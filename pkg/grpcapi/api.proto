@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package grpcapi;
+
+option go_package = "github.com/ChinmayNoob/conductor/pkg/grpcapi";
+
+enum TaskStatus {
+  QUEUED = 0;
+  STARTED = 1;
+  COMPLETE = 2;
+  FAILED = 3;
+}
+
+service WorkerService {
+  rpc SubmitTask (TaskRequest) returns (TaskResponse) {}
+}
+
+
+message TaskRequest {
+  string task_id = 1;
+  string data = 2;
+  int32 timeout_seconds = 3;  // Task timeout in seconds
+  int32 retry_count = 4;      // Current retry attempt (for logging)
+}
+
+message TaskResponse {
+  string task_id = 1;
+  string message = 2;
+  bool success = 3;
+  string output = 4;          // Task output (stdout)
+  string error_message = 5;   // Error message if failed
+}
+
+service CoordinatorService {
+  rpc SubmitTask (ClientTaskRequest) returns (ClientTaskResponse) {}
+
+  rpc SendHeartbeat (HeartbeatRequest) returns (HeartbeatResponse) {}
+
+  rpc UpdateTaskStatus (UpdateTaskStatusRequest) returns (UpdateTaskStatusResponse) {}
+}
+
+message ClientTaskRequest {
+  string data = 1;
+  int32 priority = 2;              // 1-10, lower = higher priority (default 5)
+  int32 max_retries = 3;           // Max retry attempts (default 3)
+  int32 retry_delay_seconds = 4;   // Delay between retries (default 60)
+  int32 timeout_seconds = 5;       // Task timeout (default 300)
+  int64 scheduled_at = 6;          // Unix timestamp for delayed execution (0 = now)
+}
+
+message ClientTaskResponse {
+  string message = 1;
+  string task_id = 2;
+}
+
+message HeartbeatRequest {
+  uint32 workerId = 1;
+  string address = 2;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+}
+
+message UpdateTaskStatusRequest {
+  string task_id = 1;
+  TaskStatus status = 2;
+  int64 started_at = 3;
+  int64 completed_at = 4;
+  int64 failed_at = 5;
+  string output = 6;          // Task output
+  string error_message = 7;   // Error message if failed
+}
+
+message UpdateTaskStatusResponse {
+  bool success = 1;
+  bool should_retry = 2;      // Tell worker if it should retry
+}

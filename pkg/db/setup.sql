@@ -16,7 +16,7 @@ CREATE TABLE tasks (
 
     priority INT DEFAULT 5 CHECK (priority >= 1 AND priority <= 10),
 
-    max_retries INT DEFAULT 3
+    max_retries INT DEFAULT 3,
     retry_count INT DEFAULT 0,
     retry_delay_seconds INT DEFAULT 60,
 
@@ -24,9 +24,7 @@ CREATE TABLE tasks (
 
     output TEXT,
     error_message TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-
-
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX idx_tasks_priority_scheduled ON tasks (priority ASC, scheduled_at ASC)

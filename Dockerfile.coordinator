@@ -1,0 +1,32 @@
+# Coordinator Dockerfile
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Install git for fetching dependencies
+RUN apk add --no-cache git
+
+# Copy go mod files first for caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY pkg/ ./pkg/
+COPY cmd/coordinator/ ./cmd/coordinator/
+
+# Build the coordinator
+RUN CGO_ENABLED=0 GOOS=linux go build -o coordinator ./cmd/coordinator
+
+# Final stage
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /app
+
+COPY --from=builder /app/coordinator .
+
+EXPOSE 8080
+
+CMD ["./coordinator", "--coordinator-port=:8080"]
+

@@ -37,6 +37,10 @@ service CoordinatorService {
   rpc SendHeartbeat (HeartbeatRequest) returns (HeartbeatResponse) {}
 
   rpc UpdateTaskStatus (UpdateTaskStatusRequest) returns (UpdateTaskStatusResponse) {}
+
+  rpc SubmitWorkflow (WorkflowRequest) returns (WorkflowResponse) {}
+
+  rpc GetWorkflowStatus (WorkflowStatusRequest) returns (WorkflowStatusResponse) {}
 }
 
 message ClientTaskRequest {
@@ -75,4 +79,41 @@ message UpdateTaskStatusRequest {
 message UpdateTaskStatusResponse {
   bool success = 1;
   bool should_retry = 2;      // Tell worker if it should retry
+}
+
+// --- Workflow / Saga messages ---
+
+message WorkflowRequest {
+  string workflow_type = 1;
+  string input_json = 2;       // JSON context passed to step templates
+}
+
+message WorkflowResponse {
+  string workflow_id = 1;
+  string message = 2;
+  bool success = 3;
+}
+
+message WorkflowStatusRequest {
+  string workflow_id = 1;
+}
+
+message WorkflowStepInfo {
+  int32 step_number = 1;
+  string name = 2;
+  string status = 3;
+  string task_id = 4;
+  string compensation_task_id = 5;
+}
+
+message WorkflowStatusResponse {
+  string workflow_id = 1;
+  string workflow_type = 2;
+  string status = 3;
+  int32 current_step = 4;
+  string context = 5;
+  string error_message = 6;
+  repeated WorkflowStepInfo steps = 7;
+  string created_at = 8;
+  string updated_at = 9;
 }

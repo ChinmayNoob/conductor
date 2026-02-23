@@ -593,6 +593,346 @@ func (x *UpdateTaskStatusResponse) GetShouldRetry() bool {
 	return false
 }
 
+type WorkflowRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowType  string                 `protobuf:"bytes,1,opt,name=workflow_type,json=workflowType,proto3" json:"workflow_type,omitempty"`
+	InputJson     string                 `protobuf:"bytes,2,opt,name=input_json,json=inputJson,proto3" json:"input_json,omitempty"` // JSON context passed to step templates
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkflowRequest) Reset() {
+	*x = WorkflowRequest{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkflowRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkflowRequest) ProtoMessage() {}
+
+func (x *WorkflowRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkflowRequest.ProtoReflect.Descriptor instead.
+func (*WorkflowRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *WorkflowRequest) GetWorkflowType() string {
+	if x != nil {
+		return x.WorkflowType
+	}
+	return ""
+}
+
+func (x *WorkflowRequest) GetInputJson() string {
+	if x != nil {
+		return x.InputJson
+	}
+	return ""
+}
+
+type WorkflowResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Success       bool                   `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkflowResponse) Reset() {
+	*x = WorkflowResponse{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkflowResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkflowResponse) ProtoMessage() {}
+
+func (x *WorkflowResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkflowResponse.ProtoReflect.Descriptor instead.
+func (*WorkflowResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *WorkflowResponse) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *WorkflowResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *WorkflowResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+type WorkflowStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkflowStatusRequest) Reset() {
+	*x = WorkflowStatusRequest{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkflowStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkflowStatusRequest) ProtoMessage() {}
+
+func (x *WorkflowStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkflowStatusRequest.ProtoReflect.Descriptor instead.
+func (*WorkflowStatusRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *WorkflowStatusRequest) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+type WorkflowStepInfo struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	StepNumber         int32                  `protobuf:"varint,1,opt,name=step_number,json=stepNumber,proto3" json:"step_number,omitempty"`
+	Name               string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Status             string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
+	TaskId             string                 `protobuf:"bytes,4,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	CompensationTaskId string                 `protobuf:"bytes,5,opt,name=compensation_task_id,json=compensationTaskId,proto3" json:"compensation_task_id,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *WorkflowStepInfo) Reset() {
+	*x = WorkflowStepInfo{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkflowStepInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkflowStepInfo) ProtoMessage() {}
+
+func (x *WorkflowStepInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkflowStepInfo.ProtoReflect.Descriptor instead.
+func (*WorkflowStepInfo) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *WorkflowStepInfo) GetStepNumber() int32 {
+	if x != nil {
+		return x.StepNumber
+	}
+	return 0
+}
+
+func (x *WorkflowStepInfo) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *WorkflowStepInfo) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *WorkflowStepInfo) GetTaskId() string {
+	if x != nil {
+		return x.TaskId
+	}
+	return ""
+}
+
+func (x *WorkflowStepInfo) GetCompensationTaskId() string {
+	if x != nil {
+		return x.CompensationTaskId
+	}
+	return ""
+}
+
+type WorkflowStatusResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	WorkflowType  string                 `protobuf:"bytes,2,opt,name=workflow_type,json=workflowType,proto3" json:"workflow_type,omitempty"`
+	Status        string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
+	CurrentStep   int32                  `protobuf:"varint,4,opt,name=current_step,json=currentStep,proto3" json:"current_step,omitempty"`
+	Context       string                 `protobuf:"bytes,5,opt,name=context,proto3" json:"context,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,6,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	Steps         []*WorkflowStepInfo    `protobuf:"bytes,7,rep,name=steps,proto3" json:"steps,omitempty"`
+	CreatedAt     string                 `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	UpdatedAt     string                 `protobuf:"bytes,9,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WorkflowStatusResponse) Reset() {
+	*x = WorkflowStatusResponse{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WorkflowStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WorkflowStatusResponse) ProtoMessage() {}
+
+func (x *WorkflowStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WorkflowStatusResponse.ProtoReflect.Descriptor instead.
+func (*WorkflowStatusResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *WorkflowStatusResponse) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *WorkflowStatusResponse) GetWorkflowType() string {
+	if x != nil {
+		return x.WorkflowType
+	}
+	return ""
+}
+
+func (x *WorkflowStatusResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *WorkflowStatusResponse) GetCurrentStep() int32 {
+	if x != nil {
+		return x.CurrentStep
+	}
+	return 0
+}
+
+func (x *WorkflowStatusResponse) GetContext() string {
+	if x != nil {
+		return x.Context
+	}
+	return ""
+}
+
+func (x *WorkflowStatusResponse) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *WorkflowStatusResponse) GetSteps() []*WorkflowStepInfo {
+	if x != nil {
+		return x.Steps
+	}
+	return nil
+}
+
+func (x *WorkflowStatusResponse) GetCreatedAt() string {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return ""
+}
+
+func (x *WorkflowStatusResponse) GetUpdatedAt() string {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return ""
+}
+
 var File_pkg_grpcapi_api_proto protoreflect.FileDescriptor
 
 const file_pkg_grpcapi_api_proto_rawDesc = "" +
@@ -637,7 +977,39 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\rerror_message\x18\a \x01(\tR\ferrorMessage\"W\n" +
 	"\x18UpdateTaskStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12!\n" +
-	"\fshould_retry\x18\x02 \x01(\bR\vshouldRetry*?\n" +
+	"\fshould_retry\x18\x02 \x01(\bR\vshouldRetry\"U\n" +
+	"\x0fWorkflowRequest\x12#\n" +
+	"\rworkflow_type\x18\x01 \x01(\tR\fworkflowType\x12\x1d\n" +
+	"\n" +
+	"input_json\x18\x02 \x01(\tR\tinputJson\"g\n" +
+	"\x10WorkflowResponse\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\x18\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\"8\n" +
+	"\x15WorkflowStatusRequest\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\"\xaa\x01\n" +
+	"\x10WorkflowStepInfo\x12\x1f\n" +
+	"\vstep_number\x18\x01 \x01(\x05R\n" +
+	"stepNumber\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x16\n" +
+	"\x06status\x18\x03 \x01(\tR\x06status\x12\x17\n" +
+	"\atask_id\x18\x04 \x01(\tR\x06taskId\x120\n" +
+	"\x14compensation_task_id\x18\x05 \x01(\tR\x12compensationTaskId\"\xc7\x02\n" +
+	"\x16WorkflowStatusResponse\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\x12#\n" +
+	"\rworkflow_type\x18\x02 \x01(\tR\fworkflowType\x12\x16\n" +
+	"\x06status\x18\x03 \x01(\tR\x06status\x12!\n" +
+	"\fcurrent_step\x18\x04 \x01(\x05R\vcurrentStep\x12\x18\n" +
+	"\acontext\x18\x05 \x01(\tR\acontext\x12#\n" +
+	"\rerror_message\x18\x06 \x01(\tR\ferrorMessage\x12/\n" +
+	"\x05steps\x18\a \x03(\v2\x19.grpcapi.WorkflowStepInfoR\x05steps\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\b \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"updated_at\x18\t \x01(\tR\tupdatedAt*?\n" +
 	"\n" +
 	"TaskStatus\x12\n" +
 	"\n" +
@@ -648,12 +1020,14 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\x06FAILED\x10\x032L\n" +
 	"\rWorkerService\x12;\n" +
 	"\n" +
-	"SubmitTask\x12\x14.grpcapi.TaskRequest\x1a\x15.grpcapi.TaskResponse\"\x002\x82\x02\n" +
+	"SubmitTask\x12\x14.grpcapi.TaskRequest\x1a\x15.grpcapi.TaskResponse\"\x002\xa3\x03\n" +
 	"\x12CoordinatorService\x12G\n" +
 	"\n" +
 	"SubmitTask\x12\x1a.grpcapi.ClientTaskRequest\x1a\x1b.grpcapi.ClientTaskResponse\"\x00\x12H\n" +
 	"\rSendHeartbeat\x12\x19.grpcapi.HeartbeatRequest\x1a\x1a.grpcapi.HeartbeatResponse\"\x00\x12Y\n" +
-	"\x10UpdateTaskStatus\x12 .grpcapi.UpdateTaskStatusRequest\x1a!.grpcapi.UpdateTaskStatusResponse\"\x00B.Z,github.com/ChinmayNoob/conductor/pkg/grpcapib\x06proto3"
+	"\x10UpdateTaskStatus\x12 .grpcapi.UpdateTaskStatusRequest\x1a!.grpcapi.UpdateTaskStatusResponse\"\x00\x12G\n" +
+	"\x0eSubmitWorkflow\x12\x18.grpcapi.WorkflowRequest\x1a\x19.grpcapi.WorkflowResponse\"\x00\x12V\n" +
+	"\x11GetWorkflowStatus\x12\x1e.grpcapi.WorkflowStatusRequest\x1a\x1f.grpcapi.WorkflowStatusResponse\"\x00B.Z,github.com/ChinmayNoob/conductor/pkg/grpcapib\x06proto3"
 
 var (
 	file_pkg_grpcapi_api_proto_rawDescOnce sync.Once
@@ -668,7 +1042,7 @@ func file_pkg_grpcapi_api_proto_rawDescGZIP() []byte {
 }
 
 var file_pkg_grpcapi_api_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(TaskStatus)(0),                  // 0: grpcapi.TaskStatus
 	(*TaskRequest)(nil),              // 1: grpcapi.TaskRequest
@@ -679,22 +1053,32 @@ var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(*HeartbeatResponse)(nil),        // 6: grpcapi.HeartbeatResponse
 	(*UpdateTaskStatusRequest)(nil),  // 7: grpcapi.UpdateTaskStatusRequest
 	(*UpdateTaskStatusResponse)(nil), // 8: grpcapi.UpdateTaskStatusResponse
+	(*WorkflowRequest)(nil),          // 9: grpcapi.WorkflowRequest
+	(*WorkflowResponse)(nil),         // 10: grpcapi.WorkflowResponse
+	(*WorkflowStatusRequest)(nil),    // 11: grpcapi.WorkflowStatusRequest
+	(*WorkflowStepInfo)(nil),         // 12: grpcapi.WorkflowStepInfo
+	(*WorkflowStatusResponse)(nil),   // 13: grpcapi.WorkflowStatusResponse
 }
 var file_pkg_grpcapi_api_proto_depIdxs = []int32{
-	0, // 0: grpcapi.UpdateTaskStatusRequest.status:type_name -> grpcapi.TaskStatus
-	1, // 1: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
-	3, // 2: grpcapi.CoordinatorService.SubmitTask:input_type -> grpcapi.ClientTaskRequest
-	5, // 3: grpcapi.CoordinatorService.SendHeartbeat:input_type -> grpcapi.HeartbeatRequest
-	7, // 4: grpcapi.CoordinatorService.UpdateTaskStatus:input_type -> grpcapi.UpdateTaskStatusRequest
-	2, // 5: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
-	4, // 6: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
-	6, // 7: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
-	8, // 8: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
-	5, // [5:9] is the sub-list for method output_type
-	1, // [1:5] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	0,  // 0: grpcapi.UpdateTaskStatusRequest.status:type_name -> grpcapi.TaskStatus
+	12, // 1: grpcapi.WorkflowStatusResponse.steps:type_name -> grpcapi.WorkflowStepInfo
+	1,  // 2: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
+	3,  // 3: grpcapi.CoordinatorService.SubmitTask:input_type -> grpcapi.ClientTaskRequest
+	5,  // 4: grpcapi.CoordinatorService.SendHeartbeat:input_type -> grpcapi.HeartbeatRequest
+	7,  // 5: grpcapi.CoordinatorService.UpdateTaskStatus:input_type -> grpcapi.UpdateTaskStatusRequest
+	9,  // 6: grpcapi.CoordinatorService.SubmitWorkflow:input_type -> grpcapi.WorkflowRequest
+	11, // 7: grpcapi.CoordinatorService.GetWorkflowStatus:input_type -> grpcapi.WorkflowStatusRequest
+	2,  // 8: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
+	4,  // 9: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
+	6,  // 10: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
+	8,  // 11: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
+	10, // 12: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
+	13, // 13: grpcapi.CoordinatorService.GetWorkflowStatus:output_type -> grpcapi.WorkflowStatusResponse
+	8,  // [8:14] is the sub-list for method output_type
+	2,  // [2:8] is the sub-list for method input_type
+	2,  // [2:2] is the sub-list for extension type_name
+	2,  // [2:2] is the sub-list for extension extendee
+	0,  // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_pkg_grpcapi_api_proto_init() }
@@ -708,7 +1092,7 @@ func file_pkg_grpcapi_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_grpcapi_api_proto_rawDesc), len(file_pkg_grpcapi_api_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

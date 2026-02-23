@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -294,6 +295,210 @@ func (db *DB) ListTasksByStatus(status TaskStatus, limit int) ([]*Task, error) {
 	}
 
 	return tasks, nil
+}
+
+// --- Workflow types and constants ---
+
+type WorkflowStatus string
+type StepStatus string
+
+const (
+	WorkflowRunning      WorkflowStatus = "RUNNING"
+	WorkflowCompensating WorkflowStatus = "COMPENSATING"
+	WorkflowCompleted    WorkflowStatus = "COMPLETED"
+	WorkflowFailed       WorkflowStatus = "FAILED"
+)
+
+const (
+	StepPending      StepStatus = "PENDING"
+	StepRunning      StepStatus = "RUNNING"
+	StepCompleted    StepStatus = "COMPLETED"
+	StepFailed       StepStatus = "FAILED"
+	StepCompensating StepStatus = "COMPENSATING"
+	StepCompensated  StepStatus = "COMPENSATED"
+)
+
+type Workflow struct {
+	ID           uuid.UUID
+	Type         string
+	Status       WorkflowStatus
+	CurrentStep  int
+	Context      json.RawMessage
+	ErrorMessage string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+type WorkflowStep struct {
+	ID                 uuid.UUID
+	WorkflowID         uuid.UUID
+	StepNumber         int
+	Name               string
+	TaskID             *uuid.UUID
+	CompensationTaskID *uuid.UUID
+	Status             StepStatus
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// --- Workflow CRUD ---
+
+func (db *DB) CreateWorkflow(wfType string, ctx json.RawMessage, totalSteps int) (*Workflow, error) {
+	if ctx == nil {
+		ctx = json.RawMessage("{}")
+	}
+	wf := &Workflow{
+		Type:    wfType,
+		Status:  WorkflowRunning,
+		Context: ctx,
+	}
+	err := db.conn.QueryRow(
+		`INSERT INTO workflows (type, status, current_step, context)
+		 VALUES ($1, $2, 0, $3)
+		 RETURNING id, created_at, updated_at`,
+		wfType, WorkflowRunning, ctx,
+	).Scan(&wf.ID, &wf.CreatedAt, &wf.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create workflow: %w", err)
+	}
+	return wf, nil
+}
+
+func (db *DB) GetWorkflow(id uuid.UUID) (*Workflow, error) {
+	wf := &Workflow{}
+	var errMsg sql.NullString
+	err := db.conn.QueryRow(
+		`SELECT id, type, status, current_step, context, error_message, created_at, updated_at
+		 FROM workflows WHERE id = $1`, id,
+	).Scan(&wf.ID, &wf.Type, &wf.Status, &wf.CurrentStep, &wf.Context, &errMsg, &wf.CreatedAt, &wf.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workflow: %w", err)
+	}
+	wf.ErrorMessage = errMsg.String
+	return wf, nil
+}
+
+func (db *DB) UpdateWorkflowStatus(id uuid.UUID, status WorkflowStatus, errMsg string) error {
+	_, err := db.conn.Exec(
+		`UPDATE workflows SET status = $2, error_message = $3, updated_at = NOW() WHERE id = $1`,
+		id, status, errMsg,
+	)
+	return err
+}
+
+func (db *DB) AdvanceWorkflowStep(id uuid.UUID, step int) error {
+	_, err := db.conn.Exec(
+		`UPDATE workflows SET current_step = $2, updated_at = NOW() WHERE id = $1`,
+		id, step,
+	)
+	return err
+}
+
+func (db *DB) ListWorkflows(limit int) ([]*Workflow, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, type, status, current_step, context, error_message, created_at, updated_at
+		 FROM workflows ORDER BY created_at DESC LIMIT $1`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workflows: %w", err)
+	}
+	defer rows.Close()
+
+	var workflows []*Workflow
+	for rows.Next() {
+		wf := &Workflow{}
+		var errMsg sql.NullString
+		if err := rows.Scan(&wf.ID, &wf.Type, &wf.Status, &wf.CurrentStep, &wf.Context, &errMsg, &wf.CreatedAt, &wf.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan workflow: %w", err)
+		}
+		wf.ErrorMessage = errMsg.String
+		workflows = append(workflows, wf)
+	}
+	return workflows, nil
+}
+
+// --- WorkflowStep CRUD ---
+
+func (db *DB) CreateWorkflowStep(workflowID uuid.UUID, stepNumber int, name string) (*WorkflowStep, error) {
+	step := &WorkflowStep{
+		WorkflowID: workflowID,
+		StepNumber: stepNumber,
+		Name:       name,
+		Status:     StepPending,
+	}
+	err := db.conn.QueryRow(
+		`INSERT INTO workflow_steps (workflow_id, step_number, name, status)
+		 VALUES ($1, $2, $3, $4)
+		 RETURNING id, created_at, updated_at`,
+		workflowID, stepNumber, name, StepPending,
+	).Scan(&step.ID, &step.CreatedAt, &step.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create workflow step: %w", err)
+	}
+	return step, nil
+}
+
+func (db *DB) GetWorkflowSteps(workflowID uuid.UUID) ([]*WorkflowStep, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, workflow_id, step_number, name, task_id, compensation_task_id, status, created_at, updated_at
+		 FROM workflow_steps WHERE workflow_id = $1 ORDER BY step_number ASC`, workflowID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workflow steps: %w", err)
+	}
+	defer rows.Close()
+
+	var steps []*WorkflowStep
+	for rows.Next() {
+		s := &WorkflowStep{}
+		if err := rows.Scan(&s.ID, &s.WorkflowID, &s.StepNumber, &s.Name, &s.TaskID, &s.CompensationTaskID, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan workflow step: %w", err)
+		}
+		steps = append(steps, s)
+	}
+	return steps, nil
+}
+
+func (db *DB) UpdateStepStatus(stepID uuid.UUID, status StepStatus) error {
+	_, err := db.conn.Exec(
+		`UPDATE workflow_steps SET status = $2, updated_at = NOW() WHERE id = $1`,
+		stepID, status,
+	)
+	return err
+}
+
+func (db *DB) LinkTaskToStep(stepID uuid.UUID, taskID uuid.UUID) error {
+	_, err := db.conn.Exec(
+		`UPDATE workflow_steps SET task_id = $2, updated_at = NOW() WHERE id = $1`,
+		stepID, taskID,
+	)
+	return err
+}
+
+func (db *DB) LinkCompensationTaskToStep(stepID uuid.UUID, taskID uuid.UUID) error {
+	_, err := db.conn.Exec(
+		`UPDATE workflow_steps SET compensation_task_id = $2, updated_at = NOW() WHERE id = $1`,
+		stepID, taskID,
+	)
+	return err
+}
+
+func (db *DB) GetStepByTaskID(taskID uuid.UUID) (*WorkflowStep, error) {
+	s := &WorkflowStep{}
+	err := db.conn.QueryRow(
+		`SELECT id, workflow_id, step_number, name, task_id, compensation_task_id, status, created_at, updated_at
+		 FROM workflow_steps WHERE task_id = $1 OR compensation_task_id = $1`, taskID,
+	).Scan(&s.ID, &s.WorkflowID, &s.StepNumber, &s.Name, &s.TaskID, &s.CompensationTaskID, &s.Status, &s.CreatedAt, &s.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get step by task: %w", err)
+	}
+	return s, nil
 }
 
 func (db *DB) ResetStaleTasks(staleThreshold time.Duration) (int64, error) {

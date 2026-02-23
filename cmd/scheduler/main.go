@@ -45,16 +45,22 @@ func main() {
 	http.HandleFunc("/tasks/schedule", corsMiddleware(handleScheduleTask))
 	http.HandleFunc("/tasks/status", corsMiddleware(handleTaskStatus))
 	http.HandleFunc("/tasks/stats", corsMiddleware(handleStats))
+	http.HandleFunc("/workflows", corsMiddleware(handleWorkflows))
+	http.HandleFunc("/workflows/status", corsMiddleware(handleWorkflowStatus))
+	http.HandleFunc("/workflows/list", corsMiddleware(handleWorkflowList))
 	http.HandleFunc("/health", corsMiddleware(handleHealth))
 
 	log.Printf("Scheduler HTTP server listening on %s", *schedulerPort)
 	log.Println("Endpoints:")
-	log.Println("  POST /tasks          - Submit a task for immediate execution")
-	log.Println("  GET  /tasks/list     - List all tasks")
-	log.Println("  POST /tasks/schedule - Schedule a task for later")
-	log.Println("  GET  /tasks/status   - Get task status")
-	log.Println("  GET  /tasks/stats    - Get task statistics")
-	log.Println("  GET  /health         - Health check")
+	log.Println("  POST /tasks            - Submit a task for immediate execution")
+	log.Println("  GET  /tasks/list       - List all tasks")
+	log.Println("  POST /tasks/schedule   - Schedule a task for later")
+	log.Println("  GET  /tasks/status     - Get task status")
+	log.Println("  GET  /tasks/stats      - Get task statistics")
+	log.Println("  POST /workflows        - Submit a workflow (saga)")
+	log.Println("  GET  /workflows/status - Get workflow status")
+	log.Println("  GET  /workflows/list   - List all workflows")
+	log.Println("  GET  /health           - Health check")
 
 	if err := http.ListenAndServe(*schedulerPort, nil); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
@@ -384,4 +390,151 @@ func sendJSON(w http.ResponseWriter, data interface{}, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+// --- Workflow HTTP handlers ---
+
+type WorkflowRequest struct {
+	WorkflowType string          `json:"workflow_type"`
+	Input        json.RawMessage `json:"input"`
+}
+
+type WorkflowHTTPResponse struct {
+	WorkflowID string `json:"workflow_id"`
+	Message    string `json:"message"`
+	Success    bool   `json:"success"`
+}
+
+type WorkflowStatusHTTPResponse struct {
+	WorkflowID   string              `json:"workflow_id"`
+	WorkflowType string              `json:"workflow_type"`
+	Status       string              `json:"status"`
+	CurrentStep  int                 `json:"current_step"`
+	Context      json.RawMessage     `json:"context"`
+	ErrorMessage string              `json:"error_message,omitempty"`
+	Steps        []WorkflowStepHTTP  `json:"steps"`
+	CreatedAt    string              `json:"created_at"`
+	UpdatedAt    string              `json:"updated_at"`
+}
+
+type WorkflowStepHTTP struct {
+	StepNumber         int    `json:"step_number"`
+	Name               string `json:"name"`
+	Status             string `json:"status"`
+	TaskID             string `json:"task_id,omitempty"`
+	CompensationTaskID string `json:"compensation_task_id,omitempty"`
+}
+
+func handleWorkflows(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req WorkflowRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendJSON(w, WorkflowHTTPResponse{Message: "Invalid JSON", Success: false}, http.StatusBadRequest)
+		return
+	}
+
+	if req.WorkflowType == "" {
+		sendJSON(w, WorkflowHTTPResponse{Message: "workflow_type is required", Success: false}, http.StatusBadRequest)
+		return
+	}
+
+	inputStr := "{}"
+	if req.Input != nil {
+		inputStr = string(req.Input)
+	}
+
+	wfID, err := sched.SubmitWorkflow(req.WorkflowType, inputStr)
+	if err != nil {
+		log.Printf("Failed to submit workflow: %v", err)
+		sendJSON(w, WorkflowHTTPResponse{Message: err.Error(), Success: false}, http.StatusInternalServerError)
+		return
+	}
+
+	sendJSON(w, WorkflowHTTPResponse{
+		WorkflowID: wfID,
+		Message:    "Workflow started successfully",
+		Success:    true,
+	}, http.StatusCreated)
+}
+
+func handleWorkflowStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	wfID := r.URL.Query().Get("id")
+	if wfID == "" {
+		sendJSON(w, WorkflowHTTPResponse{Message: "Workflow ID is required", Success: false}, http.StatusBadRequest)
+		return
+	}
+
+	resp, err := sched.GetWorkflowStatus(wfID)
+	if err != nil {
+		log.Printf("Failed to get workflow status: %v", err)
+		sendJSON(w, WorkflowHTTPResponse{Message: "Failed to get workflow status", Success: false}, http.StatusInternalServerError)
+		return
+	}
+
+	if resp.WorkflowId == "" {
+		sendJSON(w, WorkflowHTTPResponse{Message: "Workflow not found", Success: false}, http.StatusNotFound)
+		return
+	}
+
+	var steps []WorkflowStepHTTP
+	for _, s := range resp.Steps {
+		steps = append(steps, WorkflowStepHTTP{
+			StepNumber:         int(s.StepNumber),
+			Name:               s.Name,
+			Status:             s.Status,
+			TaskID:             s.TaskId,
+			CompensationTaskID: s.CompensationTaskId,
+		})
+	}
+
+	sendJSON(w, WorkflowStatusHTTPResponse{
+		WorkflowID:   resp.WorkflowId,
+		WorkflowType: resp.WorkflowType,
+		Status:       resp.Status,
+		CurrentStep:  int(resp.CurrentStep),
+		Context:      json.RawMessage(resp.Context),
+		ErrorMessage: resp.ErrorMessage,
+		Steps:        steps,
+		CreatedAt:    resp.CreatedAt,
+		UpdatedAt:    resp.UpdatedAt,
+	}, http.StatusOK)
+}
+
+func handleWorkflowList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	workflows, err := database.ListWorkflows(100)
+	if err != nil {
+		log.Printf("Failed to list workflows: %v", err)
+		sendJSON(w, WorkflowHTTPResponse{Message: "Failed to list workflows", Success: false}, http.StatusInternalServerError)
+		return
+	}
+
+	var response []WorkflowStatusHTTPResponse
+	for _, wf := range workflows {
+		response = append(response, WorkflowStatusHTTPResponse{
+			WorkflowID:   wf.ID.String(),
+			WorkflowType: wf.Type,
+			Status:       string(wf.Status),
+			CurrentStep:  wf.CurrentStep,
+			Context:      wf.Context,
+			ErrorMessage: wf.ErrorMessage,
+			CreatedAt:    wf.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:    wf.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+
+	sendJSON(w, response, http.StatusOK)
 }

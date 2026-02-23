@@ -121,9 +121,11 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	CoordinatorService_SubmitTask_FullMethodName       = "/grpcapi.CoordinatorService/SubmitTask"
-	CoordinatorService_SendHeartbeat_FullMethodName    = "/grpcapi.CoordinatorService/SendHeartbeat"
-	CoordinatorService_UpdateTaskStatus_FullMethodName = "/grpcapi.CoordinatorService/UpdateTaskStatus"
+	CoordinatorService_SubmitTask_FullMethodName        = "/grpcapi.CoordinatorService/SubmitTask"
+	CoordinatorService_SendHeartbeat_FullMethodName     = "/grpcapi.CoordinatorService/SendHeartbeat"
+	CoordinatorService_UpdateTaskStatus_FullMethodName  = "/grpcapi.CoordinatorService/UpdateTaskStatus"
+	CoordinatorService_SubmitWorkflow_FullMethodName    = "/grpcapi.CoordinatorService/SubmitWorkflow"
+	CoordinatorService_GetWorkflowStatus_FullMethodName = "/grpcapi.CoordinatorService/GetWorkflowStatus"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -133,6 +135,8 @@ type CoordinatorServiceClient interface {
 	SubmitTask(ctx context.Context, in *ClientTaskRequest, opts ...grpc.CallOption) (*ClientTaskResponse, error)
 	SendHeartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	UpdateTaskStatus(ctx context.Context, in *UpdateTaskStatusRequest, opts ...grpc.CallOption) (*UpdateTaskStatusResponse, error)
+	SubmitWorkflow(ctx context.Context, in *WorkflowRequest, opts ...grpc.CallOption) (*WorkflowResponse, error)
+	GetWorkflowStatus(ctx context.Context, in *WorkflowStatusRequest, opts ...grpc.CallOption) (*WorkflowStatusResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -173,6 +177,26 @@ func (c *coordinatorServiceClient) UpdateTaskStatus(ctx context.Context, in *Upd
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) SubmitWorkflow(ctx context.Context, in *WorkflowRequest, opts ...grpc.CallOption) (*WorkflowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkflowResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_SubmitWorkflow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coordinatorServiceClient) GetWorkflowStatus(ctx context.Context, in *WorkflowStatusRequest, opts ...grpc.CallOption) (*WorkflowStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WorkflowStatusResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_GetWorkflowStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -180,6 +204,8 @@ type CoordinatorServiceServer interface {
 	SubmitTask(context.Context, *ClientTaskRequest) (*ClientTaskResponse, error)
 	SendHeartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	UpdateTaskStatus(context.Context, *UpdateTaskStatusRequest) (*UpdateTaskStatusResponse, error)
+	SubmitWorkflow(context.Context, *WorkflowRequest) (*WorkflowResponse, error)
+	GetWorkflowStatus(context.Context, *WorkflowStatusRequest) (*WorkflowStatusResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -198,6 +224,12 @@ func (UnimplementedCoordinatorServiceServer) SendHeartbeat(context.Context, *Hea
 }
 func (UnimplementedCoordinatorServiceServer) UpdateTaskStatus(context.Context, *UpdateTaskStatusRequest) (*UpdateTaskStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateTaskStatus not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) SubmitWorkflow(context.Context, *WorkflowRequest) (*WorkflowResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitWorkflow not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) GetWorkflowStatus(context.Context, *WorkflowStatusRequest) (*WorkflowStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetWorkflowStatus not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -274,6 +306,42 @@ func _CoordinatorService_UpdateTaskStatus_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_SubmitWorkflow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WorkflowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).SubmitWorkflow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_SubmitWorkflow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).SubmitWorkflow(ctx, req.(*WorkflowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoordinatorService_GetWorkflowStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WorkflowStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).GetWorkflowStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_GetWorkflowStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).GetWorkflowStatus(ctx, req.(*WorkflowStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -292,6 +360,14 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateTaskStatus",
 			Handler:    _CoordinatorService_UpdateTaskStatus_Handler,
+		},
+		{
+			MethodName: "SubmitWorkflow",
+			Handler:    _CoordinatorService_SubmitWorkflow_Handler,
+		},
+		{
+			MethodName: "GetWorkflowStatus",
+			Handler:    _CoordinatorService_GetWorkflowStatus_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

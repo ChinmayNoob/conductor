@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -117,6 +118,38 @@ func (s *Server) ListPendingTasks(limit int) ([]*db.Task, error) {
 
 func (s *Server) ListAllTasks(status db.TaskStatus, limit int) ([]*db.Task, error) {
 	return s.db.ListTasksByStatus(status, limit)
+}
+
+func (s *Server) SubmitWorkflow(wfType, inputJSON string) (string, error) {
+	if s.coordinatorClient == nil {
+		return "", fmt.Errorf("coordinator not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := s.coordinatorClient.SubmitWorkflow(ctx, &grpcapi.WorkflowRequest{
+		WorkflowType: wfType,
+		InputJson:    inputJSON,
+	})
+	if err != nil {
+		return "", err
+	}
+	if !resp.Success {
+		return "", fmt.Errorf("%s", resp.Message)
+	}
+	return resp.WorkflowId, nil
+}
+
+func (s *Server) GetWorkflowStatus(workflowID string) (*grpcapi.WorkflowStatusResponse, error) {
+	if s.coordinatorClient == nil {
+		return nil, fmt.Errorf("coordinator not connected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	return s.coordinatorClient.GetWorkflowStatus(ctx, &grpcapi.WorkflowStatusRequest{
+		WorkflowId: workflowID,
+	})
 }
 
 func (s *Server) cleanupLoop() {

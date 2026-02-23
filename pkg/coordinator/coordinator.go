@@ -2,15 +2,17 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/workflow"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"github.com/google/uuid"
 )
 
 type Worker struct {
@@ -30,6 +32,7 @@ type Server struct {
 	mu              sync.RWMutex
 	nextWorkerIndex int
 	stopDispatcher  chan struct{}
+	registry        *workflow.Registry
 }
 
 func NewServer(database *db.DB) *Server {
@@ -37,6 +40,7 @@ func NewServer(database *db.DB) *Server {
 		db:             database,
 		workers:        make(map[uint32]*Worker),
 		stopDispatcher: make(chan struct{}),
+		registry:       workflow.NewRegistry(),
 	}
 
 	go s.checkWorkerHealth()
@@ -312,9 +316,9 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 	case grpcapi.TaskStatus_COMPLETE:
 		err = s.db.MarkTaskCompleted(taskID, req.Output)
 		log.Printf("Task %s completed successfully", req.TaskId)
+		s.handleWorkflowTaskComplete(taskID)
 
 	case grpcapi.TaskStatus_FAILED:
-		// Check if we should retry
 		canRetry, retryErr := s.db.IncrementRetryCount(taskID)
 		if retryErr != nil {
 			log.Printf("Error checking retry: %v", retryErr)
@@ -323,11 +327,10 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 		if canRetry {
 			log.Printf("Task %s failed, will retry (error: %s)", req.TaskId, req.ErrorMessage)
 			shouldRetry = true
-			// Task is already rescheduled by IncrementRetryCount
 		} else {
-			// No more retries - mark as permanently failed
 			err = s.db.MarkTaskFailed(taskID, req.ErrorMessage)
 			log.Printf("Task %s failed permanently after max retries (error: %s)", req.TaskId, req.ErrorMessage)
+			s.handleWorkflowTaskFailed(taskID, req.ErrorMessage)
 		}
 
 	default:
@@ -343,4 +346,279 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 		Success:     true,
 		ShouldRetry: shouldRetry,
 	}, nil
+}
+
+// --- Saga / Workflow methods ---
+
+func (s *Server) SubmitWorkflow(ctx context.Context, req *grpcapi.WorkflowRequest) (*grpcapi.WorkflowResponse, error) {
+	log.Printf("Received workflow submission: type=%s", req.WorkflowType)
+
+	def, err := s.registry.Get(req.WorkflowType)
+	if err != nil {
+		return &grpcapi.WorkflowResponse{Message: err.Error(), Success: false}, nil
+	}
+
+	inputJSON := json.RawMessage(req.InputJson)
+	if req.InputJson == "" {
+		inputJSON = json.RawMessage("{}")
+	}
+
+	wf, err := s.db.CreateWorkflow(req.WorkflowType, inputJSON, len(def.Steps))
+	if err != nil {
+		log.Printf("Failed to create workflow: %v", err)
+		return &grpcapi.WorkflowResponse{Message: "Failed to create workflow", Success: false}, nil
+	}
+
+	for i, stepDef := range def.Steps {
+		_, err := s.db.CreateWorkflowStep(wf.ID, i, stepDef.Name)
+		if err != nil {
+			log.Printf("Failed to create workflow step %d: %v", i, err)
+			s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowFailed, "failed to create steps")
+			return &grpcapi.WorkflowResponse{Message: "Failed to create workflow steps", Success: false}, nil
+		}
+	}
+
+	if err := s.startWorkflowStep(wf.ID, 0, inputJSON); err != nil {
+		log.Printf("Failed to start first workflow step: %v", err)
+		s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowFailed, err.Error())
+		return &grpcapi.WorkflowResponse{Message: "Failed to start workflow", Success: false}, nil
+	}
+
+	log.Printf("Workflow created: ID=%s, Type=%s, Steps=%d", wf.ID, req.WorkflowType, len(def.Steps))
+	return &grpcapi.WorkflowResponse{
+		WorkflowId: wf.ID.String(),
+		Message:    "Workflow started successfully",
+		Success:    true,
+	}, nil
+}
+
+func (s *Server) GetWorkflowStatus(ctx context.Context, req *grpcapi.WorkflowStatusRequest) (*grpcapi.WorkflowStatusResponse, error) {
+	wfID, err := uuid.Parse(req.WorkflowId)
+	if err != nil {
+		return nil, err
+	}
+
+	wf, err := s.db.GetWorkflow(wfID)
+	if err != nil {
+		return nil, err
+	}
+	if wf == nil {
+		return &grpcapi.WorkflowStatusResponse{}, nil
+	}
+
+	steps, err := s.db.GetWorkflowSteps(wfID)
+	if err != nil {
+		return nil, err
+	}
+
+	var stepInfos []*grpcapi.WorkflowStepInfo
+	for _, step := range steps {
+		info := &grpcapi.WorkflowStepInfo{
+			StepNumber: int32(step.StepNumber),
+			Name:       step.Name,
+			Status:     string(step.Status),
+		}
+		if step.TaskID != nil {
+			info.TaskId = step.TaskID.String()
+		}
+		if step.CompensationTaskID != nil {
+			info.CompensationTaskId = step.CompensationTaskID.String()
+		}
+		stepInfos = append(stepInfos, info)
+	}
+
+	return &grpcapi.WorkflowStatusResponse{
+		WorkflowId:   wf.ID.String(),
+		WorkflowType: wf.Type,
+		Status:       string(wf.Status),
+		CurrentStep:  int32(wf.CurrentStep),
+		Context:      string(wf.Context),
+		ErrorMessage: wf.ErrorMessage,
+		Steps:        stepInfos,
+		CreatedAt:    wf.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt:    wf.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}, nil
+}
+
+func (s *Server) startWorkflowStep(workflowID uuid.UUID, stepNumber int, ctx json.RawMessage) error {
+	wf, err := s.db.GetWorkflow(workflowID)
+	if err != nil {
+		return err
+	}
+
+	def, err := s.registry.Get(wf.Type)
+	if err != nil {
+		return err
+	}
+	if stepNumber >= len(def.Steps) {
+		return nil
+	}
+
+	steps, err := s.db.GetWorkflowSteps(workflowID)
+	if err != nil {
+		return err
+	}
+
+	var step *db.WorkflowStep
+	for _, s := range steps {
+		if s.StepNumber == stepNumber {
+			step = s
+			break
+		}
+	}
+	if step == nil {
+		return nil
+	}
+
+	command := workflow.ExpandCommand(def.Steps[stepNumber].CommandTemplate, ctx)
+
+	opts := db.DefaultTaskOptions()
+	opts.MaxRetries = 2
+	opts.RetryDelaySeconds = 5
+	opts.TimeoutSeconds = 60
+
+	task, err := s.db.CreateTaskWithOptions(command, opts)
+	if err != nil {
+		return err
+	}
+
+	if err := s.db.LinkTaskToStep(step.ID, task.ID); err != nil {
+		return err
+	}
+	if err := s.db.UpdateStepStatus(step.ID, db.StepRunning); err != nil {
+		return err
+	}
+	if err := s.db.AdvanceWorkflowStep(workflowID, stepNumber); err != nil {
+		return err
+	}
+
+	log.Printf("Workflow %s: started step %d (%s) -> task %s",
+		workflowID, stepNumber, def.Steps[stepNumber].Name, task.ID)
+	return nil
+}
+
+func (s *Server) handleWorkflowTaskComplete(taskID uuid.UUID) {
+	step, err := s.db.GetStepByTaskID(taskID)
+	if err != nil || step == nil {
+		return
+	}
+
+	wf, err := s.db.GetWorkflow(step.WorkflowID)
+	if err != nil || wf == nil {
+		return
+	}
+
+	if step.CompensationTaskID != nil && *step.CompensationTaskID == taskID {
+		s.handleCompensationComplete(wf, step)
+		return
+	}
+
+	s.db.UpdateStepStatus(step.ID, db.StepCompleted)
+
+	def, err := s.registry.Get(wf.Type)
+	if err != nil {
+		return
+	}
+
+	nextStep := step.StepNumber + 1
+	if nextStep >= len(def.Steps) {
+		s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowCompleted, "")
+		log.Printf("Workflow %s COMPLETED (all %d steps done)", wf.ID, len(def.Steps))
+		return
+	}
+
+	if err := s.startWorkflowStep(wf.ID, nextStep, wf.Context); err != nil {
+		log.Printf("Workflow %s: failed to start step %d: %v", wf.ID, nextStep, err)
+		s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowFailed, err.Error())
+	}
+}
+
+func (s *Server) handleWorkflowTaskFailed(taskID uuid.UUID, errMsg string) {
+	step, err := s.db.GetStepByTaskID(taskID)
+	if err != nil || step == nil {
+		return
+	}
+
+	wf, err := s.db.GetWorkflow(step.WorkflowID)
+	if err != nil || wf == nil {
+		return
+	}
+
+	if step.CompensationTaskID != nil && *step.CompensationTaskID == taskID {
+		s.db.UpdateStepStatus(step.ID, db.StepFailed)
+		log.Printf("Workflow %s: compensation for step %d FAILED (best-effort)", wf.ID, step.StepNumber)
+		s.continueCompensation(wf)
+		return
+	}
+
+	s.db.UpdateStepStatus(step.ID, db.StepFailed)
+	s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowCompensating, errMsg)
+	log.Printf("Workflow %s: step %d FAILED, starting compensation", wf.ID, step.StepNumber)
+	s.startCompensation(wf, step.StepNumber)
+}
+
+func (s *Server) startCompensation(wf *db.Workflow, failedStep int) {
+	steps, err := s.db.GetWorkflowSteps(wf.ID)
+	if err != nil {
+		return
+	}
+
+	for i := failedStep - 1; i >= 0; i-- {
+		if steps[i].Status == db.StepCompleted {
+			s.runCompensationTask(wf, steps[i])
+			return
+		}
+	}
+
+	s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowFailed, wf.ErrorMessage)
+	log.Printf("Workflow %s: compensation complete, workflow FAILED", wf.ID)
+}
+
+func (s *Server) handleCompensationComplete(wf *db.Workflow, step *db.WorkflowStep) {
+	s.db.UpdateStepStatus(step.ID, db.StepCompensated)
+	log.Printf("Workflow %s: step %d (%s) COMPENSATED", wf.ID, step.StepNumber, step.Name)
+	s.continueCompensation(wf)
+}
+
+func (s *Server) continueCompensation(wf *db.Workflow) {
+	steps, err := s.db.GetWorkflowSteps(wf.ID)
+	if err != nil {
+		return
+	}
+
+	for i := len(steps) - 1; i >= 0; i-- {
+		if steps[i].Status == db.StepCompleted {
+			s.runCompensationTask(wf, steps[i])
+			return
+		}
+	}
+
+	s.db.UpdateWorkflowStatus(wf.ID, db.WorkflowFailed, wf.ErrorMessage)
+	log.Printf("Workflow %s: all compensations done, workflow FAILED", wf.ID)
+}
+
+func (s *Server) runCompensationTask(wf *db.Workflow, step *db.WorkflowStep) {
+	def, err := s.registry.Get(wf.Type)
+	if err != nil || step.StepNumber >= len(def.Steps) {
+		return
+	}
+
+	compensateCmd := workflow.ExpandCommand(def.Steps[step.StepNumber].CompensateTemplate, wf.Context)
+
+	opts := db.DefaultTaskOptions()
+	opts.MaxRetries = 1
+	opts.RetryDelaySeconds = 3
+	opts.TimeoutSeconds = 60
+
+	task, err := s.db.CreateTaskWithOptions(compensateCmd, opts)
+	if err != nil {
+		log.Printf("Workflow %s: failed to create compensation task for step %d: %v", wf.ID, step.StepNumber, err)
+		return
+	}
+
+	s.db.LinkCompensationTaskToStep(step.ID, task.ID)
+	s.db.UpdateStepStatus(step.ID, db.StepCompensating)
+
+	log.Printf("Workflow %s: compensating step %d (%s) -> task %s",
+		wf.ID, step.StepNumber, step.Name, task.ID)
 }

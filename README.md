@@ -1,5 +1,19 @@
 # Conductor - A Distributed Task Scheduler with Saga Workflows
 
+## Brief Description
+
+Conductor is a distributed task scheduler built from scratch in Go that mimics how production-grade systems like Kubernetes or Apache Spark dispatch and execute work across a cluster of machines. It follows a coordinator-worker architecture where clients submit tasks over HTTP to a Scheduler service, which forwards them via gRPC to a central Coordinator. The Coordinator maintains a live registry of worker nodes (discovered through periodic heartbeats), picks the highest-priority task from a PostgreSQL-backed queue using `FOR UPDATE SKIP LOCKED` to guarantee atomic assignment without race conditions, and pushes it to a healthy worker over gRPC. Workers execute shell commands with enforced timeouts using Go's `context.WithTimeout` and report status (STARTED/COMPLETED/FAILED) back to the Coordinator, which handles retry logic (configurable retries with exponential back-off delay). The system also implements the Saga orchestration pattern for multi-step workflows with automatic compensation (rollback) on failure -- if step 3 of a 5-step workflow fails, all previously completed steps are undone in reverse order. The entire stack is containerized with Docker Compose, supporting horizontal scaling by simply increasing worker replicas. It demonstrates real distributed systems concepts: concurrent task assignment, fault detection via heartbeats, priority queuing, at-least-once delivery semantics, and transactional workflow orchestration.
+
+### Architecture
+
+The system is composed of three distinct microservices communicating over gRPC, with PostgreSQL as the durable persistence layer:
+
+- **Scheduler (HTTP :8081)** -- The API gateway. It exposes a REST API for clients to submit tasks, check status, view statistics, and trigger workflows. It validates incoming requests and forwards them to the Coordinator over gRPC. It also runs a background goroutine that periodically cleans up stale tasks (tasks that were picked but never started due to crashes).
+
+- **Coordinator (gRPC :8080)** -- The brain of the system. It maintains an in-memory registry of all active workers, updated via heartbeat RPCs that workers send every 10 seconds. A dispatch loop runs every second, picking the next highest-priority task from PostgreSQL using a `SELECT ... FOR UPDATE SKIP LOCKED` query, and pushes it to a healthy worker via gRPC using round-robin load balancing. The Coordinator also owns all retry logic: when a worker reports a failure, the Coordinator checks if the task has remaining retries, and if so, requeues it with a configurable delay. For saga workflows, the Coordinator acts as the orchestrator -- advancing steps on success and running compensation tasks in reverse on failure.
+
+- **Workers (gRPC :900x)** -- The execution engines. Each worker is both a gRPC server (to receive task assignments) and a gRPC client (to send heartbeats and report task status back to the Coordinator). When a task arrives, it is placed into a buffered channel (capacity 100 for backpressure). A processing goroutine dequeues tasks, executes them as shell commands using `exec.CommandContext` with a timeout derived from `context.WithTimeout`, and reports the outcome. If the channel is full, the worker rejects the task so the Coordinator can assign it elsewhere.
+
 ## Features
 
 - Distributed Architecture
@@ -157,7 +171,7 @@ This would cause steps 1 and 2 to be compensated in reverse order (Cancel Hotel,
 | GET | `/workflows/list` | List all workflows |
 | GET | `/health` | Health check |
 
-## Architecture
+## Workflow
 
 ```
 ┌─────────────┐     HTTP      ┌─────────────┐
@@ -196,7 +210,3 @@ This would cause steps 1 and 2 to be compensated in reverse order (Cancel Hotel,
 | `POSTGRES_USER` | `postgres` | Database user |
 | `POSTGRES_PASSWORD` | `postgres` | Database password |
 
-## Documentation
-
-- [Saga Design Document](docs/SAGA_DESIGN.md) -- explains the saga pattern, database schema, and architecture
-- [Saga Changelog](docs/SAGA_CHANGELOG.md) -- lists every file and function added for the saga implementation

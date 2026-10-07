@@ -314,4 +314,338 @@ Local run (Windows host, Docker Desktop, 3 workers):
 
 ## Phase 2: A real scheduler
 
-*In progress. This section is filled in as Phase 2 lands.*
+**Goal:** users define their own workflows without editing Go code, and tasks go beyond shell commands.
+**Result:** PR #3. Every Phase 2 item is done: 64 files and about 8,000 lines, with 29 end-to-end tests, all green over plaintext and mTLS.
+
+### 1. What a user can do now that they couldn't before
+
+```mermaid
+mindmap
+  root((Conductor<br/>Phase 2))
+    Workflows
+      YAML DAGs
+      parallel branches & fan-in
+      outputs between steps
+      versioned definitions
+      reverse-order compensation
+    Scheduling
+      cron + time zones
+      misfire policies
+      queues: concurrency, rate, pause
+      priority aging
+      idempotency keys
+      dead-letter + requeue
+    Workers
+      slots
+      labels & routing
+      shell / http / container
+      clean task environment
+    Tenancy
+      namespaces
+      quotas → HTTP 429
+      namespace-scoped keys
+    DX
+      conductor dev
+      conductorctl
+      Go SDK
+```
+
+### 2. Workflows became data, and DAGs
+
+Phase 1's workflows were Go structs compiled into the binary, and they ran strictly one step after another. Now they are YAML documents uploaded through the API, stored as versions, and executed as a **DAG**:
+
+```mermaid
+flowchart LR
+    subgraph def ["order_pipeline (examples/workflows)"]
+        V[validate] --> R[reserve_stock]
+        V --> C[charge_card]
+        R --> S[ship]
+        C --> S
+    end
+    V -. "customer=cus_A1" .-> C
+    R -. "reservation=res_A1" .-> S
+    C -. "charge=ch_A1" .-> S
+```
+
+The dotted edges are **outputs**: a step appends `key=value` lines to `$CONDUCTOR_OUTPUT`, and later steps read them with `${{ steps.validate.outputs.customer }}` in their `env`. Validation guarantees a step can only reference outputs of steps it (transitively) depends on, so a reference can never point at a step that hasn't run.
+
+Here is an actual run from the e2e suite. The two branches started **2.4 ms apart**:
+
+```mermaid
+gantt
+    title order_pipeline run (e2e)
+    dateFormat HH:mm:ss
+    axisFormat %S s
+    section start
+    validate      :done, 00:00:00, 00:00:01
+    section parallel
+    reserve_stock :done, 00:00:01, 00:00:03
+    charge_card   :done, 00:00:01, 00:00:03
+    section fan-in
+    ship          :done, 00:00:03, 00:00:04
+```
+
+### 3. The engine is a pure function
+
+The most important design decision of Phase 2: **the workflow engine contains no I/O.** `workflow.Reconcile(definition, state) → plan` takes a snapshot of every step's status and returns what should happen next. The coordinator applies the plan.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant C as Coordinator
+    participant DB as Postgres
+    participant R as workflow.Reconcile (pure)
+    W->>C: COMPLETE (task of step charge_card)
+    C->>DB: MarkTaskCompleted → RETURNING workflow_id
+    C->>DB: BEGIN · SELECT … FROM workflows FOR UPDATE
+    loop until the plan is empty
+        C->>DB: load steps + task statuses + outputs
+        C->>R: Reconcile(def, state)
+        R-->>C: plan {SetStep, Start, Compensate, Cancel, SetStatus}
+        C->>DB: create tasks, update steps/run
+    end
+    C->>DB: COMMIT
+    C->>C: wake dispatcher
+```
+
+Why it matters:
+
+| Property | How it's achieved |
+|---|---|
+| **No races between parallel branches** | `reserve_stock` and `charge_card` can finish at the same moment. Each reconcile holds `FOR UPDATE` on the run, so the second one sees the first one's result and `ship` starts exactly once. |
+| **Crash-safe** | A plan is applied in one transaction. If the coordinator dies mid-way, nothing is half-applied, and a sweep re-reconciles every active run every 15 seconds. |
+| **Idempotent** | Reconciling the same state twice yields the same plan, so extra reconciles are harmless. |
+| **Testable without a database** | `dag_test.go` drives the reconciler with a tiny simulator that plays the coordinator's role and records events per round. Parallelism and compensation order are asserted exactly. |
+| **HA-ready** | Every decision is derived from rows in Postgres, not memory. That's what Phase 3's multiple coordinators will need. |
+
+### 4. Step and run lifecycles
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> RUNNING: all depends_on COMPLETED
+    PENDING --> SKIPPED: run failed first
+    RUNNING --> COMPLETED: task COMPLETED
+    RUNNING --> FAILED: task FAILED (retries used up)
+    RUNNING --> CANCELLED: sibling failed / user cancelled
+    COMPLETED --> COMPENSATING: every dependent settled
+    COMPLETED --> COMPENSATED: nothing to undo
+    COMPENSATING --> COMPENSATED: compensation succeeded
+    COMPENSATING --> COMPENSATION_FAILED: compensation failed (keep going)
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> COMPLETED: every step COMPLETED
+    RUNNING --> COMPENSATING: a step failed, or cancel requested
+    COMPENSATING --> FAILED: nothing left to undo
+    COMPENSATING --> CANCELLED: …and the user asked for it
+```
+
+**Compensation order** is reverse *dependency* order, not reverse start order. A completed step is undone only once everything that depends on it has been undone (or never ran). In the failing `order_pipeline`, `ship` fails, both parallel branches are refunded and released **in parallel**, and then `validate`:
+
+```mermaid
+flowchart RL
+    S["ship ❌"] --> R["reserve_stock ↩ release"]
+    S --> C["charge_card ↩ refund"]
+    R --> V["validate ✓ nothing to undo"]
+    C --> V
+```
+
+### 5. Shell injection: fixed at the root
+
+PR #1 *filtered* dangerous characters out of workflow inputs. Phase 2 removes the attack surface entirely:
+
+```mermaid
+flowchart LR
+    subgraph before ["Before: string templating"]
+        i1["input: 1; rm -rf /"] --> t1["'echo user={{user_id}}'"] --> sh1["sh -c 'echo user=1; rm -rf /' 💥"]
+    end
+    subgraph after ["After: environment variables"]
+        i2["input: 1; rm -rf /"] --> e2["INPUT_USER_ID='1; rm -rf /'"] --> sh2["sh -c 'echo user=$INPUT_USER_ID'<br/>prints the text ✅"]
+    end
+```
+
+The definition validator also **rejects `${{ }}` inside `run:`**, with an error explaining to use `env:`, so nobody can reintroduce templating by accident. The e2e test submits `1; touch /tmp/pwned-… #` and checks that every worker's `/tmp` is clean.
+
+### 6. 🔐 Security finding: tasks could read the cluster token
+
+While building the environment-variable plumbing, I noticed that since Phase 1, shell tasks had inherited the **worker's whole environment**, and the worker's environment contains `CONDUCTOR_CLUSTER_TOKEN`:
+
+```mermaid
+sequenceDiagram
+    actor A as Any API user
+    participant W as Worker
+    participant C as Coordinator
+    A->>W: task "echo $CONDUCTOR_CLUSTER_TOKEN"
+    W-->>A: output: the token 😱
+    A->>C: SendHeartbeat as a fake worker (valid token)
+    C->>A: dispatches other tenants' tasks to the attacker
+```
+
+**Fix:** tasks get a minimal environment (`PATH`, `HOME`, `LANG`, `TMPDIR`, plus the task's own `CONDUCTOR_*` variables). Anything else must be allow-listed with `CONDUCTOR_WORKER_PASS_ENV`. Compose also stopped giving workers database credentials and the API key at all. A unit test and an e2e test both assert the token is absent.
+
+### 7. Smarter dispatch in one SQL statement
+
+Every scheduling rule is enforced inside the `SKIP LOCKED` pick query, so there are no in-memory counters that could drift or disagree between coordinators:
+
+```mermaid
+flowchart TB
+    Q([QUEUED, not picked, due]) --> P{queue paused?}
+    P -- yes --> X[skip]
+    P -- no --> L{"some free worker has<br/>all required labels?<br/>(jsonb @>)"}
+    L -- no --> X
+    L -- yes --> CC{"queue running #lt; concurrency_limit?"}
+    CC -- no --> X
+    CC -- yes --> RL{"dispatches in last period #lt; rate_limit?"}
+    RL -- no --> X
+    RL -- yes --> NS{"namespace running #lt; max_concurrency?"}
+    NS -- no --> X
+    NS -- yes --> O["ORDER BY priority − aging, scheduled_at<br/>LIMIT 1 FOR UPDATE SKIP LOCKED"]
+    O --> D([dispatch to a round-robin pick<br/>among matching free workers])
+```
+
+- **Labels:** workers advertise `type.shell`, `type.http`, `type.container` (if Docker answers) plus user labels. Each task requires `type.<its type>` plus its own labels. A GPU task waits for a GPU worker; nobody else takes it.
+- **Slots:** each worker runs `CONDUCTOR_WORKER_SLOTS` tasks at once (default 2). The burst test: **40 one-second tasks on 8 slots in 5.7s** (ideal 5s), split 10/10/10/10.
+- **Priority aging:** effective priority improves by one level per `CONDUCTOR_PRIORITY_AGING` waited, so a priority-9 task can't starve behind a stream of priority-1s.
+- **Rate limits** use a sliding window over `last_dispatched_at`, so there's no token-bucket state to keep consistent.
+
+### 8. Three task types
+
+```mermaid
+flowchart LR
+    T[task] --> S{type}
+    S -- shell --> SH["sh -c in its own process group<br/>clean env, $CONDUCTOR_OUTPUT"]
+    S -- http --> HT["HTTP request<br/>outputs: status, body<br/>expect_status"]
+    S -- container --> CT["Docker Engine API over the socket<br/>pull → create → start → wait → logs → remove<br/>memory / cpus / network:none"]
+```
+
+The container executor talks to Docker's HTTP API directly over the Unix socket in about 300 lines, with no Docker SDK and its large dependency tree. It demultiplexes Docker's 8-byte-header log frames, kills the container on cancel or timeout, and always removes it. Because socket access is root-equivalent, it runs only in the opt-in `container-worker` service.
+
+### 9. Cron schedules
+
+```mermaid
+timeline
+    title Coordinator down 10.05 to 13.20, hourly schedule
+    10.00 : fired normally
+    11.00 : missed
+    12.00 : missed
+    13.00 : missed
+    13.20 back up : skip → next run 14.00 : run_once → fire now, then 14.00 : catch_up → fire 11.00, 12.00, 13.00, one per tick
+```
+
+- Firing a run and advancing `next_run_at` happen in **one transaction**, with `FOR UPDATE SKIP LOCKED` on due schedules. Each run uses the idempotency key `schedule:<id>:<run unix time>`, so a run time can never fire twice, even with several coordinators.
+- Time zones come from Go's embedded tz database (`time/tzdata`), so `Asia/Kolkata` works even in a minimal container.
+- `@every 30s` and `@hourly` descriptors work alongside 5-field cron.
+
+### 10. Data model after Phase 2
+
+```mermaid
+erDiagram
+    namespaces ||--o{ api_keys : "binds"
+    namespaces ||--o{ tasks : "owns"
+    namespaces ||--o{ queues : "limits"
+    namespaces ||--o{ workflow_definitions : "versions"
+    namespaces ||--o{ workflows : "runs"
+    namespaces ||--o{ schedules : "fires"
+    workflows ||--|{ workflow_steps : "has"
+    workflow_steps |o--o| tasks : "task / compensation"
+    workflows ||--o{ tasks : "workflow_id"
+    tasks {
+        uuid id
+        text namespace
+        text queue
+        text type
+        jsonb spec
+        jsonb env
+        jsonb requirements
+        jsonb outputs
+        text idempotency_key
+    }
+    workflows {
+        uuid id
+        jsonb definition "snapshot"
+        int definition_version
+        bool cancel_requested
+    }
+    schedules {
+        text cron
+        text timezone
+        text misfire_policy
+        jsonb target
+        timestamptz next_run_at
+    }
+    workers {
+        bigint id
+        jsonb labels
+        int slots
+        text status
+    }
+```
+
+### 11. Bugs found along the way
+
+| Bug | How it was found | Fix |
+|---|---|---|
+| Tasks could read `CONDUCTOR_CLUSTER_TOKEN` | Code review while adding task env vars | Minimal task env + allow-list; e2e test |
+| Times passed in a non-UTC zone were stored hours off (columns are `TIMESTAMP` without a zone) | The priority-aging DB test failed on an IST machine | Normalize to UTC on insert; pin the session to `timezone=UTC` |
+| Retried tasks lost the failed attempt's output | Debugging a failing container task | `RetryTask` keeps the output |
+| SDK sent `created_at` when creating a namespace; strict JSON decoding rejected it | Manual CLI smoke test | Send an explicit request body |
+| The Docker image failed to build once `examples/` was embedded | `docker compose up --build` | `COPY examples` in the Dockerfile |
+
+### 12. Results
+
+| Suite | Count | Result |
+|---|---|---|
+| Unit (workflow, schedule, worker, coordinator, security, examples) | 35 tests + 11 validation subtests | ✅ |
+| Database (real Postgres) | 18 | ✅ |
+| E2E, plaintext (3 workers + container worker) | 29 | ✅ 143s |
+| E2E, mutual TLS | 29 | ✅ 155s |
+| golangci-lint | | ✅ 0 issues |
+
+```mermaid
+pie title Tests by layer
+    "Unit" : 35
+    "Database" : 18
+    "End-to-end" : 29
+```
+
+### Design decisions
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Pure reconciler + row lock | Event handlers per transition (Phase 1 style) | Parallel branches made event handlers race-prone; a pure function is testable and HA-friendly. |
+| Inputs only via env vars | Shell-quoting values | Quoting is shell-specific and easy to get wrong; env vars are not parsed as code. |
+| Definition snapshot per run | Reference by version | Runs stay readable and deterministic even if versions are deleted later. |
+| All dispatch rules in SQL | In-memory counters | One source of truth; correct with several coordinators (Phase 3). |
+| Raw Docker Engine API | Docker Go SDK | ~300 lines instead of dozens of transitive dependencies. |
+| GitHub-Actions-style `${{ }}` and `$CONDUCTOR_OUTPUT` | A new syntax | Familiar to most developers. |
+| `api` doesn't run cron | Cron in the API | Firing must be single-writer per run, which belongs with the coordinator (and its future leader election). |
+
+### Phase 2 scorecard
+
+| Item | Status |
+|---|---|
+| 2.1 Workflows as data: YAML, versions, DAGs, outputs, env-only inputs, per-step options, validation | ✅ |
+| 2.2 Cron + misfire, idempotency keys, priority aging, queues (concurrency/rate/pause), dead letter | ✅ |
+| 2.3 Worker slots and labels, requirement matching, worker registry | ✅ |
+| 2.4 Executors: shell, http, container | ✅ |
+| 2.5 `conductor dev`, `conductorctl`, Go SDK | ✅ |
+| 2.6 Namespaces with quotas | ✅ |
+
+**Exit criterion:** *"a new user can write a YAML DAG workflow with parallel steps, schedule it with cron, and watch it run with conductorctl, without touching Go code."*
+
+```bash
+conductorctl workflow apply -f my_dag.yaml
+conductorctl schedule create nightly -cron '0 2 * * *' -workflow my_dag
+conductorctl workflow watch <id>
+```
+
+✅ Met, and covered by the e2e suite.
+
+---
+
+## What's next
+
+Phase 3, distributed-systems depth: coordinator high availability through Postgres advisory-lock leader election, fencing tokens on every dispatch, `LISTEN/NOTIFY` for instant dispatch, and published benchmarks and chaos tests. See [plan.md](plan.md).

@@ -102,42 +102,42 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 
 ---
 
-## Phase 2: A real scheduler ⬜
+## Phase 2: A real scheduler ✅ (done, PR #3)
 
 **Goal:** users define their own workflows without editing Go code, and tasks go beyond shell commands.
 
 ### 2.1 Workflows as data
-- ⬜ Workflow definitions in YAML or JSON, submitted via `POST /v1/workflow-definitions` and stored versioned in a `workflow_definitions` table
-- ⬜ **DAG support:** `depends_on` between steps, parallel branches and fan-in; compensation runs in reverse topological order
-- ⬜ Step outputs available to later steps (for example `steps.book_flight.output.booking_id`)
-- ⬜ **Pass inputs as environment variables, not by templating them into shell strings.** This removes the injection risk at its root, rather than relying on validation alone.
-- ⬜ Per-step settings for retries, timeout and back-off
-- ⬜ Definition validation: cycle detection, unknown references and schema checks, with clear error messages
+- ✅ Workflow definitions in YAML or JSON, submitted via `POST /v1/workflow-definitions` and stored versioned in a `workflow_definitions` table
+- ✅ **DAG support:** `depends_on` between steps, parallel branches and fan-in; compensation runs in reverse topological order
+- ✅ Step outputs available to later steps (for example `steps.book_flight.output.booking_id`)
+- ✅ **Pass inputs as environment variables, not by templating them into shell strings.** This removes the injection risk at its root, rather than relying on validation alone.
+- ✅ Per-step settings for retries, timeout and back-off
+- ✅ Definition validation: cycle detection, unknown references and schema checks, with clear error messages
 
 ### 2.2 Scheduling features
-- ⬜ Cron schedules (`schedules` table) with timezone and misfire policy (skip, run once, or catch up)
-- ⬜ Idempotency keys on submission (unique constraint), so duplicate submits return the existing task
-- ⬜ Priority aging, so low-priority tasks don't starve
-- ⬜ Named queues with concurrency limits and rate limits (token bucket stored in Postgres)
-- ⬜ Dead-letter view for permanently failed tasks, with a "requeue" action
+- ✅ Cron schedules (`schedules` table) with timezone and misfire policy (skip, run once, or catch up)
+- ✅ Idempotency keys on submission (unique constraint), so duplicate submits return the existing task
+- ✅ Priority aging, so low-priority tasks don't starve
+- ✅ Named queues with concurrency limits and rate limits (a sliding window over recent dispatches, enforced in the pick query; no token-bucket state)
+- ✅ Dead-letter view for permanently failed tasks, with a "requeue" action
 
 ### 2.3 Smarter workers
-- ⬜ Workers report capacity (slots) and labels in their heartbeat, and run multiple tasks concurrently
-- ⬜ Tasks declare requirements (`labels: {gpu: "true"}`), and the coordinator matches them to workers
-- ⬜ Worker registry persisted in a `workers` table (also needed for Phase 3 failover)
+- ✅ Workers report capacity (slots) and labels in their heartbeat, and run multiple tasks concurrently
+- ✅ Tasks declare requirements (`labels: {gpu: "true"}`), and the coordinator matches them to workers
+- ✅ Worker registry persisted in a `workers` table (also needed for Phase 3 failover)
 
 ### 2.4 Task types (a pluggable executor interface)
-- ⬜ `shell`: the current behavior
-- ⬜ `http`: method, URL, headers and body, with success determined by status code
-- ⬜ `container`: run each task in its own Docker container with CPU and memory limits. This is the sandboxing answer for untrusted work.
+- ✅ `shell`: the current behavior
+- ✅ `http`: method, URL, headers and body, with success determined by status code
+- ✅ `container`: run each task in its own Docker container with CPU and memory limits. This is the sandboxing answer for untrusted work.
 
 ### 2.5 Developer experience
-- 🟡 **Single-binary mode:** one `conductor` binary with subcommands (done in Phase 1); `conductor dev` runs everything in one process against one Postgres
-- 🟡 `conductorctl` CLI to replace the test client: submit, status, logs, cancel, workflows and schedules (tasks, workflows and API keys done in Phase 1)
-- 🟡 Go SDK (`pkg/client`) for submitting tasks and workflows from Go code (started in Phase 1)
+- ✅ **Single-binary mode:** one `conductor` binary with subcommands; `conductor dev` runs everything in one process against one Postgres
+- ✅ `conductorctl` CLI to replace the test client: submit, status, logs, cancel, workflows and schedules
+- ✅ Go SDK (`pkg/client`) for submitting tasks and workflows from Go code
 
 ### 2.6 Multi-tenancy (basic)
-- ⬜ Namespaces: tasks, workflows, API keys and quotas scoped per namespace
+- ✅ Namespaces: tasks, workflows, API keys and quotas scoped per namespace
 
 **Exit criteria:** a new user can write a YAML DAG workflow with parallel steps, schedule it with cron, and watch it run with `conductorctl`, without touching Go code.
 
@@ -345,8 +345,8 @@ Phases describe *areas*. The order below gets the most value soonest and front-l
 |---|---|---|
 | 0 | Foundation and bug-fix round | ✅ Done |
 | 1 | Production basics (CI, e2e, migrations, auth, TLS, cancellation) | ✅ Done |
-| 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | 🟡 In progress |
-| 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ⬜ |
+| 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | ✅ Done |
+| 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ⬜ Next |
 | 4 | Observability and UI (metrics, tracing, dashboard) | ⬜ |
 | 5 | AI-native durable execution (LLM steps, agents, explainer) | ⬜ |
 | 6 | Kubernetes and cloud-native (Helm, KEDA, operator) | ⬜ |

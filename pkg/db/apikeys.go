@@ -14,24 +14,27 @@ type APIKey struct {
 	ID        uuid.UUID
 	Name      string
 	Prefix    string
+	Namespace string
 	IsAdmin   bool
 	CreatedAt time.Time
 	RevokedAt *time.Time
 }
 
-const apiKeyColumns = `id, name, prefix, is_admin, created_at, revoked_at`
+const apiKeyColumns = `id, name, prefix, namespace, is_admin, created_at, revoked_at`
 
 func scanAPIKey(row scanner) (*APIKey, error) {
 	k := &APIKey{}
-	err := row.Scan(&k.ID, &k.Name, &k.Prefix, &k.IsAdmin, &k.CreatedAt, &k.RevokedAt)
+	err := row.Scan(&k.ID, &k.Name, &k.Prefix, &k.Namespace, &k.IsAdmin, &k.CreatedAt, &k.RevokedAt)
 	return k, err
 }
 
-func (db *DB) CreateAPIKey(ctx context.Context, name string, hash []byte, prefix string, admin bool) (*APIKey, error) {
+// CreateAPIKey stores a key. Admin keys may act in any namespace; other keys
+// only in theirs.
+func (db *DB) CreateAPIKey(ctx context.Context, name string, hash []byte, prefix, namespace string, admin bool) (*APIKey, error) {
 	k, err := scanAPIKey(db.q.QueryRowContext(ctx,
-		`INSERT INTO api_keys (name, key_hash, prefix, is_admin) VALUES ($1, $2, $3, $4)
+		`INSERT INTO api_keys (name, key_hash, prefix, namespace, is_admin) VALUES ($1, $2, $3, $4, $5)
 		 RETURNING `+apiKeyColumns,
-		name, hash, prefix, admin,
+		name, hash, prefix, namespace, admin,
 	))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create API key: %w", err)

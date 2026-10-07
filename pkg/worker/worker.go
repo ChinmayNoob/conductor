@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"maps"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,13 +24,24 @@ var (
 
 const heartbeatInterval = 10 * time.Second
 
+// Label keys a worker sets automatically to advertise the task types it can
+// run. Tasks require the label for their type.
+const (
+	LabelShell     = "type.shell"
+	LabelHTTP      = "type.http"
+	LabelContainer = "type.container"
+)
+
 type Server struct {
 	grpcapi.UnimplementedWorkerServiceServer
 
 	id          uint32
 	address     string
 	slots       int
+	labels      map[string]string
 	maxOutput   int
+	env         []string // base environment for tasks
+	docker      *docker  // nil if containers aren't available
 	coordinator grpcapi.CoordinatorServiceClient
 	log         *slog.Logger
 
@@ -44,27 +57,54 @@ type Server struct {
 }
 
 type Options struct {
-	ID          uint32
-	Address     string // host:port the coordinator dials
-	Slots       int    // tasks run concurrently
-	MaxOutput   int    // bytes of output kept per task
-	Coordinator grpcapi.CoordinatorServiceClient
+	ID        uint32
+	Address   string            // host:port the coordinator dials
+	Slots     int               // tasks run concurrently
+	Labels    map[string]string // user labels, e.g. region=eu
+	MaxOutput int               // bytes of output kept per task
+	// PassEnv names worker environment variables that tasks may see. Nothing
+	// else from the worker's environment is passed on.
+	PassEnv []string
+	// DockerSocket enables the container executor if the daemon answers.
+	DockerSocket string
+	Coordinator  grpcapi.CoordinatorServiceClient
 }
 
 func NewServer(opts Options) *Server {
 	ctx, kill := context.WithCancelCause(context.Background())
-	return &Server{
+	s := &Server{
 		id:          opts.ID,
 		address:     opts.Address,
 		slots:       max(opts.Slots, 1),
 		maxOutput:   opts.MaxOutput,
+		env:         baseEnv(opts.PassEnv),
 		coordinator: opts.Coordinator,
 		log:         slog.Default(),
 		tasksCtx:    ctx,
 		killTasks:   kill,
 		running:     make(map[string]context.CancelCauseFunc),
 	}
+
+	s.labels = maps.Clone(opts.Labels)
+	if s.labels == nil {
+		s.labels = make(map[string]string)
+	}
+	s.labels[LabelShell] = "true"
+	s.labels[LabelHTTP] = "true"
+	if opts.DockerSocket != "" {
+		d := newDocker(opts.DockerSocket)
+		if err := d.Ping(context.Background()); err != nil {
+			s.log.Info("Container tasks disabled: Docker is not reachable", "socket", opts.DockerSocket, "error", err)
+		} else {
+			s.docker = d
+			s.labels[LabelContainer] = "true"
+		}
+	}
+	return s
 }
+
+// Labels returns the labels the worker advertises.
+func (s *Server) Labels() map[string]string { return maps.Clone(s.labels) }
 
 // ID derives a stable worker ID from the advertised address, so replicas of
 // the same service get distinct IDs without configuration.
@@ -94,14 +134,15 @@ func (s *Server) SubmitTask(_ context.Context, req *grpcapi.TaskRequest) (*grpca
 	reject := func(msg string) (*grpcapi.TaskResponse, error) {
 		return &grpcapi.TaskResponse{TaskId: req.TaskId, Message: msg}, nil
 	}
-	if s.draining {
+	switch {
+	case s.draining:
 		return reject("worker is draining")
-	}
-	if len(s.running) >= s.slots {
+	case len(s.running) >= s.slots:
 		return reject("no free slot")
-	}
-	if _, dup := s.running[req.TaskId]; dup {
+	case s.running[req.TaskId] != nil:
 		return reject("task is already running here")
+	case req.Type == "container" && s.docker == nil:
+		return reject("container tasks are not available on this worker")
 	}
 
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)
@@ -131,30 +172,51 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 		s.mu.Unlock()
 	}()
 
-	log := s.log.With("task_id", task.TaskId, "attempt", task.RetryCount)
+	log := s.log.With("task_id", task.TaskId, "type", task.Type, "attempt", task.RetryCount)
 	log.Info("Task started")
-	s.report(task.TaskId, grpcapi.TaskStatus_STARTED, "", "")
+	s.report(task.TaskId, grpcapi.TaskStatus_STARTED, "", "", nil)
 
 	timeout := time.Duration(task.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
+	env := maps.Clone(task.Env)
+	if env == nil {
+		env = make(map[string]string)
+	}
+	env["CONDUCTOR_TASK_ID"] = task.TaskId
+	env["CONDUCTOR_ATTEMPT"] = strconv.Itoa(int(task.RetryCount))
+
 	start := time.Now()
-	output, err := runShell(ctx, task.Data, timeout, s.maxOutput)
+	var (
+		output  string
+		outputs map[string]string
+		err     error
+	)
+	switch task.Type {
+	case "", "shell":
+		output, outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.maxOutput)
+	case "http":
+		output, outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
+	case "container":
+		output, err = s.docker.run(ctx, task.TaskId, task.SpecJson, taskEnv(nil, env), timeout, s.maxOutput)
+	default:
+		err = fmt.Errorf("unknown task type %q", task.Type)
+	}
 
 	if err != nil {
 		if cause := context.Cause(ctx); cause != nil {
 			err = cause
 		}
 		log.Warn("Task failed", "error", err, "duration", time.Since(start))
-		s.report(task.TaskId, grpcapi.TaskStatus_FAILED, output, err.Error())
+		s.report(task.TaskId, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
 		return
 	}
 	log.Info("Task completed", "duration", time.Since(start))
-	s.report(task.TaskId, grpcapi.TaskStatus_COMPLETE, output, "")
+	s.report(task.TaskId, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
 }
 
-func (s *Server) report(taskID string, status grpcapi.TaskStatus, output, errMsg string) {
+func (s *Server) report(taskID string, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
 	// Use a fresh context: results must be reported even while shutting down.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -164,6 +226,7 @@ func (s *Server) report(taskID string, status grpcapi.TaskStatus, output, errMsg
 		Status:       status,
 		Output:       output,
 		ErrorMessage: errMsg,
+		Outputs:      outputs,
 	})
 	if err != nil {
 		s.log.Error("Failed to report task status", "task_id", taskID, "status", status, "error", err)
@@ -195,13 +258,16 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 	defer cancel()
 
 	s.mu.Lock()
-	draining := s.draining
+	draining, running := s.draining, len(s.running)
 	s.mu.Unlock()
 
 	_, err := s.coordinator.SendHeartbeat(ctx, &grpcapi.HeartbeatRequest{
 		WorkerId: s.id,
 		Address:  s.address,
 		Draining: draining,
+		Slots:    int32(s.slots),
+		Running:  int32(running),
+		Labels:   s.labels,
 	})
 	if err != nil {
 		s.log.Warn("Heartbeat failed", "error", err)

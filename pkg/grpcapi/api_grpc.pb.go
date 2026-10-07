@@ -30,7 +30,7 @@ const (
 // Implemented by workers; called by the coordinator.
 type WorkerServiceClient interface {
 	SubmitTask(ctx context.Context, in *TaskRequest, opts ...grpc.CallOption) (*TaskResponse, error)
-	// Kills the task's process if it is running on this worker.
+	// Kills the task if it is running on this worker.
 	CancelTask(ctx context.Context, in *CancelTaskRequest, opts ...grpc.CallOption) (*CancelTaskResponse, error)
 }
 
@@ -69,7 +69,7 @@ func (c *workerServiceClient) CancelTask(ctx context.Context, in *CancelTaskRequ
 // Implemented by workers; called by the coordinator.
 type WorkerServiceServer interface {
 	SubmitTask(context.Context, *TaskRequest) (*TaskResponse, error)
-	// Kills the task's process if it is running on this worker.
+	// Kills the task if it is running on this worker.
 	CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }

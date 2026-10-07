@@ -1,0 +1,22 @@
+name: trip_booking_slow
+description: Like trip_booking, but booking the hotel takes 30 seconds, leaving time to cancel the run.
+inputs:
+  user_id: {required: true}
+  amount: {required: true}
+defaults:
+  retries: 0
+  timeout: 2m
+steps:
+  - name: book_flight
+    run: echo "booking flight for user=$INPUT_USER_ID"
+    compensate: echo "cancelling flight for user=$INPUT_USER_ID"
+
+  - name: book_hotel
+    depends_on: [book_flight]
+    run: echo "waiting for a hotel for user=$INPUT_USER_ID" && sleep 30
+    compensate: echo "cancelling hotel for user=$INPUT_USER_ID"
+
+  - name: charge_payment
+    depends_on: [book_hotel]
+    run: echo "charging amount=$INPUT_AMOUNT for user=$INPUT_USER_ID"
+    compensate: echo "refunding amount=$INPUT_AMOUNT for user=$INPUT_USER_ID"

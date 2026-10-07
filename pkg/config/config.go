@@ -42,6 +42,9 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	MaxOutputBytes  int
 	MaxRequestBytes int64
+	// PriorityAging raises a waiting task's priority one level per interval
+	// so low-priority work can't starve. Zero disables it.
+	PriorityAging time.Duration
 }
 
 type DB struct {
@@ -67,6 +70,11 @@ func (d DB) DSN() string {
 type Worker struct {
 	ID            uint32 // 0 means derive from the advertised address
 	AdvertiseAddr string // host:port the coordinator dials; empty means auto-detect
+	Slots         int    // tasks run at once
+	Labels        map[string]string
+	// PassEnv names worker environment variables that tasks may see.
+	PassEnv      []string
+	DockerSocket string // enables container tasks when Docker answers here
 }
 
 // TLS secures gRPC between components. All components share one certificate
@@ -97,6 +105,8 @@ func Load() (*Config, error) {
 		WorkerListen:      env("CONDUCTOR_WORKER_LISTEN", ":9000"),
 		Worker: Worker{
 			AdvertiseAddr: os.Getenv("CONDUCTOR_WORKER_ADVERTISE_ADDR"),
+			DockerSocket:  env("CONDUCTOR_DOCKER_SOCKET", "/var/run/docker.sock"),
+			PassEnv:       splitList(os.Getenv("CONDUCTOR_WORKER_PASS_ENV")),
 		},
 		ClusterToken: os.Getenv("CONDUCTOR_CLUSTER_TOKEN"),
 		APIKey:       os.Getenv("CONDUCTOR_API_KEY"),
@@ -130,6 +140,15 @@ func Load() (*Config, error) {
 	collect(wrap("CONDUCTOR_MAX_OUTPUT_BYTES", err))
 	c.MaxRequestBytes, err = strconv.ParseInt(env("CONDUCTOR_MAX_REQUEST_BYTES", "1048576"), 10, 64)
 	collect(wrap("CONDUCTOR_MAX_REQUEST_BYTES", err))
+	c.PriorityAging, err = time.ParseDuration(env("CONDUCTOR_PRIORITY_AGING", "60s"))
+	collect(wrap("CONDUCTOR_PRIORITY_AGING", err))
+	c.Worker.Slots, err = strconv.Atoi(env("CONDUCTOR_WORKER_SLOTS", "2"))
+	collect(wrap("CONDUCTOR_WORKER_SLOTS", err))
+	if err == nil && c.Worker.Slots < 1 {
+		collect(errors.New("CONDUCTOR_WORKER_SLOTS must be at least 1"))
+	}
+	c.Worker.Labels, err = parseLabels(os.Getenv("CONDUCTOR_WORKER_LABELS"))
+	collect(wrap("CONDUCTOR_WORKER_LABELS", err))
 
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		collect(fmt.Errorf("CONDUCTOR_LOG_FORMAT must be text or json, got %q", c.LogFormat))
@@ -169,6 +188,34 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseLabels parses "k1=v1,k2=v2".
+func parseLabels(s string) (map[string]string, error) {
+	labels := make(map[string]string)
+	for _, pair := range splitList(s) {
+		k, v, ok := strings.Cut(pair, "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" {
+			return nil, fmt.Errorf("label %q must look like key=value", pair)
+		}
+		if strings.HasPrefix(k, "type.") {
+			return nil, fmt.Errorf("label %q: the type. prefix is reserved", k)
+		}
+		labels[k] = strings.TrimSpace(v)
+	}
+	return labels, nil
+}
+
+// splitList splits a comma-separated list, dropping empty items.
+func splitList(s string) []string {
+	var out []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func wrap(key string, err error) error {

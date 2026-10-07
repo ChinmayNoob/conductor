@@ -14,6 +14,8 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/app"
 	"github.com/ChinmayNoob/conductor/pkg/config"
 	"github.com/ChinmayNoob/conductor/pkg/logging"
+	"github.com/ChinmayNoob/conductor/pkg/security"
+	_ "time/tzdata" // schedules may use any time zone, even without OS tz data
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -22,6 +24,7 @@ var version = "dev"
 const usage = `Usage: conductor <command>
 
 Commands:
+  dev           Run everything (coordinator, API, one worker) in this process
   coordinator   Dispatch tasks to workers and drive workflows (gRPC, default :8080)
   api           Serve the HTTP API (default :8081)
   worker        Execute tasks (gRPC, default :9000)
@@ -40,6 +43,7 @@ func main() {
 		"coordinator": app.RunCoordinator,
 		"api":         app.RunAPI,
 		"worker":      app.RunWorker,
+		"dev":         app.RunDev,
 	}
 
 	cmd := os.Args[1]
@@ -57,6 +61,9 @@ func main() {
 		os.Exit(2)
 	}
 
+	if cmd == "dev" {
+		devDefaults()
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -74,4 +81,16 @@ func main() {
 		os.Exit(1)
 	}
 	log.Info("Stopped")
+}
+
+// devDefaults fills in secrets for `conductor dev` so it runs with no setup.
+// The cluster token is random (everything runs in this process); the API key
+// is fixed so it's easy to use, and printed on startup.
+func devDefaults() {
+	if os.Getenv("CONDUCTOR_CLUSTER_TOKEN") == "" {
+		_ = os.Setenv("CONDUCTOR_CLUSTER_TOKEN", security.GenerateAPIKey())
+	}
+	if os.Getenv("CONDUCTOR_API_KEY") == "" {
+		_ = os.Setenv("CONDUCTOR_API_KEY", config.DevPrefix+"api-key")
+	}
 }

@@ -1,50 +1,69 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/task"
 	"github.com/google/uuid"
 )
 
 type createTaskRequest struct {
-	Data              string `json:"data"`
-	Priority          int    `json:"priority,omitempty"`
-	MaxRetries        int    `json:"max_retries,omitempty"`
-	RetryDelaySeconds int    `json:"retry_delay_seconds,omitempty"`
-	TimeoutSeconds    int    `json:"timeout_seconds,omitempty"`
-	DelaySeconds      int    `json:"delay_seconds,omitempty"`
-	ScheduledAt       int64  `json:"scheduled_at,omitempty"` // Unix seconds
+	task.Template
+	// Data is the older name for Command.
+	Data           string `json:"data,omitempty"`
+	DelaySeconds   int    `json:"delay_seconds,omitempty"`
+	ScheduledAt    int64  `json:"scheduled_at,omitempty"` // Unix seconds
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type taskJSON struct {
-	ID             uuid.UUID     `json:"id"`
-	Data           string        `json:"data"`
-	Status         db.TaskStatus `json:"status"`
-	Priority       int           `json:"priority"`
-	MaxRetries     int           `json:"max_retries"`
-	RetryCount     int           `json:"retry_count"`
-	TimeoutSeconds int           `json:"timeout_seconds"`
-	ScheduledAt    time.Time     `json:"scheduled_at"`
-	PickedAt       *time.Time    `json:"picked_at,omitempty"`
-	StartedAt      *time.Time    `json:"started_at,omitempty"`
-	CompletedAt    *time.Time    `json:"completed_at,omitempty"`
-	FailedAt       *time.Time    `json:"failed_at,omitempty"`
-	CancelledAt    *time.Time    `json:"cancelled_at,omitempty"`
-	Output         string        `json:"output,omitempty"`
-	ErrorMessage   string        `json:"error_message,omitempty"`
-	CreatedAt      time.Time     `json:"created_at"`
+	ID             uuid.UUID         `json:"id"`
+	Namespace      string            `json:"namespace"`
+	Queue          string            `json:"queue"`
+	Type           string            `json:"type"`
+	Command        string            `json:"command"`
+	Spec           json.RawMessage   `json:"spec,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	Status         db.TaskStatus     `json:"status"`
+	Priority       int               `json:"priority"`
+	MaxRetries     int               `json:"max_retries"`
+	RetryCount     int               `json:"retry_count"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+	ScheduledAt    time.Time         `json:"scheduled_at"`
+	PickedAt       *time.Time        `json:"picked_at,omitempty"`
+	StartedAt      *time.Time        `json:"started_at,omitempty"`
+	CompletedAt    *time.Time        `json:"completed_at,omitempty"`
+	FailedAt       *time.Time        `json:"failed_at,omitempty"`
+	CancelledAt    *time.Time        `json:"cancelled_at,omitempty"`
+	Output         string            `json:"output,omitempty"`
+	Outputs        map[string]string `json:"outputs,omitempty"`
+	ErrorMessage   string            `json:"error_message,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	WorkflowID     *uuid.UUID        `json:"workflow_id,omitempty"`
+	WorkerID       *int64            `json:"worker_id,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
 }
 
 func toTaskJSON(t *db.Task) taskJSON {
+	// Hide the internal type.* labels; they are implied by the type.
+	labels := make(map[string]string)
+	for k, v := range t.Requirements {
+		if k != "type."+t.Type {
+			labels[k] = v
+		}
+	}
 	return taskJSON{
-		ID: t.ID, Data: t.Data, Status: t.Status, Priority: t.Priority, MaxRetries: t.MaxRetries,
+		ID: t.ID, Namespace: t.Namespace, Queue: t.Queue, Type: t.Type, Command: t.Data, Spec: t.Spec,
+		Labels: labels, Status: t.Status, Priority: t.Priority, MaxRetries: t.MaxRetries,
 		RetryCount: t.RetryCount, TimeoutSeconds: t.TimeoutSeconds, ScheduledAt: t.ScheduledAt,
 		PickedAt: t.PickedAt, StartedAt: t.StartedAt, CompletedAt: t.CompletedAt, FailedAt: t.FailedAt,
-		CancelledAt: t.CancelledAt, Output: t.Output, ErrorMessage: t.ErrorMessage, CreatedAt: t.CreatedAt,
+		CancelledAt: t.CancelledAt, Output: t.Output, Outputs: t.Outputs, ErrorMessage: t.ErrorMessage,
+		IdempotencyKey: t.IdempotencyKey, WorkflowID: t.WorkflowID, WorkerID: t.WorkerID, CreatedAt: t.CreatedAt,
 	}
 }
 
@@ -53,18 +72,19 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &req) {
 		return
 	}
+	if req.Command == "" {
+		req.Command = req.Data
+	}
 	switch {
-	case req.Data == "":
-		writeError(w, http.StatusBadRequest, "data is required")
-		return
-	case req.Priority < 0 || req.Priority > 10:
-		writeError(w, http.StatusBadRequest, "priority must be between 1 and 10")
-		return
-	case req.MaxRetries < 0 || req.RetryDelaySeconds < 0 || req.TimeoutSeconds < 0 || req.DelaySeconds < 0:
-		writeError(w, http.StatusBadRequest, "max_retries, retry_delay_seconds, timeout_seconds and delay_seconds must not be negative")
+	case req.DelaySeconds < 0:
+		writeError(w, http.StatusBadRequest, "delay_seconds must not be negative")
 		return
 	case req.DelaySeconds > 0 && req.ScheduledAt > 0:
 		writeError(w, http.StatusBadRequest, "set either delay_seconds or scheduled_at, not both")
+		return
+	}
+	if err := req.Template.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -72,38 +92,49 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if req.DelaySeconds > 0 {
 		scheduledAt = time.Now().Add(time.Duration(req.DelaySeconds) * time.Second).Unix()
 	}
+	tmpl, err := json.Marshal(req.Template)
+	if err != nil {
+		s.internalError(w, "Failed to encode task", err)
+		return
+	}
 
 	resp, err := s.coordinator.SubmitTask(r.Context(), &grpcapi.ClientTaskRequest{
-		Data:              req.Data,
-		Priority:          int32(req.Priority),
-		MaxRetries:        int32(req.MaxRetries),
-		RetryDelaySeconds: int32(req.RetryDelaySeconds),
-		TimeoutSeconds:    int32(req.TimeoutSeconds),
-		ScheduledAt:       scheduledAt,
+		Namespace:      namespace(r),
+		TemplateJson:   tmpl,
+		ScheduledAt:    scheduledAt,
+		IdempotencyKey: req.IdempotencyKey,
 	})
 	if err != nil {
 		s.writeRPCError(w, err)
 		return
 	}
-	s.respondWithTask(w, r, resp.TaskId, http.StatusCreated)
+	s.respondWithTask(w, r, resp.TaskId, createdOr(resp.Created))
 }
 
-func (s *Server) respondWithTask(w http.ResponseWriter, r *http.Request, rawID string, code int) {
+// loadTask returns the task if it exists in the request's namespace. It
+// writes the error response itself and returns nil otherwise.
+func (s *Server) loadTask(w http.ResponseWriter, r *http.Request, rawID string) *db.Task {
 	id, err := uuid.Parse(rawID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid task ID")
-		return
+		return nil
 	}
 	t, err := s.db.GetTask(r.Context(), id)
 	if err != nil {
 		s.internalError(w, "Failed to get task", err)
-		return
+		return nil
 	}
-	if t == nil {
+	if t == nil || t.Namespace != namespace(r) {
 		writeError(w, http.StatusNotFound, "task not found")
-		return
+		return nil
 	}
-	writeJSON(w, code, toTaskJSON(t))
+	return t
+}
+
+func (s *Server) respondWithTask(w http.ResponseWriter, r *http.Request, rawID string, code int) {
+	if t := s.loadTask(w, r, rawID); t != nil {
+		writeJSON(w, code, toTaskJSON(t))
+	}
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
@@ -111,16 +142,37 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
-	st := db.TaskStatus(r.URL.Query().Get("status"))
+	q := r.URL.Query()
+	st := db.TaskStatus(q.Get("status"))
 	if st != "" && !st.Valid() {
 		writeError(w, http.StatusBadRequest, "unknown status "+strconv.Quote(string(st)))
 		return
 	}
+	f := db.TaskFilter{Namespace: namespace(r), Status: st, Queue: q.Get("queue")}
+	if wf := q.Get("workflow_id"); wf != "" {
+		id, err := uuid.Parse(wf)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid workflow_id")
+			return
+		}
+		f.WorkflowID = &id
+	}
+	s.listTasks(w, r, f)
+}
+
+// handleDeadLetter lists tasks that failed permanently and aren't part of a
+// workflow (workflow failures are handled by compensation).
+func (s *Server) handleDeadLetter(w http.ResponseWriter, r *http.Request) {
+	s.listTasks(w, r, db.TaskFilter{Namespace: namespace(r), Queue: r.URL.Query().Get("queue"), DeadLetter: true})
+}
+
+func (s *Server) listTasks(w http.ResponseWriter, r *http.Request, f db.TaskFilter) {
 	limit, ok := parseLimit(w, r)
 	if !ok {
 		return
 	}
-	tasks, err := s.db.ListTasks(r.Context(), st, limit)
+	f.Limit = limit
+	tasks, err := s.db.ListTasks(r.Context(), f)
 	if err != nil {
 		s.internalError(w, "Failed to list tasks", err)
 		return
@@ -138,7 +190,7 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid task ID")
 		return
 	}
-	resp, err := s.coordinator.CancelTask(r.Context(), &grpcapi.CancelTaskRequest{TaskId: id})
+	resp, err := s.coordinator.CancelTask(r.Context(), &grpcapi.CancelTaskRequest{TaskId: id, Namespace: namespace(r)})
 	if err != nil {
 		s.writeRPCError(w, err)
 		return
@@ -150,8 +202,26 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	s.respondWithTask(w, r, id, http.StatusOK)
 }
 
+// handleRequeueTask gives a dead-lettered task a fresh set of retries.
+func (s *Server) handleRequeueTask(w http.ResponseWriter, r *http.Request) {
+	t := s.loadTask(w, r, r.PathValue("id"))
+	if t == nil {
+		return
+	}
+	requeued, err := s.db.RequeueFailedTask(r.Context(), t.ID)
+	if err != nil {
+		s.internalError(w, "Failed to requeue task", err)
+		return
+	}
+	if requeued == nil {
+		writeError(w, http.StatusConflict, "only permanently failed tasks outside workflows can be requeued")
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskJSON(requeued))
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	counts, err := s.db.TaskCounts(r.Context())
+	counts, err := s.db.TaskCounts(r.Context(), namespace(r))
 	if err != nil {
 		s.internalError(w, "Failed to count tasks", err)
 		return
@@ -162,18 +232,4 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		out["total"] += counts[st]
 	}
 	writeJSON(w, http.StatusOK, out)
-}
-
-// parseLimit reads ?limit= (default 100, max 1000).
-func parseLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
-	raw := r.URL.Query().Get("limit")
-	if raw == "" {
-		return 100, true
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 || n > 1000 {
-		writeError(w, http.StatusBadRequest, "limit must be between 1 and 1000")
-		return 0, false
-	}
-	return n, true
 }

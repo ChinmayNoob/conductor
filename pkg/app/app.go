@@ -34,7 +34,10 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	srv := coordinator.NewServer(database, dialOpts)
+	srv := coordinator.NewServer(database, coordinator.Options{
+		DialOptions:   dialOpts,
+		PriorityAging: cfg.PriorityAging,
+	})
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterCoordinatorServiceServer(grpcServer, srv)
 
@@ -134,11 +137,14 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	slog.SetDefault(slog.Default().With("worker_id", id))
 
 	w := worker.NewServer(worker.Options{
-		ID:          id,
-		Address:     address,
-		Slots:       1,
-		MaxOutput:   cfg.MaxOutputBytes,
-		Coordinator: grpcapi.NewCoordinatorServiceClient(conn),
+		ID:           id,
+		Address:      address,
+		Slots:        cfg.Worker.Slots,
+		Labels:       cfg.Worker.Labels,
+		MaxOutput:    cfg.MaxOutputBytes,
+		PassEnv:      cfg.Worker.PassEnv,
+		DockerSocket: cfg.Worker.DockerSocket,
+		Coordinator:  grpcapi.NewCoordinatorServiceClient(conn),
 	})
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterWorkerServiceServer(grpcServer, w)
@@ -152,7 +158,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	defer stopHeartbeats()
 	go w.RunHeartbeats(heartbeatCtx)
 
-	slog.Info("Worker listening", "addr", lis.Addr().String(), "advertise", address)
+	slog.Info("Worker listening", "addr", lis.Addr().String(), "advertise", address,
+		"slots", cfg.Worker.Slots, "labels", w.Labels())
 	err = serveUntilDone(ctx, func() error { return grpcServer.Serve(lis) })
 
 	slog.Info("Shutting down")
@@ -162,6 +169,58 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	stopHeartbeats()
 	gracefulStop(grpcServer, 5*time.Second)
 	return err
+}
+
+// RunDev runs the coordinator, the API and one worker in this process: the
+// quickest way to try Conductor or develop against it. Only Postgres is
+// needed.
+func RunDev(ctx context.Context, cfg *config.Config) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Everything talks over loopback.
+	_, coordPort, err := net.SplitHostPort(cfg.CoordinatorListen)
+	if err != nil {
+		return fmt.Errorf("invalid CONDUCTOR_COORDINATOR_LISTEN: %w", err)
+	}
+	cfg.CoordinatorAddr = net.JoinHostPort("127.0.0.1", coordPort)
+	if cfg.Worker.AdvertiseAddr == "" {
+		_, workerPort, err := net.SplitHostPort(cfg.WorkerListen)
+		if err != nil {
+			return fmt.Errorf("invalid CONDUCTOR_WORKER_LISTEN: %w", err)
+		}
+		cfg.Worker.AdvertiseAddr = net.JoinHostPort("127.0.0.1", workerPort)
+	}
+
+	// Migrate once up front so the components don't race to do it.
+	database, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	database.Close()
+
+	errc := make(chan error, 3)
+	for name, run := range map[string]func(context.Context, *config.Config) error{
+		"coordinator": RunCoordinator, "api": RunAPI, "worker": RunWorker,
+	} {
+		go func() {
+			if err := run(ctx, cfg); err != nil {
+				errc <- fmt.Errorf("%s: %w", name, err)
+				return
+			}
+			errc <- nil
+		}()
+	}
+
+	slog.Info("Conductor dev mode is up", "api", "http://localhost"+cfg.APIListen, "api_key", cfg.APIKey)
+	var firstErr error
+	for range 3 {
+		if err := <-errc; err != nil && firstErr == nil {
+			firstErr = err
+			cancel() // one component failed: stop the rest
+		}
+	}
+	return firstErr
 }
 
 func openDB(ctx context.Context, cfg *config.Config) (*db.DB, error) {

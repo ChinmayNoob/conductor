@@ -76,9 +76,12 @@ func (TaskStatus) EnumDescriptor() ([]byte, []int) {
 type TaskRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	TaskId         string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	Data           string                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	Data           string                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"` // shell command (type "shell")
 	TimeoutSeconds int32                  `protobuf:"varint,3,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
-	RetryCount     int32                  `protobuf:"varint,4,opt,name=retry_count,json=retryCount,proto3" json:"retry_count,omitempty"` // Current retry attempt (for logging)
+	RetryCount     int32                  `protobuf:"varint,4,opt,name=retry_count,json=retryCount,proto3" json:"retry_count,omitempty"`                                          // current attempt, for logging
+	Type           string                 `protobuf:"bytes,5,opt,name=type,proto3" json:"type,omitempty"`                                                                         // shell, http or container
+	SpecJson       []byte                 `protobuf:"bytes,6,opt,name=spec_json,json=specJson,proto3" json:"spec_json,omitempty"`                                                 // type-specific settings
+	Env            map[string]string      `protobuf:"bytes,7,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // extra environment variables
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -139,6 +142,27 @@ func (x *TaskRequest) GetRetryCount() int32 {
 		return x.RetryCount
 	}
 	return 0
+}
+
+func (x *TaskRequest) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *TaskRequest) GetSpecJson() []byte {
+	if x != nil {
+		return x.SpecJson
+	}
+	return nil
+}
+
+func (x *TaskRequest) GetEnv() map[string]string {
+	if x != nil {
+		return x.Env
+	}
+	return nil
 }
 
 type TaskResponse struct {
@@ -202,15 +226,13 @@ func (x *TaskResponse) GetSuccess() bool {
 }
 
 type ClientTaskRequest struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	Data              string                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
-	Priority          int32                  `protobuf:"varint,2,opt,name=priority,proto3" json:"priority,omitempty"`                                              // 1-10, lower = higher priority (default 5)
-	MaxRetries        int32                  `protobuf:"varint,3,opt,name=max_retries,json=maxRetries,proto3" json:"max_retries,omitempty"`                        // Max retry attempts (default 3)
-	RetryDelaySeconds int32                  `protobuf:"varint,4,opt,name=retry_delay_seconds,json=retryDelaySeconds,proto3" json:"retry_delay_seconds,omitempty"` // Base delay between retries (default 60)
-	TimeoutSeconds    int32                  `protobuf:"varint,5,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`            // Task timeout (default 300)
-	ScheduledAt       int64                  `protobuf:"varint,6,opt,name=scheduled_at,json=scheduledAt,proto3" json:"scheduled_at,omitempty"`                     // Unix timestamp for delayed execution (0 = now)
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Namespace      string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	TemplateJson   []byte                 `protobuf:"bytes,2,opt,name=template_json,json=templateJson,proto3" json:"template_json,omitempty"` // a task.Template, validated by the coordinator
+	ScheduledAt    int64                  `protobuf:"varint,3,opt,name=scheduled_at,json=scheduledAt,proto3" json:"scheduled_at,omitempty"`   // Unix seconds; 0 = now
+	IdempotencyKey string                 `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ClientTaskRequest) Reset() {
@@ -243,39 +265,18 @@ func (*ClientTaskRequest) Descriptor() ([]byte, []int) {
 	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{2}
 }
 
-func (x *ClientTaskRequest) GetData() string {
+func (x *ClientTaskRequest) GetNamespace() string {
 	if x != nil {
-		return x.Data
+		return x.Namespace
 	}
 	return ""
 }
 
-func (x *ClientTaskRequest) GetPriority() int32 {
+func (x *ClientTaskRequest) GetTemplateJson() []byte {
 	if x != nil {
-		return x.Priority
+		return x.TemplateJson
 	}
-	return 0
-}
-
-func (x *ClientTaskRequest) GetMaxRetries() int32 {
-	if x != nil {
-		return x.MaxRetries
-	}
-	return 0
-}
-
-func (x *ClientTaskRequest) GetRetryDelaySeconds() int32 {
-	if x != nil {
-		return x.RetryDelaySeconds
-	}
-	return 0
-}
-
-func (x *ClientTaskRequest) GetTimeoutSeconds() int32 {
-	if x != nil {
-		return x.TimeoutSeconds
-	}
-	return 0
+	return nil
 }
 
 func (x *ClientTaskRequest) GetScheduledAt() int64 {
@@ -285,9 +286,17 @@ func (x *ClientTaskRequest) GetScheduledAt() int64 {
 	return 0
 }
 
+func (x *ClientTaskRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
 type ClientTaskResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	Created       bool                   `protobuf:"varint,2,opt,name=created,proto3" json:"created,omitempty"` // false if the idempotency key matched an existing task
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -329,9 +338,17 @@ func (x *ClientTaskResponse) GetTaskId() string {
 	return ""
 }
 
+func (x *ClientTaskResponse) GetCreated() bool {
+	if x != nil {
+		return x.Created
+	}
+	return false
+}
+
 type CancelTaskRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"` // required on the coordinator, ignored by workers
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -369,6 +386,13 @@ func (*CancelTaskRequest) Descriptor() ([]byte, []int) {
 func (x *CancelTaskRequest) GetTaskId() string {
 	if x != nil {
 		return x.TaskId
+	}
+	return ""
+}
+
+func (x *CancelTaskRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
 	}
 	return ""
 }
@@ -423,7 +447,10 @@ type HeartbeatRequest struct {
 	WorkerId uint32                 `protobuf:"varint,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	Address  string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
 	// A draining worker finishes its current tasks but accepts no new ones.
-	Draining      bool `protobuf:"varint,3,opt,name=draining,proto3" json:"draining,omitempty"`
+	Draining      bool              `protobuf:"varint,3,opt,name=draining,proto3" json:"draining,omitempty"`
+	Slots         int32             `protobuf:"varint,4,opt,name=slots,proto3" json:"slots,omitempty"`     // tasks it can run at once
+	Running       int32             `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"` // tasks it is running now
+	Labels        map[string]string `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -479,6 +506,27 @@ func (x *HeartbeatRequest) GetDraining() bool {
 	return false
 }
 
+func (x *HeartbeatRequest) GetSlots() int32 {
+	if x != nil {
+		return x.Slots
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetRunning() int32 {
+	if x != nil {
+		return x.Running
+	}
+	return 0
+}
+
+func (x *HeartbeatRequest) GetLabels() map[string]string {
+	if x != nil {
+		return x.Labels
+	}
+	return nil
+}
+
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Acknowledged  bool                   `protobuf:"varint,1,opt,name=acknowledged,proto3" json:"acknowledged,omitempty"`
@@ -528,7 +576,8 @@ type UpdateTaskStatusRequest struct {
 	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
 	Status        TaskStatus             `protobuf:"varint,2,opt,name=status,proto3,enum=grpcapi.TaskStatus" json:"status,omitempty"`
 	Output        string                 `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"`
-	ErrorMessage  string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"` // Set when status is FAILED
+	ErrorMessage  string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`                                             // set when status is FAILED
+	Outputs       map[string]string      `protobuf:"bytes,5,rep,name=outputs,proto3" json:"outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -591,9 +640,16 @@ func (x *UpdateTaskStatusRequest) GetErrorMessage() string {
 	return ""
 }
 
+func (x *UpdateTaskStatusRequest) GetOutputs() map[string]string {
+	if x != nil {
+		return x.Outputs
+	}
+	return nil
+}
+
 type UpdateTaskStatusResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	ShouldRetry   bool                   `protobuf:"varint,1,opt,name=should_retry,json=shouldRetry,proto3" json:"should_retry,omitempty"` // The coordinator will retry the failed task
+	ShouldRetry   bool                   `protobuf:"varint,1,opt,name=should_retry,json=shouldRetry,proto3" json:"should_retry,omitempty"` // the coordinator will retry the failed task
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -636,11 +692,14 @@ func (x *UpdateTaskStatusResponse) GetShouldRetry() bool {
 }
 
 type WorkflowRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	WorkflowType  string                 `protobuf:"bytes,1,opt,name=workflow_type,json=workflowType,proto3" json:"workflow_type,omitempty"`
-	InputJson     string                 `protobuf:"bytes,2,opt,name=input_json,json=inputJson,proto3" json:"input_json,omitempty"` // JSON object passed to step commands
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Namespace      string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`                            // workflow definition name
+	Version        int32                  `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`                     // 0 = latest
+	InputJson      string                 `protobuf:"bytes,4,opt,name=input_json,json=inputJson,proto3" json:"input_json,omitempty"` // JSON object of inputs
+	IdempotencyKey string                 `protobuf:"bytes,5,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *WorkflowRequest) Reset() {
@@ -673,11 +732,25 @@ func (*WorkflowRequest) Descriptor() ([]byte, []int) {
 	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{10}
 }
 
-func (x *WorkflowRequest) GetWorkflowType() string {
+func (x *WorkflowRequest) GetNamespace() string {
 	if x != nil {
-		return x.WorkflowType
+		return x.Namespace
 	}
 	return ""
+}
+
+func (x *WorkflowRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *WorkflowRequest) GetVersion() int32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
 }
 
 func (x *WorkflowRequest) GetInputJson() string {
@@ -687,9 +760,17 @@ func (x *WorkflowRequest) GetInputJson() string {
 	return ""
 }
 
+func (x *WorkflowRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
 type WorkflowResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Created       bool                   `protobuf:"varint,2,opt,name=created,proto3" json:"created,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -731,9 +812,17 @@ func (x *WorkflowResponse) GetWorkflowId() string {
 	return ""
 }
 
+func (x *WorkflowResponse) GetCreated() bool {
+	if x != nil {
+		return x.Created
+	}
+	return false
+}
+
 type CancelWorkflowRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -771,6 +860,13 @@ func (*CancelWorkflowRequest) Descriptor() ([]byte, []int) {
 func (x *CancelWorkflowRequest) GetWorkflowId() string {
 	if x != nil {
 		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *CancelWorkflowRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
 	}
 	return ""
 }
@@ -824,54 +920,74 @@ var File_pkg_grpcapi_api_proto protoreflect.FileDescriptor
 
 const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\n" +
-	"\x15pkg/grpcapi/api.proto\x12\agrpcapi\"\x84\x01\n" +
+	"\x15pkg/grpcapi/api.proto\x12\agrpcapi\"\x9e\x02\n" +
 	"\vTaskRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\tR\x04data\x12'\n" +
 	"\x0ftimeout_seconds\x18\x03 \x01(\x05R\x0etimeoutSeconds\x12\x1f\n" +
 	"\vretry_count\x18\x04 \x01(\x05R\n" +
-	"retryCount\"[\n" +
+	"retryCount\x12\x12\n" +
+	"\x04type\x18\x05 \x01(\tR\x04type\x12\x1b\n" +
+	"\tspec_json\x18\x06 \x01(\fR\bspecJson\x12/\n" +
+	"\x03env\x18\a \x03(\v2\x1d.grpcapi.TaskRequest.EnvEntryR\x03env\x1a6\n" +
+	"\bEnvEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"[\n" +
 	"\fTaskResponse\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x18\n" +
-	"\asuccess\x18\x03 \x01(\bR\asuccess\"\xe0\x01\n" +
-	"\x11ClientTaskRequest\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\tR\x04data\x12\x1a\n" +
-	"\bpriority\x18\x02 \x01(\x05R\bpriority\x12\x1f\n" +
-	"\vmax_retries\x18\x03 \x01(\x05R\n" +
-	"maxRetries\x12.\n" +
-	"\x13retry_delay_seconds\x18\x04 \x01(\x05R\x11retryDelaySeconds\x12'\n" +
-	"\x0ftimeout_seconds\x18\x05 \x01(\x05R\x0etimeoutSeconds\x12!\n" +
-	"\fscheduled_at\x18\x06 \x01(\x03R\vscheduledAt\"-\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\"\xa2\x01\n" +
+	"\x11ClientTaskRequest\x12\x1c\n" +
+	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12#\n" +
+	"\rtemplate_json\x18\x02 \x01(\fR\ftemplateJson\x12!\n" +
+	"\fscheduled_at\x18\x03 \x01(\x03R\vscheduledAt\x12'\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"G\n" +
 	"\x12ClientTaskResponse\x12\x17\n" +
-	"\atask_id\x18\x01 \x01(\tR\x06taskId\",\n" +
+	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x18\n" +
+	"\acreated\x18\x02 \x01(\bR\acreated\"J\n" +
 	"\x11CancelTaskRequest\x12\x17\n" +
-	"\atask_id\x18\x01 \x01(\tR\x06taskId\"2\n" +
+	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"2\n" +
 	"\x12CancelTaskResponse\x12\x1c\n" +
-	"\tcancelled\x18\x01 \x01(\bR\tcancelled\"e\n" +
+	"\tcancelled\x18\x01 \x01(\bR\tcancelled\"\x8f\x02\n" +
 	"\x10HeartbeatRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\rR\bworkerId\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1a\n" +
-	"\bdraining\x18\x03 \x01(\bR\bdraining\"7\n" +
+	"\bdraining\x18\x03 \x01(\bR\bdraining\x12\x14\n" +
+	"\x05slots\x18\x04 \x01(\x05R\x05slots\x12\x18\n" +
+	"\arunning\x18\x05 \x01(\x05R\arunning\x12=\n" +
+	"\x06labels\x18\x06 \x03(\v2%.grpcapi.HeartbeatRequest.LabelsEntryR\x06labels\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"7\n" +
 	"\x11HeartbeatResponse\x12\"\n" +
-	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\x9c\x01\n" +
+	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\xa1\x02\n" +
 	"\x17UpdateTaskStatusRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12+\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x13.grpcapi.TaskStatusR\x06status\x12\x16\n" +
 	"\x06output\x18\x03 \x01(\tR\x06output\x12#\n" +
-	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\"=\n" +
+	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\x12G\n" +
+	"\aoutputs\x18\x05 \x03(\v2-.grpcapi.UpdateTaskStatusRequest.OutputsEntryR\aoutputs\x1a:\n" +
+	"\fOutputsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"=\n" +
 	"\x18UpdateTaskStatusResponse\x12!\n" +
-	"\fshould_retry\x18\x01 \x01(\bR\vshouldRetry\"U\n" +
-	"\x0fWorkflowRequest\x12#\n" +
-	"\rworkflow_type\x18\x01 \x01(\tR\fworkflowType\x12\x1d\n" +
+	"\fshould_retry\x18\x01 \x01(\bR\vshouldRetry\"\xa5\x01\n" +
+	"\x0fWorkflowRequest\x12\x1c\n" +
+	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x18\n" +
+	"\aversion\x18\x03 \x01(\x05R\aversion\x12\x1d\n" +
 	"\n" +
-	"input_json\x18\x02 \x01(\tR\tinputJson\"3\n" +
+	"input_json\x18\x04 \x01(\tR\tinputJson\x12'\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"M\n" +
 	"\x10WorkflowResponse\x12\x1f\n" +
 	"\vworkflow_id\x18\x01 \x01(\tR\n" +
-	"workflowId\"8\n" +
+	"workflowId\x12\x18\n" +
+	"\acreated\x18\x02 \x01(\bR\acreated\"V\n" +
 	"\x15CancelWorkflowRequest\x12\x1f\n" +
 	"\vworkflow_id\x18\x01 \x01(\tR\n" +
-	"workflowId\"6\n" +
+	"workflowId\x12\x1c\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"6\n" +
 	"\x16CancelWorkflowResponse\x12\x1c\n" +
 	"\tcancelled\x18\x01 \x01(\bR\tcancelled*?\n" +
 	"\n" +
@@ -910,7 +1026,7 @@ func file_pkg_grpcapi_api_proto_rawDescGZIP() []byte {
 }
 
 var file_pkg_grpcapi_api_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(TaskStatus)(0),                  // 0: grpcapi.TaskStatus
 	(*TaskRequest)(nil),              // 1: grpcapi.TaskRequest
@@ -927,30 +1043,36 @@ var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(*WorkflowResponse)(nil),         // 12: grpcapi.WorkflowResponse
 	(*CancelWorkflowRequest)(nil),    // 13: grpcapi.CancelWorkflowRequest
 	(*CancelWorkflowResponse)(nil),   // 14: grpcapi.CancelWorkflowResponse
+	nil,                              // 15: grpcapi.TaskRequest.EnvEntry
+	nil,                              // 16: grpcapi.HeartbeatRequest.LabelsEntry
+	nil,                              // 17: grpcapi.UpdateTaskStatusRequest.OutputsEntry
 }
 var file_pkg_grpcapi_api_proto_depIdxs = []int32{
-	0,  // 0: grpcapi.UpdateTaskStatusRequest.status:type_name -> grpcapi.TaskStatus
-	1,  // 1: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
-	5,  // 2: grpcapi.WorkerService.CancelTask:input_type -> grpcapi.CancelTaskRequest
-	3,  // 3: grpcapi.CoordinatorService.SubmitTask:input_type -> grpcapi.ClientTaskRequest
-	5,  // 4: grpcapi.CoordinatorService.CancelTask:input_type -> grpcapi.CancelTaskRequest
-	7,  // 5: grpcapi.CoordinatorService.SendHeartbeat:input_type -> grpcapi.HeartbeatRequest
-	9,  // 6: grpcapi.CoordinatorService.UpdateTaskStatus:input_type -> grpcapi.UpdateTaskStatusRequest
-	11, // 7: grpcapi.CoordinatorService.SubmitWorkflow:input_type -> grpcapi.WorkflowRequest
-	13, // 8: grpcapi.CoordinatorService.CancelWorkflow:input_type -> grpcapi.CancelWorkflowRequest
-	2,  // 9: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
-	6,  // 10: grpcapi.WorkerService.CancelTask:output_type -> grpcapi.CancelTaskResponse
-	4,  // 11: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
-	6,  // 12: grpcapi.CoordinatorService.CancelTask:output_type -> grpcapi.CancelTaskResponse
-	8,  // 13: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
-	10, // 14: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
-	12, // 15: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
-	14, // 16: grpcapi.CoordinatorService.CancelWorkflow:output_type -> grpcapi.CancelWorkflowResponse
-	9,  // [9:17] is the sub-list for method output_type
-	1,  // [1:9] is the sub-list for method input_type
-	1,  // [1:1] is the sub-list for extension type_name
-	1,  // [1:1] is the sub-list for extension extendee
-	0,  // [0:1] is the sub-list for field type_name
+	15, // 0: grpcapi.TaskRequest.env:type_name -> grpcapi.TaskRequest.EnvEntry
+	16, // 1: grpcapi.HeartbeatRequest.labels:type_name -> grpcapi.HeartbeatRequest.LabelsEntry
+	0,  // 2: grpcapi.UpdateTaskStatusRequest.status:type_name -> grpcapi.TaskStatus
+	17, // 3: grpcapi.UpdateTaskStatusRequest.outputs:type_name -> grpcapi.UpdateTaskStatusRequest.OutputsEntry
+	1,  // 4: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
+	5,  // 5: grpcapi.WorkerService.CancelTask:input_type -> grpcapi.CancelTaskRequest
+	3,  // 6: grpcapi.CoordinatorService.SubmitTask:input_type -> grpcapi.ClientTaskRequest
+	5,  // 7: grpcapi.CoordinatorService.CancelTask:input_type -> grpcapi.CancelTaskRequest
+	7,  // 8: grpcapi.CoordinatorService.SendHeartbeat:input_type -> grpcapi.HeartbeatRequest
+	9,  // 9: grpcapi.CoordinatorService.UpdateTaskStatus:input_type -> grpcapi.UpdateTaskStatusRequest
+	11, // 10: grpcapi.CoordinatorService.SubmitWorkflow:input_type -> grpcapi.WorkflowRequest
+	13, // 11: grpcapi.CoordinatorService.CancelWorkflow:input_type -> grpcapi.CancelWorkflowRequest
+	2,  // 12: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
+	6,  // 13: grpcapi.WorkerService.CancelTask:output_type -> grpcapi.CancelTaskResponse
+	4,  // 14: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
+	6,  // 15: grpcapi.CoordinatorService.CancelTask:output_type -> grpcapi.CancelTaskResponse
+	8,  // 16: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
+	10, // 17: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
+	12, // 18: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
+	14, // 19: grpcapi.CoordinatorService.CancelWorkflow:output_type -> grpcapi.CancelWorkflowResponse
+	12, // [12:20] is the sub-list for method output_type
+	4,  // [4:12] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_pkg_grpcapi_api_proto_init() }
@@ -964,7 +1086,7 @@ func file_pkg_grpcapi_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_grpcapi_api_proto_rawDesc), len(file_pkg_grpcapi_api_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   14,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

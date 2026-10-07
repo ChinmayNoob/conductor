@@ -31,3 +31,6 @@ go.work.sum
 # .idea/
 # .vscode/
 docs/
+
+# Locally built client binary (go build -o client ./cmd/client)
+/client

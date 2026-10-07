@@ -59,9 +59,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    environment:
-      WORKER_ID: 1
-      WORKER_ADDRESS: worker
+    # No WORKER_ID / WORKER_ADDRESS here: each replica derives its own from
+    # its container IP, so replicas don't register as the same worker.
     depends_on:
       - coordinator
     restart: unless-stopped

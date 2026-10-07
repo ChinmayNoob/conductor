@@ -1,8 +1,11 @@
 package workflow
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -57,18 +60,55 @@ func (r *Registry) ListTypes() []string {
 	return types
 }
 
+// safeValue matches input values that can be pasted into a shell command
+// as-is: no whitespace, quotes or shell metacharacters, and no leading "-" that
+// could be read as a command-line flag.
+var safeValue = regexp.MustCompile(`^([A-Za-z0-9_.,:@+][A-Za-z0-9_.,:@+-]*)?$`)
+
+// ParseInput decodes workflow input, which must be a JSON object of strings,
+// numbers or booleans, and rejects any value that is unsafe to substitute into
+// a shell command.
+func ParseInput(input json.RawMessage) (map[string]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(input))
+	dec.UseNumber()
+	var raw map[string]any
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("input must be a JSON object: %w", err)
+	}
+
+	values := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s string
+		switch v := v.(type) {
+		case string:
+			s = v
+		case json.Number:
+			s = v.String()
+		case bool:
+			s = strconv.FormatBool(v)
+		default:
+			return nil, fmt.Errorf("input %q must be a string, number or boolean", k)
+		}
+		if !safeValue.MatchString(s) {
+			return nil, fmt.Errorf("input %q has characters that are not allowed in commands: %q", k, s)
+		}
+		values[k] = s
+	}
+	return values, nil
+}
+
 // ExpandCommand replaces {{key}} placeholders with values from the context JSON.
-func ExpandCommand(template string, ctx json.RawMessage) string {
-	var data map[string]interface{}
-	if err := json.Unmarshal(ctx, &data); err != nil {
-		return template
+func ExpandCommand(template string, ctx json.RawMessage) (string, error) {
+	values, err := ParseInput(ctx)
+	if err != nil {
+		return "", err
 	}
 	result := template
-	for k, v := range data {
+	for k, v := range values {
 		placeholder := fmt.Sprintf("{{%s}}", k)
-		result = strings.ReplaceAll(result, placeholder, fmt.Sprintf("%v", v))
+		result = strings.ReplaceAll(result, placeholder, v)
 	}
-	return result
+	return result, nil
 }
 
 func (r *Registry) registerBuiltins() {

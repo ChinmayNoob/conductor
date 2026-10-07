@@ -199,72 +199,117 @@ func (db *DB) PickNextTask() (*Task, error) {
 	return task, nil
 }
 
-func (db *DB) UpdateTaskStatus(taskID uuid.UUID, status TaskStatus, startedAt, completedAt, failedAt *time.Time) error {
+// RequeueTask puts a task that was picked but never started back in the queue,
+// e.g. when no worker could accept it.
+func (db *DB) RequeueTask(taskID uuid.UUID) error {
 	_, err := db.conn.Exec(
-		`UPDATE tasks 
-		 SET status = $2, started_at = $3, completed_at = $4, failed_at = $5 
-		 WHERE id = $1`,
-		taskID, status, startedAt, completedAt, failedAt,
+		`UPDATE tasks SET picked_at = NULL WHERE id = $1 AND status = 'QUEUED'`,
+		taskID,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to update task status: %w", err)
+		return fmt.Errorf("failed to requeue task: %w", err)
 	}
 	return nil
 }
 
-func (db *DB) UpdateTaskResult(taskID uuid.UUID, output, errorMessage string) error {
-	_, err := db.conn.Exec(
-		`UPDATE tasks SET output = $2, error_message = $3 WHERE id = $1`,
-		taskID, output, errorMessage,
-	)
-	return err
-}
+// The transitions below only apply to a task that is currently dispatched
+// (picked and not yet finished). A late or duplicate report from a worker
+// therefore changes nothing, and each returns whether the task was updated.
+const dispatchedCondition = `status IN ('QUEUED', 'STARTED') AND picked_at IS NOT NULL`
 
-func (db *DB) IncrementRetryCount(taskID uuid.UUID) (bool, error) {
-	var canRetry bool
-	err := db.conn.QueryRow(
-		`UPDATE tasks 
+// maxRetryDelay caps the exponential back-off between retries.
+const maxRetryDelay = time.Hour
+
+// RetryTask requeues a failed task with exponential back-off if it has retries
+// left. It returns false when the retries are used up.
+func (db *DB) RetryTask(taskID uuid.UUID, errorMessage string) (bool, error) {
+	result, err := db.conn.Exec(
+		`UPDATE tasks
 		 SET retry_count = retry_count + 1,
 		     status = 'QUEUED',
 		     picked_at = NULL,
+		     started_at = NULL,
 		     failed_at = NULL,
-		     scheduled_at = NOW() + (retry_delay_seconds * INTERVAL '1 second')
-		 WHERE id = $1 
-		   AND retry_count < max_retries
-		 RETURNING true`,
-		taskID,
-	).Scan(&canRetry)
-
-	if err == sql.ErrNoRows {
-		return false, nil // Max retries reached
-	}
+		     error_message = $2,
+		     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
+		 WHERE id = $1
+		   AND `+dispatchedCondition+`
+		   AND retry_count < max_retries`,
+		taskID, errorMessage, maxRetryDelay.Seconds(),
+	)
 	if err != nil {
-		return false, fmt.Errorf("failed to increment retry: %w", err)
+		return false, fmt.Errorf("failed to retry task: %w", err)
 	}
-
-	return canRetry, nil
+	return rowsChanged(result)
 }
 
-
-func (db *DB) MarkTaskStarted(taskID uuid.UUID) error {
-	now := time.Now()
-	return db.UpdateTaskStatus(taskID, StatusStarted, &now, nil, nil)
+func (db *DB) MarkTaskStarted(taskID uuid.UUID) (bool, error) {
+	result, err := db.conn.Exec(
+		`UPDATE tasks SET status = 'STARTED', started_at = NOW()
+		 WHERE id = $1 AND status = 'QUEUED' AND picked_at IS NOT NULL`,
+		taskID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark task started: %w", err)
+	}
+	return rowsChanged(result)
 }
 
-func (db *DB) MarkTaskCompleted(taskID uuid.UUID, output string) error {
-	now := time.Now()
-	if err := db.UpdateTaskStatus(taskID, StatusCompleted, nil, &now, nil); err != nil {
-		return err
+func (db *DB) MarkTaskCompleted(taskID uuid.UUID, output string) (bool, error) {
+	result, err := db.conn.Exec(
+		`UPDATE tasks SET status = 'COMPLETED', completed_at = NOW(), output = $2, error_message = NULL
+		 WHERE id = $1 AND `+dispatchedCondition,
+		taskID, output,
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark task completed: %w", err)
 	}
-	return db.UpdateTaskResult(taskID, output, "")
+	return rowsChanged(result)
 }
 
-func (db *DB) MarkTaskFailed(taskID uuid.UUID, errorMessage string) error {
-	now := time.Now()
-	if err := db.UpdateTaskStatus(taskID, StatusFailed, nil, nil, &now); err != nil {
-		return err
+func (db *DB) MarkTaskFailed(taskID uuid.UUID, output, errorMessage string) (bool, error) {
+	result, err := db.conn.Exec(
+		`UPDATE tasks SET status = 'FAILED', failed_at = NOW(), output = $2, error_message = $3
+		 WHERE id = $1 AND `+dispatchedCondition,
+		taskID, output, errorMessage,
+	)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark task failed: %w", err)
 	}
-	return db.UpdateTaskResult(taskID, "", errorMessage)
+	return rowsChanged(result)
+}
+
+// ListOverdueTasks returns STARTED tasks that have run past their timeout plus
+// grace without the worker reporting a result, i.e. the worker was lost.
+func (db *DB) ListOverdueTasks(grace time.Duration) ([]uuid.UUID, error) {
+	rows, err := db.conn.Query(
+		`SELECT id FROM tasks
+		 WHERE status = 'STARTED'
+		   AND started_at + make_interval(secs => timeout_seconds + $1::float8) < NOW()`,
+		grace.Seconds(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list overdue tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan task id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func rowsChanged(result sql.Result) (bool, error) {
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (db *DB) ListTasksByStatus(status TaskStatus, limit int) ([]*Task, error) {
@@ -507,8 +552,8 @@ func (db *DB) ResetStaleTasks(staleThreshold time.Duration) (int64, error) {
 		 SET picked_at = NULL, status = 'QUEUED'
 		 WHERE status = 'QUEUED' 
 		   AND picked_at IS NOT NULL 
-		   AND picked_at < $1`,
-		time.Now().Add(-staleThreshold),
+		   AND picked_at < NOW() - make_interval(secs => $1)`,
+		staleThreshold.Seconds(),
 	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to reset stale tasks: %w", err)

@@ -1,213 +1,172 @@
-# Conductor - A Distributed Task Scheduler with Saga Workflows
+# Conductor
 
-## Brief Description
+[![CI](https://github.com/ChinmayNoob/conductor/actions/workflows/ci.yml/badge.svg)](https://github.com/ChinmayNoob/conductor/actions/workflows/ci.yml)
 
-Conductor is a distributed task scheduler built from scratch in Go that mimics how production-grade systems like Kubernetes or Apache Spark dispatch and execute work across a cluster of machines. It follows a coordinator-worker architecture where clients submit tasks over HTTP to a Scheduler service, which forwards them via gRPC to a central Coordinator. The Coordinator maintains a live registry of worker nodes (discovered through periodic heartbeats), picks the highest-priority task from a PostgreSQL-backed queue using `FOR UPDATE SKIP LOCKED` to guarantee atomic assignment without race conditions, and pushes it to a healthy worker over gRPC. Workers execute shell commands with enforced timeouts using Go's `context.WithTimeout` and report status (STARTED/COMPLETED/FAILED) back to the Coordinator, which handles retry logic (configurable retries with exponential back-off delay). The system also implements the Saga orchestration pattern for multi-step workflows with automatic compensation (rollback) on failure -- if step 3 of a 5-step workflow fails, all previously completed steps are undone in reverse order. The entire stack is containerized with Docker Compose, supporting horizontal scaling by simply increasing worker replicas. It demonstrates real distributed systems concepts: concurrent task assignment, fault detection via heartbeats, priority queuing, at-least-once delivery semantics, and transactional workflow orchestration.
+**A self-hosted, Postgres-only durable task and workflow engine.**
 
-### Architecture
+Conductor runs shell commands across a cluster of workers with priorities, retries with exponential back-off, timeouts, cancellation, and saga workflows that undo completed steps when a later one fails. Postgres is the only dependency.
 
-The system is composed of three distinct microservices communicating over gRPC, with PostgreSQL as the durable persistence layer:
+> **Status:** pre-1.0 and under active development. See [plan.md](plan.md) for the roadmap and [DEVLOG.md](DEVLOG.md) for how it's built, with diagrams.
 
-- **Scheduler (HTTP :8081)** -- The API gateway. It exposes a REST API for clients to submit tasks, check status, view statistics, and trigger workflows. It validates incoming requests and forwards them to the Coordinator over gRPC. It also runs a background goroutine that periodically cleans up stale tasks (tasks that were picked but never started due to crashes).
+## Architecture
 
-- **Coordinator (gRPC :8080)** -- The brain of the system. It maintains an in-memory registry of all active workers, updated via heartbeat RPCs that workers send every 10 seconds. A dispatch loop runs every second, picking the next highest-priority task from PostgreSQL using a `SELECT ... FOR UPDATE SKIP LOCKED` query, and pushes it to a healthy worker via gRPC using round-robin load balancing. The Coordinator also owns all retry logic: when a worker reports a failure, the Coordinator checks if the task has remaining retries, and if so, requeues it with a configurable delay. For saga workflows, the Coordinator acts as the orchestrator -- advancing steps on success and running compensation tasks in reverse on failure.
+```mermaid
+flowchart LR
+    CLI["conductorctl / Go SDK / curl"] -- "HTTP + API key" --> API
+    subgraph cluster [Conductor cluster]
+        API["api<br/>HTTP :8081"] -- "gRPC + cluster token (+mTLS)" --> COORD["coordinator<br/>gRPC :8080"]
+        COORD -- "dispatch / cancel" --> W1["worker"]
+        COORD -- "dispatch / cancel" --> W2["worker"]
+        COORD -- "dispatch / cancel" --> W3["worker …"]
+        W1 & W2 & W3 -- "heartbeats + results" --> COORD
+    end
+    API -- "reads" --> PG[("PostgreSQL")]
+    COORD -- "queue + state" --> PG
+```
 
-- **Workers (gRPC :900x)** -- The execution engines. Each worker is both a gRPC server (to receive task assignments) and a gRPC client (to send heartbeats and report task status back to the Coordinator). When a task arrives, it is placed into a buffered channel (capacity 100 for backpressure). A processing goroutine dequeues tasks, executes them as shell commands using `exec.CommandContext` with a timeout derived from `context.WithTimeout`, and reports the outcome. If the channel is full, the worker rejects the task so the Coordinator can assign it elsewhere.
+| Component | Role |
+|---|---|
+| **api** | Stateless HTTP API. Authenticates API keys, reads state from Postgres, and sends commands (submit, cancel) to the coordinator. |
+| **coordinator** | Tracks workers by heartbeat, claims tasks from Postgres with `FOR UPDATE SKIP LOCKED`, dispatches them round-robin, retries failures, recovers tasks from dead workers, and drives workflows. |
+| **worker** | Runs each task as a shell command with a timeout, in its own process group so cancellation kills everything it started. Drains gracefully on shutdown. |
 
-## Features
+All three are subcommands of one binary, `conductor`, shipped as one Docker image.
 
-- Distributed Architecture
-- **Individual Task Execution** -- submit, dispatch, and execute single tasks
-- **Multi-Step Workflows (Saga Pattern)** -- execute ordered sequences of tasks with automatic compensation (rollback) on failure
-- Task Priorities
-- Automatic Retries (exponential back-off: `retry_delay_seconds × 2^attempt`, capped at 1 hour)
-- Lost-task recovery (tasks on a worker that stops heartbeating, or that never report a result, are retried)
-- Configurable Timeouts
-- Output Capture
-- Delayed Scheduling
-- Health Monitoring
-- Atomic Task Claiming
+## Quickstart
 
-## Known Issues / TODO
-
-- Task cancellation
-- Single point of failure (coordinator)
-- No recurring tasks
-- No task dependencies
-
-## How to Run
+Requirements: Docker, and Go 1.24+ for the CLI.
 
 ```bash
 git clone https://github.com/ChinmayNoob/conductor.git
 cd conductor
-docker-compose up --build
+docker compose up -d --build --scale worker=3
+
+go build -o bin/conductorctl ./cmd/conductorctl
+export CONDUCTOR_API_KEY=insecure-dev-api-key   # the development default
+
+bin/conductorctl task submit -cmd 'echo hello from $(hostname)' -wait
+bin/conductorctl workflow start trip_booking -input '{"user_id":123,"amount":5000}' -wait
 ```
 
-Open a **new terminal** and build the client:
+> The compose file uses insecure development secrets by default. Copy `.env.example` to `.env` and set `CONDUCTOR_CLUSTER_TOKEN` and `CONDUCTOR_API_KEY` before running anywhere but your own machine.
+
+## Tasks
+
+A task is a shell command. Options:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `data` | (required) | Command to run with `sh -c` |
+| `priority` | 5 | 1 (highest) to 10 |
+| `max_retries` | 3 | Retries after the first attempt fails |
+| `retry_delay_seconds` | 60 | Base retry delay; attempt *n* waits `delay × 2ⁿ` (max 1 hour) |
+| `timeout_seconds` | 300 | The command is killed after this long |
+| `delay_seconds` / `scheduled_at` | now | Run later (relative seconds, or a Unix timestamp) |
 
 ```bash
-go build -o client ./cmd/client
+conductorctl task submit -cmd 'make backup' -priority 1 -retries 5 -timeout 600
+conductorctl task list -status FAILED
+conductorctl task get <id>        # status, attempts, captured output
+conductorctl task cancel <id>     # kills the process if it is running
 ```
 
-## Usage
+Delivery is **at-least-once**: if a worker dies mid-task, the task is retried on another worker, so make side effects idempotent.
 
-### Individual Tasks
+## Workflows (sagas)
 
-Submit a single task for immediate execution:
+A workflow is an ordered list of steps. Each step has a command and a **compensating** command that undoes it. If a step fails after its retries, Conductor compensates every completed step in reverse order.
+
+```mermaid
+flowchart LR
+    F["Book Flight ✅"] --> H["Book Hotel ❌"] -. "skipped" .-> P["Charge Payment"]
+    H -- "failure" --> CF["Cancel Flight ↩️"]
+```
+
+Built-in examples:
+
+| Type | Behaviour |
+|---|---|
+| `trip_booking` | All three steps succeed |
+| `trip_booking_fail` | Book Hotel fails; Book Flight is compensated |
+| `trip_booking_slow` | Book Hotel takes 30s, which leaves time to try `workflow cancel` |
 
 ```bash
-.\client -action=submit -cmd="echo hello"
+conductorctl workflow start trip_booking_fail -input '{"user_id":1,"amount":10}' -wait
+conductorctl workflow cancel <id>   # cancels the running step, compensates completed ones
 ```
 
-Schedule a task to run after a delay:
+Workflow input values are substituted into commands, so they must be strings, numbers or booleans made of letters, digits and `_ . , : @ + -` (and not start with `-`). Anything else is rejected to prevent shell injection.
+
+## HTTP API
+
+Every `/v1` route needs `Authorization: Bearer <api key>`. Errors are returned as `{"error": "..."}`.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness and database check (no auth) |
+| `POST` | `/v1/tasks` | Submit a task |
+| `GET` | `/v1/tasks?status=&limit=` | List recent tasks |
+| `GET` | `/v1/tasks/{id}` | Get a task |
+| `POST` | `/v1/tasks/{id}/cancel` | Cancel a task |
+| `GET` | `/v1/stats` | Task counts by status |
+| `POST` | `/v1/workflows` | Start a workflow: `{"type": "...", "input": {...}}` |
+| `GET` | `/v1/workflows?limit=` | List workflows |
+| `GET` | `/v1/workflows/{id}` | Get a workflow with its steps |
+| `POST` | `/v1/workflows/{id}/cancel` | Cancel a workflow |
+| `POST` | `/v1/api-keys` | Create a key (admin): `{"name": "...", "admin": false}` |
+| `GET` | `/v1/api-keys` | List keys (admin) |
+| `DELETE` | `/v1/api-keys/{id}` | Revoke a key (admin) |
 
 ```bash
-.\client -action=schedule -cmd="echo hello" -delay=30
+curl -s -X POST localhost:8081/v1/tasks \
+  -H "Authorization: Bearer $CONDUCTOR_API_KEY" \
+  -d '{"data": "echo hi", "priority": 1}'
 ```
 
-Check task status:
+## Security
+
+- **API keys:** `CONDUCTOR_API_KEY` creates the first admin key on startup. Create scoped keys with `conductorctl apikey create <name>`; only a SHA-256 hash is stored.
+- **Cluster token:** every gRPC call between components carries `CONDUCTOR_CLUSTER_TOKEN`.
+- **Mutual TLS:** set `CONDUCTOR_TLS_CERT`, `CONDUCTOR_TLS_KEY` and `CONDUCTOR_TLS_CA`. All components share one certificate whose name is `conductor`, so workers can be reached by IP. To try it:
+
+  ```bash
+  ./scripts/gen-dev-certs.sh
+  docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+  ```
+- Tasks run as an unprivileged user inside the worker container.
+
+## Configuration
+
+All settings are environment variables; [.env.example](.env.example) lists them with defaults. The most important:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONDUCTOR_CLUSTER_TOKEN` | (required) | Shared secret for gRPC between components |
+| `CONDUCTOR_API_KEY` | | Bootstrap admin API key |
+| `POSTGRES_HOST` / `PORT` / `USER` / `PASSWORD` / `DB` | `localhost` / `5432` / … | Database |
+| `CONDUCTOR_COORDINATOR_ADDR` | `localhost:8080` | Where the API and workers reach the coordinator |
+| `CONDUCTOR_SHUTDOWN_TIMEOUT` | `25s` | How long a stopping worker lets running tasks finish |
+| `CONDUCTOR_LOG_LEVEL` / `CONDUCTOR_LOG_FORMAT` | `info` / `text` | Logging (`json` for production) |
+
+## Development
 
 ```bash
-.\client -action=status -id=<task-id>
+make help        # list targets
+make test        # unit tests
+make lint        # golangci-lint (runs in Docker)
+make up          # start the stack with 3 workers
+make e2e         # end-to-end suite against the running stack
+make proto       # regenerate gRPC code (protoc runs in Docker)
 ```
 
-Run the full individual task test suite:
+Database tests need a Postgres server; they create and drop a throwaway database per test:
 
 ```bash
-.\client -action=test
+CONDUCTOR_TEST_DATABASE_URL='postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable' go test ./pkg/db/
 ```
 
-### Workflows (Saga Pattern)
+CI runs lint, unit and database tests with the race detector, and the end-to-end suite over both plaintext and mutual TLS.
 
-Submit a workflow (e.g. the built-in `trip_booking` example):
+## License
 
-```bash
-.\client -action=workflow -type=trip_booking -input="{\"user_id\":123,\"amount\":5000}"
-```
-
-Check workflow status (shows all steps and their states):
-
-```bash
-.\client -action=workflow-status -id=<workflow-id>
-```
-
-Run the full workflow test (submits `trip_booking` and monitors it):
-
-```bash
-.\client -action=workflow-test
-```
-
-### How Workflows Work
-
-A workflow is a sequence of steps where each step has an **execute** command and a **compensate** (undo) command. Input values are substituted into those commands, so they must be strings, numbers or booleans made of letters, digits and `_ . , : @ + -` (not starting with `-`); anything else is rejected to prevent shell injection. The coordinator runs steps one by one. If any step fails permanently, it walks backward through all completed steps and runs their compensation commands.
-
-There are two built-in workflow types to demonstrate both scenarios:
-
----
-
-**1. `trip_booking` -- Success Scenario (all steps pass)**
-
-```bash
-.\client -action=workflow -type=trip_booking -input="{\"user_id\":123,\"amount\":5000}"
-```
-
-| Step | Execute | Compensate |
-|------|---------|------------|
-| 1. Book Flight | `echo booking flight for user=123` | `echo cancelling flight for user=123` |
-| 2. Book Hotel | `echo booking hotel for user=123` | `echo cancelling hotel for user=123` |
-| 3. Charge Payment | `echo charging amount=5000 for user=123` | `echo refunding amount=5000 for user=123` |
-
-Expected output when monitoring:
-
-```
-Book Flight  -> COMPLETED
-Book Hotel   -> COMPLETED
-Charge Payment -> COMPLETED
-Workflow: COMPLETED
-```
-
----
-
-**2. `trip_booking_fail` -- Failure + Compensation Scenario (step 2 fails)**
-
-```bash
-.\client -action=workflow -type=trip_booking_fail -input="{\"user_id\":123,\"amount\":5000}"
-```
-
-This is identical to `trip_booking` except the "Book Hotel" step uses `exit 1` to simulate a failure. After retries are exhausted, the coordinator automatically compensates:
-
-Expected output when monitoring:
-
-```
-Book Flight  -> COMPLETED
-Book Hotel   -> FAILED
-  -- Compensation begins --
-Book Flight  -> COMPENSATING -> COMPENSATED  (runs "cancelling flight")
-Workflow: FAILED (compensation done)
-```
-
-Step 3 (Charge Payment) never runs because step 2 failed first. Only step 1 needs compensation since it was the only completed step.
-
----
-
-**Want to create your own failure scenario?** Edit `pkg/workflow/engine.go` and change any step's `CommandTemplate` to a command that exits non-zero. For example, changing step 3 to fail:
-
-```go
-CommandTemplate: "echo payment declined && exit 1",
-```
-
-This would cause steps 1 and 2 to be compensated in reverse order (Cancel Hotel, then Cancel Flight).
-
-### HTTP API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/tasks` | Submit a task for immediate execution |
-| POST | `/tasks/schedule` | Schedule a task for later |
-| GET | `/tasks/status?id=<id>` | Get task status |
-| GET | `/tasks/list` | List all tasks |
-| GET | `/tasks/stats` | Get task statistics |
-| POST | `/workflows` | Submit a workflow |
-| GET | `/workflows/status?id=<id>` | Get workflow status with all steps |
-| GET | `/workflows/list` | List all workflows |
-| GET | `/health` | Health check |
-
-## Workflow
-
-```
-┌─────────────┐     HTTP      ┌─────────────┐
-│   Client    │──────────────▶│  Scheduler  │
-└─────────────┘               │  (port 8081)│
-                              └──────┬──────┘
-                                     │
-                                     ▼
-┌─────────────┐               ┌─────────────┐
-│  PostgreSQL │◀─────────────▶│ Coordinator │
-│  (port 5432)│               │ (port 8080) │
-└─────────────┘               └──────┬──────┘
-                                     │ gRPC
-                    ┌────────────────┼────────────────┐
-                    ▼                ▼                ▼
-              ┌──────────┐    ┌──────────┐    ┌──────────┐
-              │ Worker 1 │    │ Worker 2 │    │ Worker N │
-              └──────────┘    └──────────┘    └──────────┘
-```
-
-### Database Tables
-
-| Table | Purpose |
-|-------|---------|
-| `tasks` | Individual task records (status, priority, retries, output) |
-| `workflows` | Workflow instances (type, status, current_step, context) |
-| `workflow_steps` | Steps within a workflow (linked to tasks and compensation tasks) |
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `POSTGRES_HOST` | `postgres` | Database host |
-| `POSTGRES_PORT` | `5432` | Database port |
-| `POSTGRES_DB` | `taskscheduler` | Database name |
-| `POSTGRES_USER` | `postgres` | Database user |
-| `POSTGRES_PASSWORD` | `postgres` | Database password |
-
+[Apache 2.0](LICENSE)

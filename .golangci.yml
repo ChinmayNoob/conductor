@@ -10,12 +10,20 @@ linters:
     - errorlint
     - misspell
     - unconvert
+  settings:
+    errcheck:
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
   exclusions:
     generated: strict
     rules:
       # Best-effort cleanup calls whose errors carry no useful information.
       - linters: [errcheck]
         source: '\.(Close|Rollback)\(\)'
+      - linters: [errcheck]
+        path: _test\.go
 
 formatters:
   enable:

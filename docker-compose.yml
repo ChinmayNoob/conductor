@@ -1,8 +1,28 @@
+# Local development stack. Secrets default to insecure development values;
+# override them in .env (see .env.example) before exposing this anywhere.
+#
+#   docker compose up -d --build --scale worker=3
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d   # with mTLS
+
+x-conductor: &conductor
+  build: .
+  image: conductor:dev
+  restart: unless-stopped
+  environment: &conductor-env
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
+    POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    CONDUCTOR_COORDINATOR_ADDR: coordinator:8080
+    CONDUCTOR_CLUSTER_TOKEN: ${CONDUCTOR_CLUSTER_TOKEN:-insecure-dev-cluster-token}
+    CONDUCTOR_API_KEY: ${CONDUCTOR_API_KEY:-insecure-dev-api-key}
+    CONDUCTOR_LOG_LEVEL: ${CONDUCTOR_LOG_LEVEL:-info}
+    CONDUCTOR_LOG_FORMAT: ${CONDUCTOR_LOG_FORMAT:-text}
+
 services:
   postgres:
-    build:
-      context: .
-      dockerfile: Dockerfile.postgres
+    image: postgres:16-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -12,38 +32,23 @@ services:
     ports:
       - "5433:5432"
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-taskscheduler}" ]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-taskscheduler}"]
+      interval: 2s
       timeout: 5s
-      retries: 5
+      retries: 15
 
   coordinator:
-    build:
-      context: .
-      dockerfile: Dockerfile.coordinator
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
+    <<: *conductor
+    command: ["coordinator"]
     ports:
       - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
 
-  scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.scheduler
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
+  api:
+    <<: *conductor
+    command: ["api"]
     ports:
       - "8081:8081"
     depends_on:
@@ -51,23 +56,23 @@ services:
         condition: service_healthy
       coordinator:
         condition: service_started
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    # No WORKER_ID / WORKER_ADDRESS here: each replica derives its own from
-    # its container IP, so replicas don't register as the same worker.
+    <<: *conductor
+    command: ["worker"]
+    # Workers advertise their own container IP, so replicas never collide.
+    # On shutdown they finish running tasks for up to CONDUCTOR_SHUTDOWN_TIMEOUT
+    # (25s), so give them a little longer than that.
+    stop_grace_period: 30s
     depends_on:
       - coordinator
-    restart: unless-stopped
     deploy:
-      replicas: 2 # Run 2 worker instances
-  # Additional workers can be scaled with:
-  # docker-compose up -d --scale worker=5
+      replicas: 2
 
 volumes:
   postgres_data:
-
-

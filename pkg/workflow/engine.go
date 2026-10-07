@@ -134,6 +134,29 @@ func (r *Registry) registerBuiltins() {
 		},
 	})
 
+	// Slow path: the hotel step takes a while, leaving time to cancel the
+	// workflow and watch the flight booking get compensated.
+	r.Register(&WorkflowDefinition{
+		Type: "trip_booking_slow",
+		Steps: []StepDefinition{
+			{
+				Name:               "Book Flight",
+				CommandTemplate:    "echo booking flight for user={{user_id}}",
+				CompensateTemplate: "echo cancelling flight for user={{user_id}}",
+			},
+			{
+				Name:               "Book Hotel",
+				CommandTemplate:    "echo waiting for hotel for user={{user_id}} && sleep 30",
+				CompensateTemplate: "echo cancelling hotel for user={{user_id}}",
+			},
+			{
+				Name:               "Charge Payment",
+				CommandTemplate:    "echo charging amount={{amount}} for user={{user_id}}",
+				CompensateTemplate: "echo refunding amount={{amount}} for user={{user_id}}",
+			},
+		},
+	})
+
 	// Failure path: step 2 (Book Hotel) uses a command that will exit with code 1,
 	// triggering compensation for all previously completed steps.
 	r.Register(&WorkflowDefinition{

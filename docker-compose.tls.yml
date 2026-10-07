@@ -1,0 +1,20 @@
+# Overlay that turns on mutual TLS between all components.
+#
+#   ./scripts/gen-dev-certs.sh            # writes ./certs
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+
+x-tls-env: &tls-env
+  CONDUCTOR_TLS_CERT: /certs/cluster.crt
+  CONDUCTOR_TLS_KEY: /certs/cluster.key
+  CONDUCTOR_TLS_CA: /certs/ca.crt
+
+services:
+  coordinator:
+    environment: *tls-env
+    volumes: ["./certs:/certs:ro"]
+  api:
+    environment: *tls-env
+    volumes: ["./certs:/certs:ro"]
+  worker:
+    environment: *tls-env
+    volumes: ["./certs:/certs:ro"]

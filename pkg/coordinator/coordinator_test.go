@@ -91,11 +91,12 @@ func TestChooseWorkerMatchesLabels(t *testing.T) {
 	}
 }
 
-func TestFreeWorkerLabelsAreDistinct(t *testing.T) {
+func TestFreeCapacity(t *testing.T) {
 	s := newTestServer(1, 2, 3)
 	s.workers[3].Labels = map[string]string{"type.shell": "true", "region": "eu"}
-	if got := len(s.freeWorkerLabels()); got != 2 {
-		t.Fatalf("got %d label sets, want 2", got)
+	labels, free := s.freeCapacity()
+	if len(labels) != 2 || free != 3 {
+		t.Fatalf("got %d label sets and %d free slots, want 2 and 3", len(labels), free)
 	}
 }
 

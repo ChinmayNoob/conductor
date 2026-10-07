@@ -58,6 +58,7 @@ type Task struct {
 	// Attempt numbers dispatches: it goes up every time the task is handed
 	// to a worker, and status reports must quote the current one.
 	Attempt        int
+	dispatchKey    *time.Time
 	Output         string
 	Outputs        StringMap // key=value pairs a step wrote to $CONDUCTOR_OUTPUT
 	ErrorMessage   string
@@ -103,7 +104,7 @@ func DefaultTask(data string) NewTask {
 const taskColumns = `id, namespace, queue, type, data, spec, env, requirements, status, scheduled_at,
 	picked_at, started_at, completed_at, failed_at, cancelled_at, priority, max_retries, retry_count,
 	retry_delay_seconds, timeout_seconds, output, outputs, error_message, idempotency_key,
-	workflow_id, worker_id, attempt, created_at`
+	workflow_id, worker_id, attempt, dispatch_key, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -114,7 +115,7 @@ func scanTask(row scanner) (*Task, error) {
 	err := row.Scan(&t.ID, &t.Namespace, &t.Queue, &t.Type, &t.Data, &spec, &t.Env, &t.Requirements,
 		&t.Status, &t.ScheduledAt, &t.PickedAt, &t.StartedAt, &t.CompletedAt, &t.FailedAt, &t.CancelledAt,
 		&t.Priority, &t.MaxRetries, &t.RetryCount, &t.RetryDelaySeconds, &t.TimeoutSeconds, &output,
-		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.CreatedAt)
+		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -243,23 +244,33 @@ func (db *DB) CountPendingTasks(ctx context.Context, namespace string) (int, err
 	return n, err
 }
 
-// PickOptions constrain which task PickNextTask may claim.
+// PickOptions constrain which tasks PickTasks may claim.
 type PickOptions struct {
-	// WorkerLabels holds the label set of every worker with a free slot. The
+	// WorkerLabels holds the label set of every worker with a free slot. A
 	// task's requirements must be a subset of at least one of them.
 	WorkerLabels []map[string]string
-	// AgingInterval raises a waiting task's priority by one level per
-	// interval, so low-priority work can't starve. Zero disables aging.
-	AgingInterval time.Duration
 }
 
-// PickNextTask claims the most urgent runnable task, or returns nil if there
-// is none. A task is runnable when it is due, its queue isn't paused or at its
-// concurrency or rate limit, its namespace is under its concurrency limit,
-// and some free worker has the labels it requires. SKIP LOCKED lets
-// concurrent pickers claim different tasks.
+// PickNextTask claims the most urgent runnable task, or returns nil.
 func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error) {
-	if len(opts.WorkerLabels) == 0 {
+	tasks, err := db.PickTasks(ctx, opts, 1)
+	if err != nil || len(tasks) == 0 {
+		return nil, err
+	}
+	return tasks[0], nil
+}
+
+// PickTasks claims up to limit runnable tasks, most urgent first (by
+// dispatch_key, which folds in priority aging). A task is runnable when it
+// is due, its queue isn't paused or at its concurrency or rate limit, its
+// namespace is under its concurrency limit, and some free worker has the
+// labels it requires. SKIP LOCKED lets concurrent pickers claim different
+// tasks.
+//
+// Limits hold within a batch too: candidates are ranked per queue and per
+// namespace, and only as many as each limit still allows are claimed.
+func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Task, error) {
+	if len(opts.WorkerLabels) == 0 || limit < 1 {
 		return nil, nil
 	}
 	labels, err := json.Marshal(opts.WorkerLabels)
@@ -267,11 +278,10 @@ func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error)
 		return nil, err
 	}
 
-	t, err := scanTask(db.q.QueryRowContext(ctx,
-		`UPDATE tasks
-		 SET picked_at = NOW(), last_dispatched_at = NOW(), attempt = attempt + 1
-		 WHERE id = (
-			 SELECT t.id FROM tasks t
+	rows, err := db.q.QueryContext(ctx,
+		`WITH candidates AS (
+			 SELECT t.id, t.namespace, t.queue, t.dispatch_key
+			 FROM tasks t
 			 LEFT JOIN queues q ON q.namespace = t.namespace AND q.name = t.queue
 			 LEFT JOIN namespaces n ON n.name = t.namespace
 			 WHERE t.status = 'QUEUED'
@@ -279,36 +289,89 @@ func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error)
 			   AND t.scheduled_at <= NOW()
 			   AND NOT COALESCE(q.paused, false)
 			   AND EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb) w WHERE w @> t.requirements)
-			   AND (q.concurrency_limit IS NULL OR q.concurrency_limit > (
-			         SELECT count(*) FROM tasks r
-			         WHERE r.namespace = t.namespace AND r.queue = t.queue
-			           AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')))
-			   AND (q.rate_limit IS NULL OR q.rate_limit > (
-			         SELECT count(*) FROM tasks r
-			         WHERE r.namespace = t.namespace AND r.queue = t.queue
-			           AND r.last_dispatched_at > NOW() - make_interval(secs => q.rate_period_seconds)))
-			   AND (n.max_concurrency IS NULL OR n.max_concurrency > (
-			         SELECT count(*) FROM tasks r
-			         WHERE r.namespace = t.namespace
-			           AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')))
-			 ORDER BY CASE WHEN $2 > 0
-			               THEN t.priority - LEAST(t.priority - 1,
-			                    floor(extract(epoch FROM NOW() - t.scheduled_at) / $2)::int)
-			               ELSE t.priority END,
-			          t.scheduled_at
-			 LIMIT 1
+			   AND (q.concurrency_limit IS NULL OR q.concurrency_limit > (`+queueRunning+`))
+			   AND (q.rate_limit IS NULL OR q.rate_limit > (`+queueRecent+`))
+			   AND (n.max_concurrency IS NULL OR n.max_concurrency > (`+namespaceRunning+`))
+			 ORDER BY t.dispatch_key
+			 LIMIT $2 * 4
 			 FOR UPDATE OF t SKIP LOCKED
+		 ),
+		 ranked AS (
+			 SELECT c.*,
+			        row_number() OVER (PARTITION BY c.namespace, c.queue ORDER BY c.dispatch_key) AS in_queue,
+			        row_number() OVER (PARTITION BY c.namespace ORDER BY c.dispatch_key) AS in_namespace
+			 FROM candidates c
+		 ),
+		 allowed AS (
+			 SELECT t.id
+			 FROM ranked t
+			 LEFT JOIN queues q ON q.namespace = t.namespace AND q.name = t.queue
+			 LEFT JOIN namespaces n ON n.name = t.namespace
+			 WHERE (q.concurrency_limit IS NULL OR t.in_queue <= q.concurrency_limit - (`+queueRunning+`))
+			   AND (q.rate_limit IS NULL OR t.in_queue <= q.rate_limit - (`+queueRecent+`))
+			   AND (n.max_concurrency IS NULL OR t.in_namespace <= n.max_concurrency - (`+namespaceRunning+`))
+			 ORDER BY t.dispatch_key
+			 LIMIT $2
 		 )
+		 UPDATE tasks
+		 SET picked_at = NOW(), last_dispatched_at = NOW(), attempt = attempt + 1
+		 WHERE id IN (SELECT id FROM allowed)
 		 RETURNING `+taskColumns,
-		labels, opts.AgingInterval.Seconds(),
-	))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		labels, limit,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pick task: %w", err)
+		return nil, fmt.Errorf("failed to pick tasks: %w", err)
 	}
-	return t, nil
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan task: %w", err)
+		}
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to pick tasks: %w", err)
+	}
+	// RETURNING has no order; restore dispatch order.
+	slices.SortFunc(tasks, func(a, b *Task) int {
+		if a.dispatchKey == nil || b.dispatchKey == nil {
+			return 0
+		}
+		return a.dispatchKey.Compare(*b.dispatchKey)
+	})
+	return tasks, nil
+}
+
+// Counts used by the pick query, correlated on the candidate row t.
+const (
+	queueRunning = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace AND r.queue = t.queue
+		AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')`
+	queueRecent = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace AND r.queue = t.queue
+		AND r.last_dispatched_at > NOW() - make_interval(secs => q.rate_period_seconds)`
+	namespaceRunning = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace
+		AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')`
+)
+
+// SetPriorityAging stores the aging interval used for dispatch order and,
+// if it changed, re-keys every queued task.
+func (db *DB) SetPriorityAging(ctx context.Context, interval time.Duration) error {
+	return db.WithTx(ctx, func(tx *DB) error {
+		result, err := tx.q.ExecContext(ctx,
+			`UPDATE scheduler_settings SET priority_aging_seconds = $1
+			 WHERE id = 1 AND priority_aging_seconds IS DISTINCT FROM $1`, interval.Seconds())
+		if err != nil {
+			return fmt.Errorf("failed to save priority aging: %w", err)
+		}
+		if changed, _ := rowsChanged(result); !changed {
+			return nil
+		}
+		_, err = tx.q.ExecContext(ctx,
+			`UPDATE tasks SET dispatch_key = conductor_dispatch_key(priority, scheduled_at) WHERE status = 'QUEUED'`)
+		return err
+	})
 }
 
 // RequeueTask puts a task that was picked but never started back in the queue,

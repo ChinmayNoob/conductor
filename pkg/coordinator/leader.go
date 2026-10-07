@@ -79,6 +79,9 @@ func (s *Server) lead(ctx context.Context, sess *db.LeaderSession, epoch int64) 
 	fencedOut := s.fencedOut
 	s.mu.Unlock()
 
+	if err := s.db.SetPriorityAging(leadCtx, s.opts.PriorityAging); err != nil {
+		s.log.Error("Failed to apply priority aging", "error", err)
+	}
 	s.rebuild(leadCtx)
 	if err := s.registerExamples(leadCtx); err != nil {
 		s.log.Error("Failed to register example workflows", "error", err)

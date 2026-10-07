@@ -196,15 +196,53 @@ func TestPickOrderAndSchedule(t *testing.T) {
 
 func TestPriorityAging(t *testing.T) {
 	db := testDB(t)
+	ctx := context.Background()
+	if err := db.SetPriorityAging(ctx, time.Minute); err != nil {
+		t.Fatal(err)
+	}
 	// A priority-9 task that has waited 10 minutes beats a fresh priority-5
 	// one when aging is one level per minute.
 	old := create(t, db, "old", func(n *NewTask) { n.Priority = 9; n.ScheduledAt = time.Now().Add(-10 * time.Minute) })
 	create(t, db, "fresh", func(n *NewTask) { n.Priority = 5 })
-
-	opts := shellWorkers
-	opts.AgingInterval = time.Minute
-	if got := pick(t, db, opts); got == nil || got.ID != old.ID {
+	if got := pick(t, db); got == nil || got.ID != old.ID {
 		t.Fatalf("picked %v, want the aged task", got)
+	}
+
+	// With aging off, priority is strict however long a task waits.
+	if err := db.SetPriorityAging(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	ancient := create(t, db, "ancient", func(n *NewTask) { n.Priority = 9; n.ScheduledAt = time.Now().Add(-24 * time.Hour) })
+	if got := pick(t, db); got == nil || got.Data != "fresh" {
+		t.Fatalf("picked %v, want the priority-5 task", got)
+	}
+	if got := pick(t, db); got == nil || got.ID != ancient.ID {
+		t.Fatalf("picked %v, want the ancient task last", got)
+	}
+}
+
+func TestBatchPickRespectsLimits(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	two := 2
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "limited", ConcurrencyLimit: &two}))
+	for range 5 {
+		create(t, db, "limited", func(n *NewTask) { n.Queue = "limited" })
+	}
+	for range 5 {
+		create(t, db, "free")
+	}
+
+	batch := must[[]*Task](t)(db.PickTasks(ctx, shellWorkers, 10))
+	perQueue := map[string]int{}
+	for _, task := range batch {
+		perQueue[task.Queue]++
+	}
+	if perQueue["limited"] != 2 || perQueue["default"] != 5 {
+		t.Fatalf("batch per queue = %v, want limited=2 (its limit) and default=5", perQueue)
+	}
+	if more := must[[]*Task](t)(db.PickTasks(ctx, shellWorkers, 10)); len(more) != 0 {
+		t.Fatalf("picked %d more tasks with the limited queue full and the rest drained", len(more))
 	}
 }
 

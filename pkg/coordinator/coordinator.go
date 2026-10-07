@@ -7,12 +7,14 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
@@ -271,62 +273,85 @@ func (s *Server) wakeScheduler() {
 	}
 }
 
+// maxBatch caps how many tasks one pick query claims.
+const maxBatch = 64
+
 // dispatchTasks hands out queued tasks until the queue is empty or no free
-// worker can run what's left.
+// worker can run what's left. Each round claims a batch sized to the free
+// slots in one query and sends the tasks to their workers in parallel.
 func (s *Server) dispatchTasks(ctx context.Context) {
 	for ctx.Err() == nil {
 		// Only claim tasks some free worker can run, so tasks aren't picked
 		// just to be put back.
-		labels := s.freeWorkerLabels()
-		if len(labels) == 0 {
+		labels, free := s.freeCapacity()
+		if free == 0 {
 			return
 		}
-		var t *db.Task
+		want := min(free, maxBatch)
+		var tasks []*db.Task
 		err := s.fenced(ctx, func(tx *db.DB) error {
 			var err error
-			t, err = tx.PickNextTask(ctx, db.PickOptions{WorkerLabels: labels, AgingInterval: s.opts.PriorityAging})
+			tasks, err = tx.PickTasks(ctx, db.PickOptions{WorkerLabels: labels}, want)
 			return err
 		})
 		if err != nil {
-			if ctx.Err() == nil {
-				s.log.Error("Failed to pick next task", "error", err)
+			if ctx.Err() == nil && !errors.Is(err, errNotLeader) {
+				s.log.Error("Failed to pick tasks", "error", err)
 			}
 			return
 		}
-		if t == nil {
+		if len(tasks) == 0 {
 			return
 		}
 
-		worker := s.chooseWorker(t.Requirements)
-		if worker == nil {
-			// The worker filled up or left since we looked.
-			s.requeueTask(ctx, t.ID)
-			return
+		var wg sync.WaitGroup
+		var failed atomic.Bool
+		for _, t := range tasks {
+			worker := s.chooseWorker(t.Requirements)
+			if worker == nil {
+				// No free worker has its labels (another task in the batch
+				// took the last matching slot).
+				s.requeueTask(ctx, t.ID)
+				continue
+			}
+			// Reserve the slot now so the next task sees it taken.
+			s.trackTask(t.ID, t.Attempt, worker, time.Duration(t.TimeoutSeconds)*time.Second)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if !s.sendTask(ctx, worker, t) {
+					failed.Store(true)
+				}
+			}()
 		}
-		if !s.dispatchTask(ctx, worker, t) {
+		wg.Wait()
+		if failed.Load() || len(tasks) < want {
 			return
 		}
 	}
 }
 
-// freeWorkerLabels returns the distinct label sets of workers with a free slot.
-func (s *Server) freeWorkerLabels() []map[string]string {
+// freeCapacity returns the distinct label sets of workers with a free slot,
+// and the total number of free slots.
+func (s *Server) freeCapacity() ([]map[string]string, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	seen := make(map[string]bool)
-	var out []map[string]string
+	var labels []map[string]string
+	free := 0
 	for _, w := range s.workers {
 		if !w.available() {
 			continue
 		}
+		free += w.Slots - w.inFlight
 		key := labelKey(w.Labels)
 		if !seen[key] {
 			seen[key] = true
-			out = append(out, w.Labels)
+			labels = append(labels, w.Labels)
 		}
 	}
-	return out
+	return labels, free
 }
 
 func labelKey(labels map[string]string) string {
@@ -366,13 +391,11 @@ func (s *Server) chooseWorker(req map[string]string) *Worker {
 	return s.workers[next]
 }
 
-func (s *Server) dispatchTask(ctx context.Context, worker *Worker, t *db.Task) bool {
+// sendTask hands a claimed task to its worker. The caller has already
+// reserved the worker's slot with trackTask.
+func (s *Server) sendTask(ctx context.Context, worker *Worker, t *db.Task) bool {
 	log := s.log.With("task_id", t.ID, "worker_id", worker.ID, "attempt", t.Attempt)
 	log.Debug("Dispatching task", "priority", t.Priority)
-
-	// Track the task before sending it: the worker may report back before the
-	// RPC below returns.
-	s.trackTask(t.ID, t.Attempt, worker, time.Duration(t.TimeoutSeconds)*time.Second)
 
 	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

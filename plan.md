@@ -143,28 +143,28 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 
 ---
 
-## Phase 3: Distributed-systems depth ⬜
+## Phase 3: Distributed-systems depth 🟡 (in progress, PR #4)
 
 **Goal:** no single point of failure, provable correctness under failure, and published performance numbers.
 
 ### 3.1 Coordinator high availability (Postgres-only)
-- ⬜ Run 2 or more coordinators. Leader election uses `pg_try_advisory_lock`; standbys wait and take over when the leader's session dies.
-- ⬜ The leader rebuilds its in-memory state (workers, in-flight tasks) from the database on takeover
-- ⬜ Workers and the scheduler discover the current leader, either by trying each coordinator or through a `leader` row in the database
-- ⬜ **Leader epoch:** every write the leader makes carries its epoch, so a deposed leader cannot change state
+- ✅ Run 2 or more coordinators. Leader election uses `pg_try_advisory_lock`; standbys wait and take over when the leader's session dies.
+- ✅ The leader rebuilds its in-memory state (workers, in-flight tasks) from the database on takeover
+- ✅ Workers and the API discover the current leader (standbys redirect; `pkg/coordclient` follows them), either by trying each coordinator or through a `leader` row in the database
+- ✅ **Leader epoch:** every write the leader makes carries its epoch, so a deposed leader cannot change state
 
 ### 3.2 Fencing and attempt IDs
-- ⬜ Add an `attempt` column, incremented on every dispatch and sent to the worker
-- ⬜ Status reports must match the current attempt (`WHERE attempt = $n`). This closes the late-report gap from Phase 0.
-- ⬜ Expose the attempt ID to tasks (environment variable) so user code can de-duplicate side effects
+- ✅ Add an `attempt` column, incremented on every dispatch and sent to the worker
+- ✅ Status reports must match the current attempt (`WHERE attempt = $n`). This closes the late-report gap from Phase 0.
+- ✅ Expose the attempt ID to tasks (environment variable) so user code can de-duplicate side effects
 
 ### 3.3 Faster dispatch
-- ⬜ `LISTEN/NOTIFY` on task insert and retry wakes the dispatcher immediately instead of waiting for the 1s tick
-- ⬜ Batch claiming (`LIMIT n`) to cut round trips under load
+- ✅ `LISTEN/NOTIFY` on task insert and retry wakes the dispatcher immediately instead of waiting for the 1s tick
+- ✅ Batch claiming (`LIMIT n`) to cut round trips under load, with queue and namespace limits still enforced inside a batch; plus an indexed `dispatch_key` so a pick no longer sorts every queued task
 - ⬜ **Design decision record:** keep coordinator push, or switch to a worker pull / long-poll model. Pull scales more simply, works behind NAT and removes the coordinator → worker connections. Evaluate it with benchmarks.
 
 ### 3.4 Benchmarks and chaos testing
-- ⬜ Benchmark harness: throughput (tasks/s), dispatch latency p50/p99, and workflow end-to-end latency at 1, 10 and 50 workers
+- ✅ Benchmark harness (`cmd/conductor-bench`): throughput (tasks/s), dispatch latency p50/p99, and workflow end-to-end latency at 1, 10 and 50 workers
 - ⬜ Publish baseline numbers in the docs; set targets after measuring
 - ⬜ Chaos suite in CI (nightly):
   - Kill workers and coordinators mid-workflow
@@ -346,7 +346,7 @@ Phases describe *areas*. The order below gets the most value soonest and front-l
 | 0 | Foundation and bug-fix round | ✅ Done |
 | 1 | Production basics (CI, e2e, migrations, auth, TLS, cancellation) | ✅ Done |
 | 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | ✅ Done |
-| 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ⬜ Next |
+| 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | 🟡 In progress |
 | 4 | Observability and UI (metrics, tracing, dashboard) | ⬜ |
 | 5 | AI-native durable execution (LLM steps, agents, explainer) | ⬜ |
 | 6 | Kubernetes and cloud-native (Helm, KEDA, operator) | ⬜ |

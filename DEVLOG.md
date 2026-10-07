@@ -646,6 +646,57 @@ conductorctl workflow watch <id>
 
 ---
 
+## Phase 3: Distributed-systems depth (in progress)
+
+**Done so far (PR #4):** coordinator high availability, fencing, attempt IDs, instant dispatch, batch claiming, and a benchmark tool. **Still to do:** published benchmarks at 1/10/50 workers, the nightly chaos suite, and the push-vs-pull design record.
+
+### Leader election and failover
+
+```mermaid
+sequenceDiagram
+    participant A as Coordinator A (leader)
+    participant B as Coordinator B (standby)
+    participant PG as Postgres
+    participant W as Worker
+    A->>PG: holds advisory lock · epoch 9
+    B->>PG: pg_try_advisory_lock → false (every 1s)
+    W->>B: UpdateTaskStatus
+    B-->>W: not the leader, leader=A
+    W->>A: UpdateTaskStatus ✓
+    Note over A: docker kill 💥
+    PG->>PG: A's session ends → lock released
+    B->>PG: pg_try_advisory_lock → true
+    B->>PG: BumpEpoch → 10 (waits for A's in-flight fenced writes)
+    B->>PG: rebuild workers + running tasks
+    W->>A: report ✗ (no answer within 3s)
+    W->>B: report ✓
+```
+
+- **Election:** a session-scoped Postgres advisory lock. When the leader dies, Postgres releases it. In the e2e test a standby takes over **500 ms–1 s** after the kill, with no task or workflow lost.
+- **Fencing:** every leader write first checks the epoch under a share lock on the leader row. The new leader's epoch bump must wait for those locks, so a deposed leader's writes fail with `ErrFenced` once its successor is in charge. A DB test proves the bump waits for an in-flight fenced write.
+- **Attempt IDs:** each dispatch increments `tasks.attempt`, and reports must quote it. The partition e2e test cuts a worker off mid-task, waits for the retry (attempt 2), heals the partition, and checks that attempt 1's late report is ignored.
+- **Failover client** (`pkg/coordclient`): follows "not the leader" redirects and retries through elections.
+
+### Bugs found by the failover test
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| Calls aimed at the dead leader waited for gRPC's **20 s** connect timeout (a killed container's IP never answers) | Task results arrived about 20 s late after a failover | 3 s per-attempt timeout and a 2 s connect timeout: lag ≤ 2 s |
+| Forgetting a dead leader **closed a connection another call was using** | A result report failed with `Canceled` and was never retried; the task stayed `STARTED` | Keep connections and treat caller-independent cancellation as retryable |
+
+### Throughput: what the benchmark showed
+
+| Change | No-op tasks/s (4 workers, 8 slots) | Note |
+|---|---|---|
+| Before Phase 3 | 139 | |
+| `LISTEN/NOTIFY` | | Idle dispatch latency: up to 1 s → **~3 ms** |
+| Indexed `dispatch_key` + batch claiming + parallel dispatch | **220** | A pick no longer sorts every queued task (it was O(N) per pick) |
+| 10 workers, 22 slots | ~230 | Flat: the limit is the coordinator, not the workers |
+
+Profiling showed every container nearly idle (Postgres at 8% CPU) during the run, so the remaining limit is **round-trip latency** on the per-task path: claim, then STARTED and COMPLETE reports, each a fenced transaction. I tried fencing only belief-driven writes, which saves round trips. It didn't measurably help (~230/s), so I reverted it to keep the simpler "every leader write is fenced" guarantee. The next experiments are coalescing STARTED and COMPLETE reports and single-statement fences. They'll be measured by the published benchmark runs.
+
+---
+
 ## What's next
 
-Phase 3, distributed-systems depth: coordinator high availability through Postgres advisory-lock leader election, fencing tokens on every dispatch, `LISTEN/NOTIFY` for instant dispatch, and published benchmarks and chaos tests. See [plan.md](plan.md).
+Finish Phase 3: published benchmarks at 1/10/50 workers, a nightly chaos suite (kill coordinators and workers, network partitions, Postgres latency via Toxiproxy, Postgres restarts) with invariant checks, and the push-vs-pull design record. See [plan.md](plan.md).

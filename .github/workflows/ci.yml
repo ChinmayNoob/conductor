@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          args: --build-tags e2e
+
+  test:
+    name: unit + database tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      CONDUCTOR_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go test -race -count=1 ./...
+
+  e2e:
+    name: end-to-end (${{ matrix.transport }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [plaintext, mtls]
+    env:
+      E2E_WORKERS: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Generate certificates
+        if: matrix.transport == 'mtls'
+        run: |
+          ./scripts/gen-dev-certs.sh
+          echo "E2E_COMPOSE_FILES=docker-compose.yml,docker-compose.tls.yml" >> "$GITHUB_ENV"
+          echo "COMPOSE_FILE=docker-compose.yml:docker-compose.tls.yml" >> "$GITHUB_ENV"
+
+      - name: Start the stack
+        run: docker compose up -d --build --wait --scale worker=$E2E_WORKERS
+
+      - name: Run end-to-end tests
+        run: go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color --timestamps
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

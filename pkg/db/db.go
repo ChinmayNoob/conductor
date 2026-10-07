@@ -30,7 +30,7 @@ type DB struct {
 // Open connects to Postgres, retrying until ctx is done so components can
 // start before the database is ready.
 func Open(ctx context.Context, dsn string) (*DB, error) {
-	conn, err := sql.Open("postgres", withUTC(dsn))
+	conn, err := sql.Open("postgres", WithUTC(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -55,10 +55,10 @@ func Open(ctx context.Context, dsn string) (*DB, error) {
 	}
 }
 
-// withUTC pins the session time zone to UTC. Several columns are TIMESTAMP
+// WithUTC pins the session time zone to UTC. Several columns are TIMESTAMP
 // without a zone and are compared with NOW(), so the session zone must match
 // the UTC values the code stores.
-func withUTC(dsn string) string {
+func WithUTC(dsn string) string {
 	u, err := url.Parse(dsn)
 	if err != nil || u.Scheme == "" {
 		return dsn

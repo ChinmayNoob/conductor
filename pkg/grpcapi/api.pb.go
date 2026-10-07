@@ -82,6 +82,7 @@ type TaskRequest struct {
 	Type           string                 `protobuf:"bytes,5,opt,name=type,proto3" json:"type,omitempty"`                                                                         // shell, http or container
 	SpecJson       []byte                 `protobuf:"bytes,6,opt,name=spec_json,json=specJson,proto3" json:"spec_json,omitempty"`                                                 // type-specific settings
 	Env            map[string]string      `protobuf:"bytes,7,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // extra environment variables
+	Attempt        int32                  `protobuf:"varint,8,opt,name=attempt,proto3" json:"attempt,omitempty"`                                                                  // dispatch number; quote it in status reports
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -163,6 +164,13 @@ func (x *TaskRequest) GetEnv() map[string]string {
 		return x.Env
 	}
 	return nil
+}
+
+func (x *TaskRequest) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
 }
 
 type TaskResponse struct {
@@ -578,6 +586,7 @@ type UpdateTaskStatusRequest struct {
 	Output        string                 `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"`
 	ErrorMessage  string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`                                             // set when status is FAILED
 	Outputs       map[string]string      `protobuf:"bytes,5,rep,name=outputs,proto3" json:"outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
+	Attempt       int32                  `protobuf:"varint,6,opt,name=attempt,proto3" json:"attempt,omitempty"`                                                                          // from TaskRequest; stale attempts are ignored
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -645,6 +654,13 @@ func (x *UpdateTaskStatusRequest) GetOutputs() map[string]string {
 		return x.Outputs
 	}
 	return nil
+}
+
+func (x *UpdateTaskStatusRequest) GetAttempt() int32 {
+	if x != nil {
+		return x.Attempt
+	}
+	return 0
 }
 
 type UpdateTaskStatusResponse struct {
@@ -920,7 +936,7 @@ var File_pkg_grpcapi_api_proto protoreflect.FileDescriptor
 
 const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\n" +
-	"\x15pkg/grpcapi/api.proto\x12\agrpcapi\"\x9e\x02\n" +
+	"\x15pkg/grpcapi/api.proto\x12\agrpcapi\"\xb8\x02\n" +
 	"\vTaskRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\tR\x04data\x12'\n" +
@@ -929,7 +945,8 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"retryCount\x12\x12\n" +
 	"\x04type\x18\x05 \x01(\tR\x04type\x12\x1b\n" +
 	"\tspec_json\x18\x06 \x01(\fR\bspecJson\x12/\n" +
-	"\x03env\x18\a \x03(\v2\x1d.grpcapi.TaskRequest.EnvEntryR\x03env\x1a6\n" +
+	"\x03env\x18\a \x03(\v2\x1d.grpcapi.TaskRequest.EnvEntryR\x03env\x12\x18\n" +
+	"\aattempt\x18\b \x01(\x05R\aattempt\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"[\n" +
@@ -961,13 +978,14 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"7\n" +
 	"\x11HeartbeatResponse\x12\"\n" +
-	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\xa1\x02\n" +
+	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\xbb\x02\n" +
 	"\x17UpdateTaskStatusRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12+\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x13.grpcapi.TaskStatusR\x06status\x12\x16\n" +
 	"\x06output\x18\x03 \x01(\tR\x06output\x12#\n" +
 	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\x12G\n" +
-	"\aoutputs\x18\x05 \x03(\v2-.grpcapi.UpdateTaskStatusRequest.OutputsEntryR\aoutputs\x1a:\n" +
+	"\aoutputs\x18\x05 \x03(\v2-.grpcapi.UpdateTaskStatusRequest.OutputsEntryR\aoutputs\x12\x18\n" +
+	"\aattempt\x18\x06 \x01(\x05R\aattempt\x1a:\n" +
 	"\fOutputsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"=\n" +

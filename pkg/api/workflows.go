@@ -157,7 +157,7 @@ func toWorkflowJSON(wf *db.Workflow, steps []*db.StepState) workflowJSON {
 	out := workflowJSON{
 		ID: wf.ID, Namespace: wf.Namespace, Workflow: wf.Type, Version: wf.DefinitionVersion, Status: wf.Status,
 		Input: wf.Input, ErrorMessage: wf.ErrorMessage, CancelRequested: wf.CancelRequested,
-		IdempotencyKey: wf.IdempotencyKey, CreatedAt: wf.CreatedAt, UpdatedAt: wf.UpdatedAt,
+		IdempotencyKey: userKey(wf.IdempotencyKey), CreatedAt: wf.CreatedAt, UpdatedAt: wf.UpdatedAt,
 	}
 	deps := map[string][]string{}
 	if def, err := workflow.FromJSON(wf.Definition); err == nil && wf.Definition != nil {
@@ -194,7 +194,7 @@ func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		Name:           req.Workflow,
 		Version:        int32(req.Version),
 		InputJson:      string(req.Input),
-		IdempotencyKey: req.IdempotencyKey,
+		IdempotencyKey: idempotencyKey(req.IdempotencyKey),
 	})
 	if err != nil {
 		s.writeRPCError(w, err)

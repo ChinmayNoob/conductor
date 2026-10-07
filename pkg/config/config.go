@@ -23,10 +23,15 @@ type Config struct {
 	DB DB
 
 	// Network addresses.
-	CoordinatorAddr   string // where clients reach the coordinator
+	// CoordinatorAddr lists where clients reach the coordinators, comma
+	// separated; they find the leader among them.
+	CoordinatorAddr   string
 	CoordinatorListen string
-	APIListen         string
-	WorkerListen      string
+	// CoordinatorAdvertiseAddr is where callers are redirected when this
+	// coordinator leads; empty means this machine's IP and listen port.
+	CoordinatorAdvertiseAddr string
+	APIListen                string
+	WorkerListen             string
 
 	Worker Worker
 
@@ -99,10 +104,11 @@ func Load() (*Config, error) {
 			Name:     env("POSTGRES_DB", "taskscheduler"),
 			SSLMode:  env("POSTGRES_SSLMODE", "disable"),
 		},
-		CoordinatorAddr:   env("CONDUCTOR_COORDINATOR_ADDR", "localhost:8080"),
-		CoordinatorListen: env("CONDUCTOR_COORDINATOR_LISTEN", ":8080"),
-		APIListen:         env("CONDUCTOR_API_LISTEN", ":8081"),
-		WorkerListen:      env("CONDUCTOR_WORKER_LISTEN", ":9000"),
+		CoordinatorAddr:          env("CONDUCTOR_COORDINATOR_ADDR", "localhost:8080"),
+		CoordinatorListen:        env("CONDUCTOR_COORDINATOR_LISTEN", ":8080"),
+		CoordinatorAdvertiseAddr: os.Getenv("CONDUCTOR_COORDINATOR_ADVERTISE_ADDR"),
+		APIListen:                env("CONDUCTOR_API_LISTEN", ":8081"),
+		WorkerListen:             env("CONDUCTOR_WORKER_LISTEN", ":9000"),
 		Worker: Worker{
 			AdvertiseAddr: os.Getenv("CONDUCTOR_WORKER_ADVERTISE_ADDR"),
 			DockerSocket:  env("CONDUCTOR_DOCKER_SOCKET", "/var/run/docker.sock"),

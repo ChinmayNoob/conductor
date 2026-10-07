@@ -167,3 +167,13 @@ func (db *DB) TriggerSchedule(ctx context.Context, namespace, name string) (*Sch
 	}
 	return s, nil
 }
+
+// NextScheduleAt returns when the next enabled schedule is due, or nil.
+func (db *DB) NextScheduleAt(ctx context.Context) (*time.Time, error) {
+	var t *time.Time
+	err := db.q.QueryRowContext(ctx, `SELECT min(next_run_at) FROM schedules WHERE enabled`).Scan(&t)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find next schedule: %w", err)
+	}
+	return t, nil
+}

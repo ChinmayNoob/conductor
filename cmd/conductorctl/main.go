@@ -51,6 +51,7 @@ Queues and workers:
   queue set <name> [-concurrency N] [-rate N -per SECONDS] [-pause]
   queue delete <name>
   workers                      (admin)
+  cluster                      Leader, epoch and coordinators (admin)
 
 Admin:
   namespace create|set <name> [-max-pending N] [-max-concurrency N]
@@ -110,6 +111,8 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return a.dlq(ctx, args[1:])
 	case "workers":
 		return a.workers(ctx)
+	case "cluster":
+		return a.cluster(ctx)
 	}
 	if len(args) < 2 {
 		return fmt.Errorf("usage: conductorctl %s <subcommand>; run conductorctl -h for help", args[0])
@@ -735,6 +738,32 @@ func (a *cli) workers(ctx context.Context) error {
 	for _, w := range list {
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%d/%d\t%s\t%s\n", w.ID, w.Address, w.Status, w.Running, w.Slots,
 			w.LastSeen.Local().Format(time.TimeOnly), formatMap(w.Labels))
+	}
+	return tw.Flush()
+}
+
+func (a *cli) cluster(ctx context.Context) error {
+	cl, err := a.c.Cluster(ctx)
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(cl)
+	}
+	if cl.Leader != nil {
+		fmt.Printf("Leader: %s (%s), epoch %d, elected %s\n\n", cl.Leader.ID, cl.Leader.Address, cl.Leader.Epoch,
+			timeOrDash(cl.Leader.ElectedAt))
+	} else {
+		fmt.Print("Leader: none elected yet\n\n")
+	}
+	tw := table("COORDINATOR", "ADDRESS", "ROLE", "STARTED", "LAST SEEN")
+	for _, c := range cl.Coordinators {
+		role := "standby"
+		if c.Leader {
+			role = "leader"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", c.ID, c.Address, role,
+			c.StartedAt.Local().Format(time.DateTime), c.LastSeen.Local().Format(time.TimeOnly))
 	}
 	return tw.Flush()
 }

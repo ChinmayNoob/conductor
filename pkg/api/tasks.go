@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
@@ -46,6 +47,7 @@ type taskJSON struct {
 	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 	WorkflowID     *uuid.UUID        `json:"workflow_id,omitempty"`
 	WorkerID       *int64            `json:"worker_id,omitempty"`
+	Attempt        int               `json:"attempt"`
 	CreatedAt      time.Time         `json:"created_at"`
 }
 
@@ -63,7 +65,8 @@ func toTaskJSON(t *db.Task) taskJSON {
 		RetryCount: t.RetryCount, TimeoutSeconds: t.TimeoutSeconds, ScheduledAt: t.ScheduledAt,
 		PickedAt: t.PickedAt, StartedAt: t.StartedAt, CompletedAt: t.CompletedAt, FailedAt: t.FailedAt,
 		CancelledAt: t.CancelledAt, Output: t.Output, Outputs: t.Outputs, ErrorMessage: t.ErrorMessage,
-		IdempotencyKey: t.IdempotencyKey, WorkflowID: t.WorkflowID, WorkerID: t.WorkerID, CreatedAt: t.CreatedAt,
+		IdempotencyKey: userKey(t.IdempotencyKey), WorkflowID: t.WorkflowID, WorkerID: t.WorkerID,
+		Attempt: t.Attempt, CreatedAt: t.CreatedAt,
 	}
 }
 
@@ -102,7 +105,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		Namespace:      namespace(r),
 		TemplateJson:   tmpl,
 		ScheduledAt:    scheduledAt,
-		IdempotencyKey: req.IdempotencyKey,
+		IdempotencyKey: idempotencyKey(req.IdempotencyKey),
 	})
 	if err != nil {
 		s.writeRPCError(w, err)
@@ -232,4 +235,25 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		out["total"] += counts[st]
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// autoKeyPrefix marks idempotency keys the API generates itself.
+const autoKeyPrefix = "auto:"
+
+// idempotencyKey returns the caller's key, or a fresh one. Every submission
+// carries a key so that if a coordinator fails over mid-request and the
+// client library retries, the retry can't create a duplicate.
+func idempotencyKey(key string) string {
+	if key != "" {
+		return key
+	}
+	return autoKeyPrefix + uuid.NewString()
+}
+
+// userKey hides generated keys from API responses.
+func userKey(key string) string {
+	if strings.HasPrefix(key, autoKeyPrefix) {
+		return ""
+	}
+	return key
 }

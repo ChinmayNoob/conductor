@@ -100,6 +100,16 @@ func pick(t *testing.T, db *DB, opts ...PickOptions) *Task {
 	return task
 }
 
+// att returns a task's current attempt, which status reports must quote.
+func att(t *testing.T, db *DB, id uuid.UUID) int {
+	t.Helper()
+	task, err := db.GetTask(context.Background(), id)
+	if err != nil || task == nil {
+		t.Fatalf("GetTask(%s): %v", id, err)
+	}
+	return task.Attempt
+}
+
 func exec(t *testing.T, db *DB, query string, args ...any) {
 	t.Helper()
 	if _, err := db.q.ExecContext(context.Background(), query, args...); err != nil {
@@ -145,10 +155,10 @@ func TestTaskLifecycle(t *testing.T) {
 		t.Fatal("a picked task was picked twice")
 	}
 
-	if !must[bool](t)(db.MarkTaskStarted(ctx, task.ID, 42)) {
+	if !must[bool](t)(db.MarkTaskStarted(ctx, task.ID, att(t, db, task.ID), 42)) {
 		t.Fatal("MarkTaskStarted did not update")
 	}
-	if r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, "hi\n", StringMap{"k": "v"})); !r.Updated {
+	if r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, att(t, db, task.ID), "hi\n", StringMap{"k": "v"})); !r.Updated {
 		t.Fatal("MarkTaskCompleted did not update")
 	}
 
@@ -159,10 +169,10 @@ func TestTaskLifecycle(t *testing.T) {
 	}
 
 	// Late or duplicate reports must not change a finished task.
-	if must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, "", "late failure")).Updated {
+	if must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), "", "late failure")).Updated {
 		t.Fatal("a late failure report changed a completed task")
 	}
-	if must[bool](t)(db.RetryTask(ctx, task.ID, "", "late failure")) {
+	if must[bool](t)(db.RetryTask(ctx, task.ID, att(t, db, task.ID), "", "late failure")) {
 		t.Fatal("a late failure report retried a completed task")
 	}
 }
@@ -360,7 +370,7 @@ func TestRetryBackoffIsExponential(t *testing.T) {
 		exec(t, db, `UPDATE tasks SET scheduled_at = NOW() WHERE id = $1`, task.ID)
 		pick(t, db)
 		before := time.Now()
-		if !must[bool](t)(db.RetryTask(ctx, task.ID, "", "boom")) {
+		if !must[bool](t)(db.RetryTask(ctx, task.ID, att(t, db, task.ID), "", "boom")) {
 			t.Fatal("RetryTask returned false with retries left")
 		}
 		got := must[*Task](t)(db.GetTask(ctx, task.ID))
@@ -375,7 +385,7 @@ func TestRetryBackoffIsExponential(t *testing.T) {
 
 	exec(t, db, `UPDATE tasks SET scheduled_at = NOW() WHERE id = $1`, task.ID)
 	pick(t, db)
-	if must[bool](t)(db.RetryTask(ctx, task.ID, "", "boom")) {
+	if must[bool](t)(db.RetryTask(ctx, task.ID, att(t, db, task.ID), "", "boom")) {
 		t.Fatal("RetryTask returned true with no retries left")
 	}
 }
@@ -401,13 +411,13 @@ func TestCancelTask(t *testing.T) {
 
 	running := create(t, db, "running")
 	pick(t, db)
-	must[bool](t)(db.MarkTaskStarted(ctx, running.ID, 1))
+	must[bool](t)(db.MarkTaskStarted(ctx, running.ID, att(t, db, running.ID), 1))
 	before = must[*Task](t)(db.CancelTask(ctx, running.ID))
 	if before == nil || before.Status != StatusStarted || before.PickedAt == nil {
 		t.Fatalf("CancelTask returned %+v, want the started task", before)
 	}
 	// The killed process's failure report must not resurrect the task.
-	if must[bool](t)(db.RetryTask(ctx, running.ID, "", "killed")) || must[TaskResult](t)(db.MarkTaskFailed(ctx, running.ID, "", "killed")).Updated {
+	if must[bool](t)(db.RetryTask(ctx, running.ID, att(t, db, running.ID), "", "killed")) || must[TaskResult](t)(db.MarkTaskFailed(ctx, running.ID, att(t, db, running.ID), "", "killed")).Updated {
 		t.Fatal("a report from the killed process changed the cancelled task")
 	}
 }
@@ -418,7 +428,7 @@ func TestDeadLetterAndRequeue(t *testing.T) {
 
 	task := create(t, db, "doomed", func(n *NewTask) { n.MaxRetries = 0 })
 	pick(t, db)
-	must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, "", "boom"))
+	must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), "", "boom"))
 
 	dead := must[[]*Task](t)(db.ListTasks(ctx, TaskFilter{Namespace: "default", DeadLetter: true, Limit: 10}))
 	if len(dead) != 1 || dead[0].ID != task.ID {
@@ -439,10 +449,10 @@ func TestOverdueAndStaleTasks(t *testing.T) {
 
 	stuck := create(t, db, "stuck", func(n *NewTask) { n.TimeoutSeconds = 1 })
 	pick(t, db)
-	must[bool](t)(db.MarkTaskStarted(ctx, stuck.ID, 1))
+	must[bool](t)(db.MarkTaskStarted(ctx, stuck.ID, att(t, db, stuck.ID), 1))
 	exec(t, db, `UPDATE tasks SET started_at = NOW() - INTERVAL '1 minute' WHERE id = $1`, stuck.ID)
-	overdue := must[[]uuid.UUID](t)(db.ListOverdueTasks(ctx, 30*time.Second))
-	if len(overdue) != 1 || overdue[0] != stuck.ID {
+	overdue := must[[]TaskAttempt](t)(db.ListOverdueTasks(ctx, 30*time.Second))
+	if len(overdue) != 1 || overdue[0].ID != stuck.ID || overdue[0].Attempt != 1 {
 		t.Fatalf("overdue = %v, want [%s]", overdue, stuck.ID)
 	}
 
@@ -528,7 +538,7 @@ func TestWorkflowRunAndStepStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	pick(t, db)
-	r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, "", StringMap{"out": "x"}))
+	r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, att(t, db, task.ID), "", StringMap{"out": "x"}))
 	if r.WorkflowID == nil || *r.WorkflowID != wf.ID {
 		t.Fatal("MarkTaskCompleted did not report the task's workflow")
 	}

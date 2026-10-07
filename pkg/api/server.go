@@ -83,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	authed("DELETE /v1/queues/{name}", s.handleDeleteQueue)
 
 	admin("GET /v1/workers", s.handleListWorkers)
+	admin("GET /v1/cluster", s.handleCluster)
 
 	admin("POST /v1/namespaces", s.handleCreateNamespace)
 	admin("GET /v1/namespaces", s.handleListNamespaces)

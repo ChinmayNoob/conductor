@@ -30,6 +30,7 @@ message TaskRequest {
   string type = 5;               // shell, http or container
   bytes spec_json = 6;           // type-specific settings
   map<string, string> env = 7;   // extra environment variables
+  int32 attempt = 8;             // dispatch number; quote it in status reports
 }
 
 message TaskResponse {
@@ -92,6 +93,7 @@ message UpdateTaskStatusRequest {
   string output = 3;
   string error_message = 4;            // set when status is FAILED
   map<string, string> outputs = 5;     // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
+  int32 attempt = 6;                   // from TaskRequest; stale attempts are ignored
 }
 
 message UpdateTaskStatusResponse {

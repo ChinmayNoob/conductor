@@ -1,6 +1,7 @@
 // Package coordinator is the brain of the cluster: it tracks workers through
 // heartbeats, dispatches queued tasks to them, handles retries, drives
-// workflow DAGs, and fires cron schedules.
+// workflow DAGs, and fires cron schedules. Several coordinators may run; one
+// is elected leader and does all of this, the rest stand by (see leader.go).
 package coordinator
 
 import (
@@ -34,6 +35,9 @@ const (
 	// A task picked for dispatch but never started within this long is
 	// requeued (e.g. the coordinator crashed mid-dispatch).
 	staleTaskThreshold = 5 * time.Minute
+
+	// Notifications wake the dispatcher; this is only a safety net.
+	maxDispatchSleep = 5 * time.Second
 )
 
 type Worker struct {
@@ -73,14 +77,21 @@ func (w *Worker) status() string {
 	return "healthy"
 }
 
-// dispatchedTask records which worker a task was handed to, so the worker's
-// slot can be freed and its tasks recovered if it dies.
+// dispatchedTask records which worker runs which attempt of a task, so the
+// worker's slot can be freed and its tasks recovered if it dies.
 type dispatchedTask struct {
 	workerID uint32
+	attempt  int
 	deadline time.Time
 }
 
 type Options struct {
+	// ID and Address identify this coordinator; Address is where callers
+	// are redirected when it leads.
+	ID      string
+	Address string
+	// DSN is used to LISTEN for notifications. Empty disables them.
+	DSN string
 	// DialOptions are used to connect to workers.
 	DialOptions []grpc.DialOption
 	// PriorityAging raises a waiting task's priority one level per interval.
@@ -95,49 +106,35 @@ type Server struct {
 	log  *slog.Logger
 
 	mu           sync.RWMutex
+	epoch        int64         // 0 when not leading
+	fencedOut    chan struct{} // closed when a fenced write finds a newer leader
+	leaderAddr   string        // the current leader, for redirects
 	workers      map[uint32]*Worker
 	inFlight     map[uuid.UUID]dispatchedTask
 	lastWorkerID uint32
-	wake         chan struct{}
+
+	wake      chan struct{}
+	wakeSched chan struct{}
 }
 
-// NewServer creates a coordinator. Call Run to start dispatching.
+// NewServer creates a coordinator. Call Run to campaign and, once elected,
+// dispatch.
 func NewServer(database *db.DB, opts Options) *Server {
 	return &Server{
-		db:       database,
-		opts:     opts,
-		log:      slog.Default(),
-		workers:  make(map[uint32]*Worker),
-		inFlight: make(map[uuid.UUID]dispatchedTask),
-		wake:     make(chan struct{}, 1),
+		db:        database,
+		opts:      opts,
+		log:       slog.Default(),
+		workers:   make(map[uint32]*Worker),
+		inFlight:  make(map[uuid.UUID]dispatchedTask),
+		wake:      make(chan struct{}, 1),
+		wakeSched: make(chan struct{}, 1),
 	}
 }
 
-// Run dispatches tasks, recovers lost ones, advances workflows and fires
-// schedules until ctx is cancelled, then closes worker connections.
+// Run campaigns for leadership and leads whenever elected, until ctx ends.
 func (s *Server) Run(ctx context.Context) {
-	if err := s.registerExamples(ctx); err != nil {
-		s.log.Error("Failed to register example workflows", "error", err)
-	}
-
-	loops := []func(context.Context){s.dispatchLoop, s.recoveryLoop, s.workflowSweepLoop, s.scheduleLoop}
-	var wg sync.WaitGroup
-	for _, loop := range loops {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			loop(ctx)
-		}()
-	}
-	wg.Wait()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, w := range s.workers {
-		if w.conn != nil {
-			w.conn.Close()
-		}
-	}
+	go s.presenceLoop(ctx)
+	s.campaign(ctx)
 	s.log.Info("Coordinator stopped")
 }
 
@@ -151,7 +148,13 @@ func (s *Server) recoveryLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.recoverLostTasks(ctx)
-			if n, err := s.db.ResetStaleTasks(ctx, staleTaskThreshold); err != nil {
+			var n int64
+			err := s.fenced(ctx, func(tx *db.DB) error {
+				var err error
+				n, err = tx.ResetStaleTasks(ctx, staleTaskThreshold)
+				return err
+			})
+			if err != nil && ctx.Err() == nil {
 				s.log.Error("Failed to reset stale tasks", "error", err)
 			} else if n > 0 {
 				s.log.Warn("Requeued stale tasks", "count", n)
@@ -165,8 +168,12 @@ func (s *Server) recoveryLoop(ctx context.Context) {
 // timeout without a result. Failing them sends them through the normal retry
 // (or workflow compensation) path instead of leaving them stuck forever.
 func (s *Server) recoverLostTasks(ctx context.Context) {
+	type lostTask struct {
+		attempt int
+		reason  string
+	}
 	now := time.Now()
-	lost := make(map[uuid.UUID]string)
+	lost := make(map[uuid.UUID]lostTask)
 	var died []uint32
 
 	s.mu.Lock()
@@ -179,7 +186,7 @@ func (s *Server) recoverLostTasks(ctx context.Context) {
 	}
 	for taskID, t := range s.inFlight {
 		if w, ok := s.workers[t.workerID]; !ok || !w.IsHealthy {
-			lost[taskID] = fmt.Sprintf("worker %d became unhealthy", t.workerID)
+			lost[taskID] = lostTask{t.attempt, fmt.Sprintf("worker %d became unhealthy", t.workerID)}
 		} else if now.After(t.deadline) {
 			// The task itself is recovered from the database below; here we
 			// only free the worker's slot.
@@ -195,21 +202,21 @@ func (s *Server) recoverLostTasks(ctx context.Context) {
 	}
 
 	// Catches tasks the in-memory bookkeeping doesn't know about, e.g. ones
-	// that were running when the coordinator restarted.
+	// running on a worker that died while another coordinator led.
 	overdue, err := s.db.ListOverdueTasks(ctx, lostTaskGrace)
-	if err != nil {
+	if err != nil && ctx.Err() == nil {
 		s.log.Error("Failed to list overdue tasks", "error", err)
 	}
-	for _, taskID := range overdue {
-		if _, ok := lost[taskID]; !ok {
-			lost[taskID] = "no result reported within the task timeout"
+	for _, t := range overdue {
+		if _, ok := lost[t.ID]; !ok {
+			lost[t.ID] = lostTask{t.Attempt, "no result reported within the task timeout"}
 		}
 	}
 
-	for taskID, reason := range lost {
-		s.log.Warn("Task lost", "task_id", taskID, "reason", reason)
+	for taskID, l := range lost {
+		s.log.Warn("Task lost", "task_id", taskID, "attempt", l.attempt, "reason", l.reason)
 		s.releaseTask(taskID)
-		if _, err := s.failTask(ctx, taskID, "", "task lost: "+reason); err != nil {
+		if _, err := s.failTask(ctx, taskID, l.attempt, "", "task lost: "+l.reason); err != nil {
 			s.log.Error("Failed to recover lost task", "task_id", taskID, "error", err)
 		}
 	}
@@ -218,26 +225,48 @@ func (s *Server) recoverLostTasks(ctx context.Context) {
 	}
 }
 
+// dispatchLoop hands out tasks whenever something may have become runnable:
+// a notification, a worker freeing up, or the next delayed task coming due.
 func (s *Server) dispatchLoop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		case <-s.wake:
 		}
 		s.dispatchTasks(ctx)
+
+		// Sleep until the next delayed task (or retry) is due.
+		wait := maxDispatchSleep
+		if next, err := s.db.NextDueAt(ctx); err == nil && next != nil {
+			wait = min(max(time.Until(*next), 10*time.Millisecond), maxDispatchSleep)
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
 	}
 }
 
-// wakeDispatcher runs a dispatch round now instead of waiting for the next
-// tick, e.g. because a worker just freed up.
+// wakeDispatcher runs a dispatch round now.
 func (s *Server) wakeDispatcher() {
 	select {
 	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// wakeScheduler checks schedules now.
+func (s *Server) wakeScheduler() {
+	select {
+	case s.wakeSched <- struct{}{}:
 	default:
 	}
 }
@@ -252,25 +281,29 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 		if len(labels) == 0 {
 			return
 		}
-		task, err := s.db.PickNextTask(ctx, db.PickOptions{
-			WorkerLabels:  labels,
-			AgingInterval: s.opts.PriorityAging,
+		var t *db.Task
+		err := s.fenced(ctx, func(tx *db.DB) error {
+			var err error
+			t, err = tx.PickNextTask(ctx, db.PickOptions{WorkerLabels: labels, AgingInterval: s.opts.PriorityAging})
+			return err
 		})
 		if err != nil {
-			s.log.Error("Failed to pick next task", "error", err)
+			if ctx.Err() == nil {
+				s.log.Error("Failed to pick next task", "error", err)
+			}
 			return
 		}
-		if task == nil {
+		if t == nil {
 			return
 		}
 
-		worker := s.chooseWorker(task.Requirements)
+		worker := s.chooseWorker(t.Requirements)
 		if worker == nil {
 			// The worker filled up or left since we looked.
-			s.requeueTask(task.ID)
+			s.requeueTask(ctx, t.ID)
 			return
 		}
-		if !s.dispatchTask(ctx, worker, task) {
+		if !s.dispatchTask(ctx, worker, t) {
 			return
 		}
 	}
@@ -334,17 +367,17 @@ func (s *Server) chooseWorker(req map[string]string) *Worker {
 }
 
 func (s *Server) dispatchTask(ctx context.Context, worker *Worker, t *db.Task) bool {
-	log := s.log.With("task_id", t.ID, "worker_id", worker.ID)
-	log.Debug("Dispatching task", "priority", t.Priority, "attempt", t.RetryCount)
+	log := s.log.With("task_id", t.ID, "worker_id", worker.ID, "attempt", t.Attempt)
+	log.Debug("Dispatching task", "priority", t.Priority)
 
 	// Track the task before sending it: the worker may report back before the
 	// RPC below returns.
-	s.trackTask(t.ID, worker, time.Duration(t.TimeoutSeconds)*time.Second)
+	s.trackTask(t.ID, t.Attempt, worker, time.Duration(t.TimeoutSeconds)*time.Second)
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	resp, err := worker.client.SubmitTask(ctx, &grpcapi.TaskRequest{
+	resp, err := worker.client.SubmitTask(rpcCtx, &grpcapi.TaskRequest{
 		TaskId:         t.ID.String(),
 		Type:           t.Type,
 		Data:           t.Data,
@@ -352,12 +385,13 @@ func (s *Server) dispatchTask(ctx context.Context, worker *Worker, t *db.Task) b
 		Env:            t.Env,
 		TimeoutSeconds: int32(t.TimeoutSeconds),
 		RetryCount:     int32(t.RetryCount),
+		Attempt:        int32(t.Attempt),
 	})
 
 	if err != nil {
 		log.Warn("Failed to dispatch task, marking worker unhealthy", "error", err)
 		s.releaseTask(t.ID)
-		s.requeueTask(t.ID)
+		s.requeueTask(ctx, t.ID)
 		s.mu.Lock()
 		worker.IsHealthy = false
 		s.mu.Unlock()
@@ -366,7 +400,7 @@ func (s *Server) dispatchTask(ctx context.Context, worker *Worker, t *db.Task) b
 	if !resp.Success {
 		log.Info("Worker rejected task", "reason", resp.Message)
 		s.releaseTask(t.ID)
-		s.requeueTask(t.ID)
+		s.requeueTask(ctx, t.ID)
 		return false
 	}
 
@@ -374,18 +408,20 @@ func (s *Server) dispatchTask(ctx context.Context, worker *Worker, t *db.Task) b
 	return true
 }
 
-func (s *Server) requeueTask(taskID uuid.UUID) {
-	if err := s.db.RequeueTask(context.Background(), taskID); err != nil {
+func (s *Server) requeueTask(ctx context.Context, taskID uuid.UUID) {
+	err := s.fenced(context.WithoutCancel(ctx), func(tx *db.DB) error { return tx.RequeueTask(ctx, taskID) })
+	if err != nil {
 		s.log.Error("Failed to requeue task", "task_id", taskID, "error", err)
 	}
 }
 
-func (s *Server) trackTask(taskID uuid.UUID, worker *Worker, timeout time.Duration) {
+func (s *Server) trackTask(taskID uuid.UUID, attempt int, worker *Worker, timeout time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.inFlight[taskID] = dispatchedTask{
 		workerID: worker.ID,
+		attempt:  attempt,
 		deadline: time.Now().Add(timeout + lostTaskGrace),
 	}
 	worker.inFlight++
@@ -495,7 +531,12 @@ func (s *Server) CancelTask(ctx context.Context, req *grpcapi.CancelTaskRequest)
 		return nil, status.Error(codes.NotFound, "task not found")
 	}
 
-	before, err := s.db.CancelTask(ctx, taskID)
+	var before *db.Task
+	err = s.fenced(ctx, func(tx *db.DB) error {
+		var err error
+		before, err = tx.CancelTask(ctx, taskID)
+		return err
+	})
 	if err != nil {
 		s.log.Error("Failed to cancel task", "task_id", taskID, "error", err)
 		return nil, status.Error(codes.Internal, "failed to cancel task")
@@ -588,7 +629,8 @@ func (s *Server) SendHeartbeat(ctx context.Context, req *grpcapi.HeartbeatReques
 	return &grpcapi.HeartbeatResponse{Acknowledged: true}, nil
 }
 
-// UpdateTaskStatus handles task status updates from workers.
+// UpdateTaskStatus handles task status updates from workers. Reports for
+// any attempt other than the task's current one are ignored.
 func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskStatusRequest) (*grpcapi.UpdateTaskStatusResponse, error) {
 	taskID, err := uuid.Parse(req.TaskId)
 	if err != nil {
@@ -596,21 +638,30 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 	}
 	// Finish state transitions even if the worker's RPC deadline passes.
 	ctx = context.WithoutCancel(ctx)
-	log := s.log.With("task_id", taskID)
+	attempt := int(req.Attempt)
+	log := s.log.With("task_id", taskID, "attempt", attempt)
 
 	shouldRetry := false
 	switch req.Status {
 	case grpcapi.TaskStatus_STARTED:
 		var updated bool
-		updated, err = s.db.MarkTaskStarted(ctx, taskID, int64(s.workerFor(taskID)))
+		err = s.fenced(ctx, func(tx *db.DB) error {
+			var err error
+			updated, err = tx.MarkTaskStarted(ctx, taskID, attempt, int64(s.workerFor(taskID)))
+			return err
+		})
 		if err == nil && !updated {
-			log.Info("Ignoring STARTED report: task is no longer dispatched")
+			log.Info("Ignoring STARTED report: not the current attempt")
 		}
 
 	case grpcapi.TaskStatus_COMPLETE:
 		s.releaseTask(taskID)
 		var r db.TaskResult
-		r, err = s.db.MarkTaskCompleted(ctx, taskID, req.Output, req.Outputs)
+		err = s.fenced(ctx, func(tx *db.DB) error {
+			var err error
+			r, err = tx.MarkTaskCompleted(ctx, taskID, attempt, req.Output, req.Outputs)
+			return err
+		})
 		if err == nil {
 			if r.Updated {
 				log.Info("Task completed")
@@ -618,14 +669,14 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 					s.reconcile(ctx, *r.WorkflowID)
 				}
 			} else {
-				log.Info("Ignoring COMPLETE report: task is no longer dispatched")
+				log.Info("Ignoring COMPLETE report: not the current attempt")
 			}
 		}
 		s.wakeDispatcher()
 
 	case grpcapi.TaskStatus_FAILED:
 		s.releaseTask(taskID)
-		shouldRetry, err = s.failTask(ctx, taskID, req.Output, req.ErrorMessage)
+		shouldRetry, err = s.failTask(ctx, taskID, attempt, req.Output, req.ErrorMessage)
 		s.wakeDispatcher()
 
 	default:
@@ -634,7 +685,7 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 
 	if err != nil {
 		log.Error("Failed to update task status", "error", err)
-		return nil, status.Error(codes.Internal, "failed to update task status")
+		return nil, status.Error(codes.Unavailable, "failed to update task status; retry")
 	}
 	return &grpcapi.UpdateTaskStatusResponse{ShouldRetry: shouldRetry}, nil
 }
@@ -642,10 +693,19 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 // failTask records a failed attempt. The task is requeued if it has retries
 // left; otherwise it is marked FAILED and its workflow, if any, advances
 // (which starts compensation). It returns whether the task will be retried.
-func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, output, errMsg string) (bool, error) {
-	log := s.log.With("task_id", taskID)
+func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, output, errMsg string) (bool, error) {
+	log := s.log.With("task_id", taskID, "attempt", attempt)
 
-	retrying, err := s.db.RetryTask(ctx, taskID, output, errMsg)
+	var retrying bool
+	var r db.TaskResult
+	err := s.fenced(ctx, func(tx *db.DB) error {
+		var err error
+		if retrying, err = tx.RetryTask(ctx, taskID, attempt, output, errMsg); err != nil || retrying {
+			return err
+		}
+		r, err = tx.MarkTaskFailed(ctx, taskID, attempt, output, errMsg)
+		return err
+	})
 	if err != nil {
 		return false, err
 	}
@@ -653,13 +713,8 @@ func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, output, errMsg 
 		log.Warn("Task failed, will retry", "error", errMsg)
 		return true, nil
 	}
-
-	r, err := s.db.MarkTaskFailed(ctx, taskID, output, errMsg)
-	if err != nil {
-		return false, err
-	}
 	if !r.Updated {
-		log.Info("Ignoring failure: task is no longer dispatched")
+		log.Info("Ignoring failure: not the current attempt")
 		return false, nil
 	}
 	log.Error("Task failed permanently", "error", errMsg)

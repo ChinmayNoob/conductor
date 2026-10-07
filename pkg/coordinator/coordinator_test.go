@@ -49,7 +49,7 @@ func TestChooseWorkerSkipsBusyUnhealthyAndDraining(t *testing.T) {
 	s := newTestServer(1, 2, 3, 4)
 	s.workers[2].IsHealthy = false
 	s.workers[4].Draining = true
-	s.trackTask(uuid.New(), s.workers[1], time.Minute)
+	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
 
 	for range 3 {
 		if w := s.chooseWorker(shell); w.ID != 3 {
@@ -67,11 +67,11 @@ func TestChooseWorkerUsesSlots(t *testing.T) {
 	s := newTestServer(1)
 	s.workers[1].Slots = 2
 
-	s.trackTask(uuid.New(), s.workers[1], time.Minute)
+	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
 	if s.chooseWorker(shell) == nil {
 		t.Fatal("worker with a free slot was not chosen")
 	}
-	s.trackTask(uuid.New(), s.workers[1], time.Minute)
+	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
 	if s.chooseWorker(shell) != nil {
 		t.Fatal("worker with no free slot was chosen")
 	}
@@ -103,7 +103,7 @@ func TestReleaseTaskFreesWorkerSlot(t *testing.T) {
 	s := newTestServer(1)
 	taskID := uuid.New()
 
-	s.trackTask(taskID, s.workers[1], time.Minute)
+	s.trackTask(taskID, 1, s.workers[1], time.Minute)
 	if w := s.chooseWorker(shell); w != nil {
 		t.Fatal("worker should be busy while its task is in flight")
 	}

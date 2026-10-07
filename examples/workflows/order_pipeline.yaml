@@ -1,0 +1,49 @@
+name: order_pipeline
+description: >
+  A DAG: validate the order, then reserve stock and charge the card in
+  parallel, then ship. Steps pass values to each other through outputs. Set
+  fail_shipping=true to watch both parallel branches get compensated.
+inputs:
+  order_id: {required: true}
+  amount: {default: "100"}
+  fail_shipping: {default: "false"}
+defaults:
+  retries: 1
+  retry_delay: 2s
+  timeout: 1m
+steps:
+  - name: validate
+    run: |
+      echo "validating order $INPUT_ORDER_ID"
+      echo "customer=cus_$INPUT_ORDER_ID" >> "$CONDUCTOR_OUTPUT"
+
+  - name: reserve_stock
+    depends_on: [validate]
+    run: |
+      sleep 2
+      echo "reserved stock for order $INPUT_ORDER_ID"
+      echo "reservation=res_$INPUT_ORDER_ID" >> "$CONDUCTOR_OUTPUT"
+    compensate: echo "releasing reservation $OUTPUT_RESERVATION"
+
+  - name: charge_card
+    depends_on: [validate]
+    env:
+      CUSTOMER: "${{ steps.validate.outputs.customer }}"
+    run: |
+      sleep 2
+      echo "charging $INPUT_AMOUNT to $CUSTOMER"
+      echo "charge=ch_$INPUT_ORDER_ID" >> "$CONDUCTOR_OUTPUT"
+    compensate: echo "refunding charge $OUTPUT_CHARGE"
+
+  - name: ship
+    depends_on: [reserve_stock, charge_card]
+    retries: 0
+    env:
+      RESERVATION: "${{ steps.reserve_stock.outputs.reservation }}"
+      CHARGE: "${{ steps.charge_card.outputs.charge }}"
+    run: |
+      if [ "$INPUT_FAIL_SHIPPING" = "true" ]; then
+        echo "carrier unavailable"
+        exit 1
+      fi
+      echo "shipping $RESERVATION, paid with $CHARGE"

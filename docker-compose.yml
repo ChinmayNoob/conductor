@@ -2,23 +2,29 @@
 # override them in .env (see .env.example) before exposing this anywhere.
 #
 #   docker compose up -d --build --scale worker=3
+#   docker compose --profile containers up -d   # also run container tasks
 #   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d   # with mTLS
 
 x-conductor: &conductor
   build: .
   image: conductor:dev
   restart: unless-stopped
-  environment: &conductor-env
-    POSTGRES_HOST: postgres
-    POSTGRES_PORT: 5432
-    POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
-    POSTGRES_USER: ${POSTGRES_USER:-postgres}
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    CONDUCTOR_COORDINATOR_ADDR: coordinator:8080
-    CONDUCTOR_CLUSTER_TOKEN: ${CONDUCTOR_CLUSTER_TOKEN:-insecure-dev-cluster-token}
-    CONDUCTOR_API_KEY: ${CONDUCTOR_API_KEY:-insecure-dev-api-key}
-    CONDUCTOR_LOG_LEVEL: ${CONDUCTOR_LOG_LEVEL:-info}
-    CONDUCTOR_LOG_FORMAT: ${CONDUCTOR_LOG_FORMAT:-text}
+
+# Every component: how to reach the coordinator and authenticate.
+x-cluster-env: &cluster-env
+  CONDUCTOR_COORDINATOR_ADDR: coordinator:8080
+  CONDUCTOR_CLUSTER_TOKEN: ${CONDUCTOR_CLUSTER_TOKEN:-insecure-dev-cluster-token}
+  CONDUCTOR_LOG_LEVEL: ${CONDUCTOR_LOG_LEVEL:-info}
+  CONDUCTOR_LOG_FORMAT: ${CONDUCTOR_LOG_FORMAT:-text}
+
+# Only the coordinator and API talk to Postgres; workers never see these.
+x-db-env: &db-env
+  <<: *cluster-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
 
 services:
   postgres:
@@ -40,6 +46,8 @@ services:
   coordinator:
     <<: *conductor
     command: ["coordinator"]
+    environment:
+      <<: *db-env
     ports:
       - "8080:8080"
     depends_on:
@@ -49,6 +57,9 @@ services:
   api:
     <<: *conductor
     command: ["api"]
+    environment:
+      <<: *db-env
+      CONDUCTOR_API_KEY: ${CONDUCTOR_API_KEY:-insecure-dev-api-key}
     ports:
       - "8081:8081"
     depends_on:
@@ -65,6 +76,9 @@ services:
   worker:
     <<: *conductor
     command: ["worker"]
+    environment:
+      <<: *cluster-env
+      CONDUCTOR_WORKER_SLOTS: ${CONDUCTOR_WORKER_SLOTS:-2}
     # Workers advertise their own container IP, so replicas never collide.
     # On shutdown they finish running tasks for up to CONDUCTOR_SHUTDOWN_TIMEOUT
     # (25s), so give them a little longer than that.
@@ -73,6 +87,23 @@ services:
       - coordinator
     deploy:
       replicas: 2
+
+  # Runs `type: container` tasks by talking to the host's Docker. Access to
+  # the Docker socket is equivalent to root on the host, so this worker is
+  # opt-in: docker compose --profile containers up -d
+  container-worker:
+    <<: *conductor
+    command: ["worker"]
+    profiles: ["containers"]
+    user: root
+    environment:
+      <<: *cluster-env
+      CONDUCTOR_WORKER_SLOTS: 2
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    stop_grace_period: 30s
+    depends_on:
+      - coordinator
 
 volumes:
   postgres_data:

@@ -18,3 +18,6 @@ services:
   worker:
     environment: *tls-env
     volumes: ["./certs:/certs:ro"]
+  container-worker:
+    environment: *tls-env
+    volumes: ["./certs:/certs:ro", "/var/run/docker.sock:/var/run/docker.sock"]

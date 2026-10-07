@@ -5,7 +5,8 @@ package grpcapi;
 option go_package = "github.com/ChinmayNoob/conductor/pkg/grpcapi";
 
 // Every RPC requires the cluster token in the "authorization" metadata.
-// Failures are returned as gRPC status errors (InvalidArgument, NotFound, ...).
+// Failures are returned as gRPC status errors (InvalidArgument, NotFound,
+// ResourceExhausted, ...).
 
 enum TaskStatus {
   QUEUED = 0;
@@ -17,21 +18,24 @@ enum TaskStatus {
 // Implemented by workers; called by the coordinator.
 service WorkerService {
   rpc SubmitTask (TaskRequest) returns (TaskResponse) {}
-  // Kills the task's process if it is running on this worker.
+  // Kills the task if it is running on this worker.
   rpc CancelTask (CancelTaskRequest) returns (CancelTaskResponse) {}
 }
 
 message TaskRequest {
   string task_id = 1;
-  string data = 2;
+  string data = 2;               // shell command (type "shell")
   int32 timeout_seconds = 3;
-  int32 retry_count = 4;      // Current retry attempt (for logging)
+  int32 retry_count = 4;         // current attempt, for logging
+  string type = 5;               // shell, http or container
+  bytes spec_json = 6;           // type-specific settings
+  map<string, string> env = 7;   // extra environment variables
 }
 
 message TaskResponse {
   string task_id = 1;
   string message = 2;
-  bool success = 3;           // false if the worker has no free slot
+  bool success = 3;              // false if the worker has no free slot
 }
 
 // Implemented by the coordinator; called by workers and the API server.
@@ -47,20 +51,20 @@ service CoordinatorService {
 }
 
 message ClientTaskRequest {
-  string data = 1;
-  int32 priority = 2;              // 1-10, lower = higher priority (default 5)
-  int32 max_retries = 3;           // Max retry attempts (default 3)
-  int32 retry_delay_seconds = 4;   // Base delay between retries (default 60)
-  int32 timeout_seconds = 5;       // Task timeout (default 300)
-  int64 scheduled_at = 6;          // Unix timestamp for delayed execution (0 = now)
+  string namespace = 1;
+  bytes template_json = 2;        // a task.Template, validated by the coordinator
+  int64 scheduled_at = 3;         // Unix seconds; 0 = now
+  string idempotency_key = 4;
 }
 
 message ClientTaskResponse {
   string task_id = 1;
+  bool created = 2;              // false if the idempotency key matched an existing task
 }
 
 message CancelTaskRequest {
   string task_id = 1;
+  string namespace = 2;          // required on the coordinator, ignored by workers
 }
 
 message CancelTaskResponse {
@@ -73,6 +77,9 @@ message HeartbeatRequest {
   string address = 2;
   // A draining worker finishes its current tasks but accepts no new ones.
   bool draining = 3;
+  int32 slots = 4;               // tasks it can run at once
+  int32 running = 5;             // tasks it is running now
+  map<string, string> labels = 6;
 }
 
 message HeartbeatResponse {
@@ -83,24 +90,30 @@ message UpdateTaskStatusRequest {
   string task_id = 1;
   TaskStatus status = 2;
   string output = 3;
-  string error_message = 4;   // Set when status is FAILED
+  string error_message = 4;            // set when status is FAILED
+  map<string, string> outputs = 5;     // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
 }
 
 message UpdateTaskStatusResponse {
-  bool should_retry = 1;      // The coordinator will retry the failed task
+  bool should_retry = 1;               // the coordinator will retry the failed task
 }
 
 message WorkflowRequest {
-  string workflow_type = 1;
-  string input_json = 2;       // JSON object passed to step commands
+  string namespace = 1;
+  string name = 2;                     // workflow definition name
+  int32 version = 3;                   // 0 = latest
+  string input_json = 4;               // JSON object of inputs
+  string idempotency_key = 5;
 }
 
 message WorkflowResponse {
   string workflow_id = 1;
+  bool created = 2;
 }
 
 message CancelWorkflowRequest {
   string workflow_id = 1;
+  string namespace = 2;
 }
 
 message CancelWorkflowResponse {

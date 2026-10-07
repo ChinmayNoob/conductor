@@ -1,0 +1,23 @@
+name: trip_booking_fail
+description: Like trip_booking, but the hotel is always unavailable, so the flight gets cancelled.
+inputs:
+  user_id: {required: true}
+  amount: {required: true}
+defaults:
+  retries: 2
+  retry_delay: 5s
+  timeout: 1m
+steps:
+  - name: book_flight
+    run: echo "booking flight for user=$INPUT_USER_ID"
+    compensate: echo "cancelling flight for user=$INPUT_USER_ID"
+
+  - name: book_hotel
+    depends_on: [book_flight]
+    run: echo "hotel unavailable for user=$INPUT_USER_ID" && exit 1
+    compensate: echo "cancelling hotel for user=$INPUT_USER_ID"
+
+  - name: charge_payment
+    depends_on: [book_hotel]
+    run: echo "charging amount=$INPUT_AMOUNT for user=$INPUT_USER_ID"
+    compensate: echo "refunding amount=$INPUT_AMOUNT for user=$INPUT_USER_ID"

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -29,7 +30,7 @@ type DB struct {
 // Open connects to Postgres, retrying until ctx is done so components can
 // start before the database is ready.
 func Open(ctx context.Context, dsn string) (*DB, error) {
-	conn, err := sql.Open("postgres", dsn)
+	conn, err := sql.Open("postgres", withUTC(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -52,6 +53,22 @@ func Open(ctx context.Context, dsn string) (*DB, error) {
 		}
 		backoff = min(backoff*2, 5*time.Second)
 	}
+}
+
+// withUTC pins the session time zone to UTC. Several columns are TIMESTAMP
+// without a zone and are compared with NOW(), so the session zone must match
+// the UTC values the code stores.
+func withUTC(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil || u.Scheme == "" {
+		return dsn
+	}
+	q := u.Query()
+	if q.Get("timezone") == "" {
+		q.Set("timezone", "UTC")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 func (db *DB) Close() error {

@@ -1,19 +1,22 @@
 // Package coordinator is the brain of the cluster: it tracks workers through
-// heartbeats, dispatches queued tasks to them, handles retries, and drives
-// saga workflows.
+// heartbeats, dispatches queued tasks to them, handles retries, drives
+// workflow DAGs, and fires cron schedules.
 package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
-	"github.com/ChinmayNoob/conductor/pkg/workflow"
+	"github.com/ChinmayNoob/conductor/pkg/task"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,11 +24,6 @@ import (
 )
 
 const (
-	// Workers run one task at a time, so only hand each worker one task at a
-	// time. Extra tasks would wait in the worker's local queue, where the
-	// stale-task cleanup could mistake them for lost tasks and run them twice.
-	maxTasksPerWorker = 1
-
 	// A worker that misses heartbeats for this long is considered dead.
 	workerTimeout = 30 * time.Second
 
@@ -44,9 +42,35 @@ type Worker struct {
 	LastSeen  time.Time
 	IsHealthy bool
 	Draining  bool
+	Slots     int
+	Labels    map[string]string
 	inFlight  int
 	client    grpcapi.WorkerServiceClient
 	conn      *grpc.ClientConn
+}
+
+func (w *Worker) available() bool {
+	return w.IsHealthy && !w.Draining && w.client != nil && w.inFlight < w.Slots
+}
+
+// hasLabels reports whether the worker has every required label.
+func (w *Worker) hasLabels(req map[string]string) bool {
+	for k, v := range req {
+		if w.Labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func (w *Worker) status() string {
+	switch {
+	case !w.IsHealthy:
+		return "unhealthy"
+	case w.Draining:
+		return "draining"
+	}
+	return "healthy"
 }
 
 // dispatchedTask records which worker a task was handed to, so the worker's
@@ -56,13 +80,19 @@ type dispatchedTask struct {
 	deadline time.Time
 }
 
+type Options struct {
+	// DialOptions are used to connect to workers.
+	DialOptions []grpc.DialOption
+	// PriorityAging raises a waiting task's priority one level per interval.
+	PriorityAging time.Duration
+}
+
 type Server struct {
 	grpcapi.UnimplementedCoordinatorServiceServer
 
-	db       *db.DB
-	registry *workflow.Registry
-	dialOpts []grpc.DialOption
-	log      *slog.Logger
+	db   *db.DB
+	opts Options
+	log  *slog.Logger
 
 	mu           sync.RWMutex
 	workers      map[uint32]*Worker
@@ -71,13 +101,11 @@ type Server struct {
 	wake         chan struct{}
 }
 
-// NewServer creates a coordinator. dialOpts are used to connect to workers.
-// Call Run to start dispatching.
-func NewServer(database *db.DB, dialOpts []grpc.DialOption) *Server {
+// NewServer creates a coordinator. Call Run to start dispatching.
+func NewServer(database *db.DB, opts Options) *Server {
 	return &Server{
 		db:       database,
-		registry: workflow.NewRegistry(),
-		dialOpts: dialOpts,
+		opts:     opts,
 		log:      slog.Default(),
 		workers:  make(map[uint32]*Worker),
 		inFlight: make(map[uuid.UUID]dispatchedTask),
@@ -85,11 +113,16 @@ func NewServer(database *db.DB, dialOpts []grpc.DialOption) *Server {
 	}
 }
 
-// Run dispatches tasks and recovers lost ones until ctx is cancelled, then
-// closes worker connections.
+// Run dispatches tasks, recovers lost ones, advances workflows and fires
+// schedules until ctx is cancelled, then closes worker connections.
 func (s *Server) Run(ctx context.Context) {
+	if err := s.registerExamples(ctx); err != nil {
+		s.log.Error("Failed to register example workflows", "error", err)
+	}
+
+	loops := []func(context.Context){s.dispatchLoop, s.recoveryLoop, s.workflowSweepLoop, s.scheduleLoop}
 	var wg sync.WaitGroup
-	for _, loop := range []func(context.Context){s.dispatchLoop, s.recoveryLoop} {
+	for _, loop := range loops {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -134,12 +167,14 @@ func (s *Server) recoveryLoop(ctx context.Context) {
 func (s *Server) recoverLostTasks(ctx context.Context) {
 	now := time.Now()
 	lost := make(map[uuid.UUID]string)
+	var died []uint32
 
 	s.mu.Lock()
 	for id, worker := range s.workers {
 		if worker.IsHealthy && now.Sub(worker.LastSeen) > workerTimeout {
 			s.log.Warn("Worker missed heartbeats, marking unhealthy", "worker_id", id)
 			worker.IsHealthy = false
+			died = append(died, id)
 		}
 	}
 	for taskID, t := range s.inFlight {
@@ -152,6 +187,12 @@ func (s *Server) recoverLostTasks(ctx context.Context) {
 		}
 	}
 	s.mu.Unlock()
+
+	for _, id := range died {
+		if err := s.db.SetWorkerStatus(ctx, int64(id), "unhealthy"); err != nil {
+			s.log.Warn("Failed to record worker status", "worker_id", id, "error", err)
+		}
+	}
 
 	// Catches tasks the in-memory bookkeeping doesn't know about, e.g. ones
 	// that were running when the coordinator restarted.
@@ -201,17 +242,20 @@ func (s *Server) wakeDispatcher() {
 	}
 }
 
-// dispatchTasks hands out queued tasks until the queue is empty or every
-// worker is busy.
+// dispatchTasks hands out queued tasks until the queue is empty or no free
+// worker can run what's left.
 func (s *Server) dispatchTasks(ctx context.Context) {
 	for ctx.Err() == nil {
-		// Find a free worker first so tasks aren't picked only to be put back.
-		worker := s.getNextAvailableWorker()
-		if worker == nil {
+		// Only claim tasks some free worker can run, so tasks aren't picked
+		// just to be put back.
+		labels := s.freeWorkerLabels()
+		if len(labels) == 0 {
 			return
 		}
-
-		task, err := s.db.PickNextTask(ctx)
+		task, err := s.db.PickNextTask(ctx, db.PickOptions{
+			WorkerLabels:  labels,
+			AgingInterval: s.opts.PriorityAging,
+		})
 		if err != nil {
 			s.log.Error("Failed to pick next task", "error", err)
 			return
@@ -220,34 +264,100 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 			return
 		}
 
+		worker := s.chooseWorker(task.Requirements)
+		if worker == nil {
+			// The worker filled up or left since we looked.
+			s.requeueTask(task.ID)
+			return
+		}
 		if !s.dispatchTask(ctx, worker, task) {
 			return
 		}
 	}
 }
 
-func (s *Server) dispatchTask(ctx context.Context, worker *Worker, task *db.Task) bool {
-	log := s.log.With("task_id", task.ID, "worker_id", worker.ID)
-	log.Debug("Dispatching task", "priority", task.Priority, "attempt", task.RetryCount)
+// freeWorkerLabels returns the distinct label sets of workers with a free slot.
+func (s *Server) freeWorkerLabels() []map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var out []map[string]string
+	for _, w := range s.workers {
+		if !w.available() {
+			continue
+		}
+		key := labelKey(w.Labels)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, w.Labels)
+		}
+	}
+	return out
+}
+
+func labelKey(labels map[string]string) string {
+	keys := slices.Sorted(maps.Keys(labels))
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k + "=" + labels[k] + "\x00")
+	}
+	return b.String()
+}
+
+// chooseWorker picks the next free worker that has the required labels,
+// going round-robin in worker ID order.
+func (s *Server) chooseWorker(req map[string]string) *Worker {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ids []uint32
+	for id, w := range s.workers {
+		if w.available() && w.hasLabels(req) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	slices.Sort(ids)
+
+	next := ids[0]
+	for _, id := range ids {
+		if id > s.lastWorkerID {
+			next = id
+			break
+		}
+	}
+	s.lastWorkerID = next
+	return s.workers[next]
+}
+
+func (s *Server) dispatchTask(ctx context.Context, worker *Worker, t *db.Task) bool {
+	log := s.log.With("task_id", t.ID, "worker_id", worker.ID)
+	log.Debug("Dispatching task", "priority", t.Priority, "attempt", t.RetryCount)
 
 	// Track the task before sending it: the worker may report back before the
 	// RPC below returns.
-	s.trackTask(task.ID, worker, time.Duration(task.TimeoutSeconds)*time.Second)
+	s.trackTask(t.ID, worker, time.Duration(t.TimeoutSeconds)*time.Second)
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	resp, err := worker.client.SubmitTask(ctx, &grpcapi.TaskRequest{
-		TaskId:         task.ID.String(),
-		Data:           task.Data,
-		TimeoutSeconds: int32(task.TimeoutSeconds),
-		RetryCount:     int32(task.RetryCount),
+		TaskId:         t.ID.String(),
+		Type:           t.Type,
+		Data:           t.Data,
+		SpecJson:       t.Spec,
+		Env:            t.Env,
+		TimeoutSeconds: int32(t.TimeoutSeconds),
+		RetryCount:     int32(t.RetryCount),
 	})
 
 	if err != nil {
 		log.Warn("Failed to dispatch task, marking worker unhealthy", "error", err)
-		s.releaseTask(task.ID)
-		s.requeueTask(task.ID)
+		s.releaseTask(t.ID)
+		s.requeueTask(t.ID)
 		s.mu.Lock()
 		worker.IsHealthy = false
 		s.mu.Unlock()
@@ -255,8 +365,8 @@ func (s *Server) dispatchTask(ctx context.Context, worker *Worker, task *db.Task
 	}
 	if !resp.Success {
 		log.Info("Worker rejected task", "reason", resp.Message)
-		s.releaseTask(task.ID)
-		s.requeueTask(task.ID)
+		s.releaseTask(t.ID)
+		s.requeueTask(t.ID)
 		return false
 	}
 
@@ -300,61 +410,74 @@ func (s *Server) releaseTaskLocked(taskID uuid.UUID) {
 	}
 }
 
-// getNextAvailableWorker returns the next healthy worker with a free slot,
-// going round-robin in worker ID order.
-func (s *Server) getNextAvailableWorker() *Worker {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// workerFor returns the ID of the worker a task was dispatched to, or 0.
+func (s *Server) workerFor(taskID uuid.UUID) uint32 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.inFlight[taskID].workerID
+}
 
-	var ids []uint32
-	for id, w := range s.workers {
-		if w.IsHealthy && !w.Draining && w.client != nil && w.inFlight < maxTasksPerWorker {
-			ids = append(ids, id)
+// --- Task submission and cancellation ---
+
+func namespaceOf(ns string) string {
+	if ns == "" {
+		return "default"
+	}
+	return ns
+}
+
+// checkNamespace returns the namespace, or a gRPC error if it doesn't exist
+// or is over its pending-task quota.
+func (s *Server) checkNamespace(ctx context.Context, name string, adding bool) (*db.Namespace, error) {
+	ns, err := s.db.GetNamespace(ctx, name)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "failed to load namespace")
+	}
+	if ns == nil {
+		return nil, status.Errorf(codes.NotFound, "namespace %q does not exist", name)
+	}
+	if adding && ns.MaxPendingTasks != nil {
+		n, err := s.db.CountPendingTasks(ctx, name)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "failed to count pending tasks")
+		}
+		if n >= *ns.MaxPendingTasks {
+			return nil, status.Errorf(codes.ResourceExhausted,
+				"namespace %q has %d pending tasks, its limit", name, n)
 		}
 	}
-	if len(ids) == 0 {
-		return nil
-	}
-	slices.Sort(ids)
-
-	next := ids[0]
-	for _, id := range ids {
-		if id > s.lastWorkerID {
-			next = id
-			break
-		}
-	}
-	s.lastWorkerID = next
-	return s.workers[next]
+	return ns, nil
 }
 
 func (s *Server) SubmitTask(ctx context.Context, req *grpcapi.ClientTaskRequest) (*grpcapi.ClientTaskResponse, error) {
-	opts := db.DefaultTaskOptions()
-	if req.Priority > 0 && req.Priority <= 10 {
-		opts.Priority = int(req.Priority)
-	}
-	if req.MaxRetries > 0 {
-		opts.MaxRetries = int(req.MaxRetries)
-	}
-	if req.RetryDelaySeconds > 0 {
-		opts.RetryDelaySeconds = int(req.RetryDelaySeconds)
-	}
-	if req.TimeoutSeconds > 0 {
-		opts.TimeoutSeconds = int(req.TimeoutSeconds)
-	}
-	if req.ScheduledAt > 0 {
-		opts.ScheduledAt = time.Unix(req.ScheduledAt, 0).UTC()
+	ns := namespaceOf(req.Namespace)
+	if _, err := s.checkNamespace(ctx, ns, true); err != nil {
+		return nil, err
 	}
 
-	task, err := s.db.CreateTask(ctx, req.Data, opts)
+	var tmpl task.Template
+	if err := json.Unmarshal(req.TemplateJson, &tmpl); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid task: "+err.Error())
+	}
+	n, err := tmpl.NewTask(ns)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if req.ScheduledAt > 0 {
+		n.ScheduledAt = time.Unix(req.ScheduledAt, 0).UTC()
+	}
+	n.IdempotencyKey = req.IdempotencyKey
+
+	t, created, err := s.db.CreateTask(ctx, n)
 	if err != nil {
 		s.log.Error("Failed to create task", "error", err)
 		return nil, status.Error(codes.Internal, "failed to create task")
 	}
-	s.log.Info("Task created", "task_id", task.ID, "priority", task.Priority, "scheduled_at", task.ScheduledAt)
-	s.wakeDispatcher()
-
-	return &grpcapi.ClientTaskResponse{TaskId: task.ID.String()}, nil
+	if created {
+		s.log.Info("Task created", "task_id", t.ID, "namespace", ns, "queue", t.Queue, "type", t.Type)
+		s.wakeDispatcher()
+	}
+	return &grpcapi.ClientTaskResponse{TaskId: t.ID.String(), Created: created}, nil
 }
 
 // CancelTask cancels a task. A queued task is simply never dispatched; a
@@ -364,36 +487,31 @@ func (s *Server) CancelTask(ctx context.Context, req *grpcapi.CancelTaskRequest)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "invalid task ID")
 	}
-	cancelled, err := s.cancelTask(ctx, taskID)
+	t, err := s.db.GetTask(ctx, taskID)
 	if err != nil {
-		return nil, err
+		return nil, status.Error(codes.Internal, "failed to look up task")
 	}
-	return &grpcapi.CancelTaskResponse{Cancelled: cancelled}, nil
-}
+	if t == nil || t.Namespace != namespaceOf(req.Namespace) {
+		return nil, status.Error(codes.NotFound, "task not found")
+	}
 
-func (s *Server) cancelTask(ctx context.Context, taskID uuid.UUID) (bool, error) {
 	before, err := s.db.CancelTask(ctx, taskID)
 	if err != nil {
 		s.log.Error("Failed to cancel task", "task_id", taskID, "error", err)
-		return false, status.Error(codes.Internal, "failed to cancel task")
+		return nil, status.Error(codes.Internal, "failed to cancel task")
 	}
 	if before == nil {
-		t, err := s.db.GetTask(ctx, taskID)
-		if err != nil {
-			return false, status.Error(codes.Internal, "failed to look up task")
-		}
-		if t == nil {
-			return false, status.Error(codes.NotFound, "task not found")
-		}
-		return false, nil // already finished
+		return &grpcapi.CancelTaskResponse{Cancelled: false}, nil // already finished
 	}
 
 	s.log.Info("Task cancelled", "task_id", taskID, "was", before.Status)
 	if before.PickedAt != nil {
 		s.killOnWorker(ctx, taskID)
 	}
-	s.handleWorkflowTaskFailed(context.WithoutCancel(ctx), taskID, "cancelled")
-	return true, nil
+	if before.WorkflowID != nil {
+		s.reconcile(context.WithoutCancel(ctx), *before.WorkflowID)
+	}
+	return &grpcapi.CancelTaskResponse{Cancelled: true}, nil
 }
 
 // killOnWorker asks the worker running a task to kill it. Its slot is freed
@@ -417,14 +535,15 @@ func (s *Server) killOnWorker(ctx context.Context, taskID uuid.UUID) {
 	}
 }
 
+// --- Worker-facing RPCs ---
+
 func (s *Server) SendHeartbeat(ctx context.Context, req *grpcapi.HeartbeatRequest) (*grpcapi.HeartbeatResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	worker, exists := s.workers[req.WorkerId]
 	if !exists || worker.Address != req.Address {
-		conn, err := grpc.NewClient(req.Address, s.dialOpts...)
+		conn, err := grpc.NewClient(req.Address, s.opts.DialOptions...)
 		if err != nil {
+			s.mu.Unlock()
 			s.log.Error("Failed to connect to worker", "worker_id", req.WorkerId, "address", req.Address, "error", err)
 			return nil, status.Error(codes.InvalidArgument, "invalid worker address")
 		}
@@ -440,16 +559,32 @@ func (s *Server) SendHeartbeat(ctx context.Context, req *grpcapi.HeartbeatReques
 			}
 			s.workers[req.WorkerId] = worker
 		}
-		s.log.Info("Worker registered", "worker_id", req.WorkerId, "address", req.Address)
+		s.log.Info("Worker registered", "worker_id", req.WorkerId, "address", req.Address,
+			"slots", req.Slots, "labels", req.Labels)
 	}
 
 	if req.Draining && !worker.Draining {
 		s.log.Info("Worker is draining", "worker_id", req.WorkerId)
 	}
+	becameAvailable := !worker.available()
 	worker.LastSeen = time.Now()
 	worker.IsHealthy = true
 	worker.Draining = req.Draining
+	worker.Slots = max(int(req.Slots), 1)
+	worker.Labels = req.Labels
+	becameAvailable = becameAvailable && worker.available()
+	record := db.WorkerRecord{
+		ID: int64(worker.ID), Address: worker.Address, Labels: worker.Labels,
+		Slots: worker.Slots, Running: int(req.Running), Status: worker.status(),
+	}
+	s.mu.Unlock()
 
+	if err := s.db.UpsertWorker(ctx, record); err != nil {
+		s.log.Warn("Failed to record worker", "worker_id", req.WorkerId, "error", err)
+	}
+	if becameAvailable {
+		s.wakeDispatcher()
+	}
 	return &grpcapi.HeartbeatResponse{Acknowledged: true}, nil
 }
 
@@ -467,19 +602,21 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 	switch req.Status {
 	case grpcapi.TaskStatus_STARTED:
 		var updated bool
-		updated, err = s.db.MarkTaskStarted(ctx, taskID)
+		updated, err = s.db.MarkTaskStarted(ctx, taskID, int64(s.workerFor(taskID)))
 		if err == nil && !updated {
 			log.Info("Ignoring STARTED report: task is no longer dispatched")
 		}
 
 	case grpcapi.TaskStatus_COMPLETE:
 		s.releaseTask(taskID)
-		var updated bool
-		updated, err = s.db.MarkTaskCompleted(ctx, taskID, req.Output)
+		var r db.TaskResult
+		r, err = s.db.MarkTaskCompleted(ctx, taskID, req.Output, req.Outputs)
 		if err == nil {
-			if updated {
+			if r.Updated {
 				log.Info("Task completed")
-				s.handleWorkflowTaskComplete(ctx, taskID)
+				if r.WorkflowID != nil {
+					s.reconcile(ctx, *r.WorkflowID)
+				}
 			} else {
 				log.Info("Ignoring COMPLETE report: task is no longer dispatched")
 			}
@@ -503,12 +640,12 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 }
 
 // failTask records a failed attempt. The task is requeued if it has retries
-// left; otherwise it is marked FAILED and its workflow, if any, is compensated.
-// It returns whether the task will be retried.
+// left; otherwise it is marked FAILED and its workflow, if any, advances
+// (which starts compensation). It returns whether the task will be retried.
 func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, output, errMsg string) (bool, error) {
 	log := s.log.With("task_id", taskID)
 
-	retrying, err := s.db.RetryTask(ctx, taskID, errMsg)
+	retrying, err := s.db.RetryTask(ctx, taskID, output, errMsg)
 	if err != nil {
 		return false, err
 	}
@@ -517,15 +654,17 @@ func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, output, errMsg 
 		return true, nil
 	}
 
-	failed, err := s.db.MarkTaskFailed(ctx, taskID, output, errMsg)
+	r, err := s.db.MarkTaskFailed(ctx, taskID, output, errMsg)
 	if err != nil {
 		return false, err
 	}
-	if !failed {
+	if !r.Updated {
 		log.Info("Ignoring failure: task is no longer dispatched")
 		return false, nil
 	}
 	log.Error("Task failed permanently", "error", errMsg)
-	s.handleWorkflowTaskFailed(ctx, taskID, errMsg)
+	if r.WorkflowID != nil {
+		s.reconcile(ctx, *r.WorkflowID)
+	}
 	return false, nil
 }

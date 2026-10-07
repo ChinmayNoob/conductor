@@ -48,55 +48,55 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 - ✅ Verified end to end on Docker with 3 workers: registration, a throughput burst (30×1s tasks in 10.4s), success and failure workflows, rejected injection, and recovery after killing a worker
 
 ### Known gaps carried forward
-- No authentication and no TLS (→ Phase 1)
+- ~~No authentication and no TLS~~ (resolved in Phase 1)
 - A late report from a worker that was declared dead can still affect a later attempt of the same task (→ Phase 3, fencing)
 - A single coordinator is a single point of failure (→ Phase 3)
-- Mixed CRLF and LF line endings; `gofmt` flags every file (→ Phase 1)
+- ~~Mixed CRLF and LF line endings; `gofmt` flags every file~~ (resolved in Phase 1)
 
 ---
 
-## Phase 1: Production basics ⬜
+## Phase 1: Production basics ✅ (done, PR #2)
 
 **Goal:** every change is tested automatically, and the system is safe to expose on a network.
 **Why first:** everything later builds on this. Without CI, each new feature risks breaking the fixes from Phase 0.
 
 ### 1.1 Repository hygiene
-- ⬜ Add `.gitattributes` (`* text=auto eol=lf`) and normalize line endings in one commit
-- ⬜ Run `gofmt` across the repo, add a `golangci-lint` config, and remove the obsolete `version:` key from `docker-compose.yml`
-- ⬜ Add a `Makefile` with `build`, `test`, `lint`, `e2e`, `up`, `down` and `proto` targets
-- ⬜ Add a `LICENSE` (Apache-2.0 recommended for infrastructure software: patent grant, enterprise-friendly)
+- ✅ Add `.gitattributes` (`* text=auto eol=lf`) and normalize line endings in one commit
+- ✅ Run `gofmt` across the repo, add a `golangci-lint` config, and remove the obsolete `version:` key from `docker-compose.yml`
+- ✅ Add a `Makefile` with `build`, `test`, `lint`, `e2e`, `up`, `down` and `proto` targets
+- ✅ Add a `LICENSE` (Apache-2.0 recommended for infrastructure software: patent grant, enterprise-friendly)
 
 ### 1.2 Continuous integration
-- ⬜ GitHub Actions: build, vet, lint and unit tests on every PR
-- ⬜ **Automated end-to-end suite** (`test/e2e`, Go tests driving Docker Compose) that automates the five checks run by hand in Phase 0:
+- ✅ GitHub Actions: build, vet, lint and unit tests on every PR
+- ✅ **Automated end-to-end suite** (`test/e2e`, Go tests driving Docker Compose) that automates the five checks run by hand in Phase 0:
   - Workers register with unique IDs
   - Task lifecycle, delayed tasks and output capture
   - Throughput burst with even distribution across workers
   - Success and failure workflows, plus rejected injection
   - Killing a worker mid-task: the task is retried elsewhere
-- ⬜ Database-layer tests against a real Postgres (testcontainers-go)
-- ⬜ Branch protection on `master`: CI must pass before merge
+- ✅ Database-layer tests against a real Postgres (a throwaway database per test via `CONDUCTOR_TEST_DATABASE_URL`, rather than testcontainers-go)
+- ⚠️ Branch protection on `master`: CI must pass before merge. **Needs a repo admin** to enable (Settings → Branches).
 
 ### 1.3 Schema and configuration
-- ⬜ Replace `setup.sql` in `docker-entrypoint-initdb.d` with versioned migrations (`golang-migrate`) applied by the coordinator at startup
-- ⬜ Central config struct loaded from environment variables with defaults and validation (currently scattered `os.Getenv` calls)
-- ⬜ Structured logging with `log/slog`, including task and workflow IDs on every line
-- ⬜ Graceful shutdown on SIGTERM:
+- ✅ Replace `setup.sql` in `docker-entrypoint-initdb.d` with versioned migrations applied at startup (a small embedded runner with an advisory lock instead of `golang-migrate`)
+- ✅ Central config struct loaded from environment variables with defaults and validation (currently scattered `os.Getenv` calls)
+- ✅ Structured logging with `log/slog`, including task and workflow IDs on every line
+- ✅ Graceful shutdown on SIGTERM:
   - Worker stops accepting tasks, finishes or cancels the current one, then exits
   - Coordinator stops dispatching and closes connections
   - Scheduler calls `http.Server.Shutdown`
 
 ### 1.4 Security baseline
-- ⬜ API keys for the HTTP API (stored hashed, sent as `Authorization: Bearer`)
-- ⬜ TLS for gRPC, with optional mTLS between coordinator and workers, plus a shared worker registration token
-- ⬜ Add a `.dockerignore` (`.env`, `.git`, binaries) so secrets never enter the Docker build context
-- ⬜ Add a `.env.example` that lists every variable (including `OPENAI_API_KEY`) with placeholder values
-- ⬜ Limits on request size and task output size (for example 1 MB, truncated with a marker)
-- ⬜ API versioning: move routes under `/v1/`
+- ✅ API keys for the HTTP API (stored hashed, sent as `Authorization: Bearer`)
+- ✅ TLS for gRPC, with optional mTLS between coordinator and workers, plus a shared worker registration token
+- ✅ Add a `.dockerignore` (`.env`, `.git`, binaries) so secrets never enter the Docker build context
+- ✅ Add a `.env.example` that lists every variable (including `OPENAI_API_KEY`) with placeholder values
+- ✅ Limits on request size and task output size (for example 1 MB, truncated with a marker)
+- ✅ API versioning: move routes under `/v1/`
 
 ### 1.5 Task cancellation
-- ⬜ New `CANCELLED` status, a `DELETE /v1/tasks/{id}` endpoint and a `CancelTask` worker RPC that cancels the running command's context
-- ⬜ Cancelling a workflow stops the current step and runs compensation for completed steps
+- ✅ New `CANCELLED` status, a `POST /v1/tasks/{id}/cancel` endpoint and a `CancelTask` worker RPC that kills the running command's process group
+- ✅ Cancelling a workflow stops the current step and runs compensation for completed steps
 
 **Exit criteria:** CI is green and required on PRs; the e2e suite covers all five Phase 0 checks; the API rejects unauthenticated requests; the stack shuts down cleanly with no lost tasks.
 
@@ -132,9 +132,9 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 - ⬜ `container`: run each task in its own Docker container with CPU and memory limits. This is the sandboxing answer for untrusted work.
 
 ### 2.5 Developer experience
-- ⬜ **Single-binary mode:** `conductor dev` runs scheduler, coordinator and a worker in one process against one Postgres
-- ⬜ `conductorctl` CLI to replace the test client: submit, status, logs, cancel, workflows and schedules
-- ⬜ Go SDK (`pkg/client`) for submitting tasks and workflows from Go code
+- 🟡 **Single-binary mode:** one `conductor` binary with subcommands (done in Phase 1); `conductor dev` runs everything in one process against one Postgres
+- 🟡 `conductorctl` CLI to replace the test client: submit, status, logs, cancel, workflows and schedules (tasks, workflows and API keys done in Phase 1)
+- 🟡 Go SDK (`pkg/client`) for submitting tasks and workflows from Go code (started in Phase 1)
 
 ### 2.6 Multi-tenancy (basic)
 - ⬜ Namespaces: tasks, workflows, API keys and quotas scoped per namespace
@@ -344,8 +344,8 @@ Phases describe *areas*. The order below gets the most value soonest and front-l
 | Phase | Area | Status |
 |---|---|---|
 | 0 | Foundation and bug-fix round | ✅ Done |
-| 1 | Production basics (CI, e2e, migrations, auth, TLS, cancellation) | ⬜ Next |
-| 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | ⬜ |
+| 1 | Production basics (CI, e2e, migrations, auth, TLS, cancellation) | ✅ Done |
+| 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | 🟡 In progress |
 | 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ⬜ |
 | 4 | Observability and UI (metrics, tracing, dashboard) | ⬜ |
 | 5 | AI-native durable execution (LLM steps, agents, explainer) | ⬜ |

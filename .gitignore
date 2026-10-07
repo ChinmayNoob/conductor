@@ -34,3 +34,8 @@ docs/
 
 # Locally built client binary (go build -o client ./cmd/client)
 /client
+
+# Development TLS certificates (scripts/gen-dev-certs.sh)
+/certs/
+# Build output
+/bin/

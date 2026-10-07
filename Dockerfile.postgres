@@ -1,9 +1,0 @@
-# PostgreSQL Dockerfile with schema initialization
-FROM postgres:16-alpine
-
-# Copy initialization SQL
-COPY pkg/db/setup.sql /docker-entrypoint-initdb.d/
-
-# The PostgreSQL image automatically runs all .sql files
-# in /docker-entrypoint-initdb.d/ on first startup
-

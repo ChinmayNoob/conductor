@@ -1,0 +1,12 @@
+# Keep secrets and local artifacts out of the Docker build context.
+.env
+.env.*
+!.env.example
+.git
+.github
+.omc
+*.exe
+/client
+/conductor
+/conductorctl
+coverage.*

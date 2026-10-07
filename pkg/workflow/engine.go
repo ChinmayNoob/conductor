@@ -11,8 +11,8 @@ import (
 )
 
 type StepDefinition struct {
-	Name              string
-	CommandTemplate   string
+	Name               string
+	CommandTemplate    string
 	CompensateTemplate string
 }
 

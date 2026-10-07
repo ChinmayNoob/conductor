@@ -90,7 +90,6 @@ func (s *Server) Stop() {
 	}
 }
 
-
 func (s *Server) checkWorkerHealth() {
 	ticker := time.NewTicker(10 * time.Second)
 
@@ -323,7 +322,6 @@ func (s *Server) GetHealthyWorkers() []*Worker {
 	return healthy
 }
 
-
 func (s *Server) SubmitTask(ctx context.Context, req *grpcapi.ClientTaskRequest) (*grpcapi.ClientTaskResponse, error) {
 	log.Printf("Received task submission: %s (priority=%d, retries=%d, timeout=%ds)",
 		req.Data, req.Priority, req.MaxRetries, req.TimeoutSeconds)
@@ -365,7 +363,6 @@ func (s *Server) SubmitTask(ctx context.Context, req *grpcapi.ClientTaskRequest)
 		TaskId:  task.ID.String(),
 	}, nil
 }
-
 
 func (s *Server) SendHeartbeat(ctx context.Context, req *grpcapi.HeartbeatRequest) (*grpcapi.HeartbeatResponse, error) {
 	s.mu.Lock()

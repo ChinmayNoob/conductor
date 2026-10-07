@@ -13,48 +13,47 @@ import (
 
 type TaskStatus string
 
-
 const (
-	StatusQueued TaskStatus = "QUEUED"
-	StatusStarted TaskStatus = "STARTED"
+	StatusQueued    TaskStatus = "QUEUED"
+	StatusStarted   TaskStatus = "STARTED"
 	StatusCompleted TaskStatus = "COMPLETED"
-	StatusFailed TaskStatus = "FAILED"
+	StatusFailed    TaskStatus = "FAILED"
 )
 
 type Task struct {
-	ID uuid.UUID
-	Data string
-	Status TaskStatus
-	ScheduledAt time.Time
-	PickedAt *time.Time
-	StartedAt *time.Time
-	CompletedAt *time.Time
-	FailedAt *time.Time
-	Priority int
-	MaxRetries int
-	RetryCount int
+	ID                uuid.UUID
+	Data              string
+	Status            TaskStatus
+	ScheduledAt       time.Time
+	PickedAt          *time.Time
+	StartedAt         *time.Time
+	CompletedAt       *time.Time
+	FailedAt          *time.Time
+	Priority          int
+	MaxRetries        int
+	RetryCount        int
 	RetryDelaySeconds int
-	TimeoutSeconds int
-	Output string
-	ErrorMessage string
-	CreatedAt time.Time
+	TimeoutSeconds    int
+	Output            string
+	ErrorMessage      string
+	CreatedAt         time.Time
 }
 
 type TaskOptions struct {
-	Priority int 
-	MaxRetries int
+	Priority          int
+	MaxRetries        int
 	RetryDelaySeconds int
-	TimeoutSeconds int
-	ScheduledAt time.Time
+	TimeoutSeconds    int
+	ScheduledAt       time.Time
 }
 
 func DefaultTaskOptions() TaskOptions {
 	return TaskOptions{
-		Priority: 5,
-		MaxRetries: 3,
+		Priority:          5,
+		MaxRetries:        3,
 		RetryDelaySeconds: 60,
-		TimeoutSeconds: 300,
-		ScheduledAt: time.Now().UTC(),
+		TimeoutSeconds:    300,
+		ScheduledAt:       time.Now().UTC(),
 	}
 }
 
@@ -62,13 +61,12 @@ type DB struct {
 	conn *sql.DB
 }
 
-
-func New() (*DB,error){
-	host:= os.Getenv("POSTGRES_HOST")
-	port:= os.Getenv("POSTGRES_PORT")
-	user:= os.Getenv("POSTGRES_USER")
-	password:= os.Getenv("POSTGRES_PASSWORD")
-	dbname:= os.Getenv("POSTGRES_DB")
+func New() (*DB, error) {
+	host := os.Getenv("POSTGRES_HOST")
+	port := os.Getenv("POSTGRES_PORT")
+	user := os.Getenv("POSTGRES_USER")
+	password := os.Getenv("POSTGRES_PASSWORD")
+	dbname := os.Getenv("POSTGRES_DB")
 
 	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", host, port, user, password, dbname)
 
@@ -138,7 +136,6 @@ func (db *DB) CreateTaskScheduled(data string, scheduledAt time.Time) (*Task, er
 	opts.ScheduledAt = scheduledAt
 	return db.CreateTaskWithOptions(data, opts)
 }
-
 
 func (db *DB) GetTask(taskID uuid.UUID) (*Task, error) {
 	task := &Task{}

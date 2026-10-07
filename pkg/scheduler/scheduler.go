@@ -1,4 +1,4 @@
-package scheduler 
+package scheduler
 
 import (
 	"context"
@@ -13,12 +13,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-
 type Server struct {
-	db *db.DB
+	db                *db.DB
 	coordinatorClient grpcapi.CoordinatorServiceClient
-	coordinatorConn *grpc.ClientConn
-	stopCleanup chan struct {}
+	coordinatorConn   *grpc.ClientConn
+	stopCleanup       chan struct{}
 }
 
 func NewServer(database *db.DB, coordinatorAddr string) (*Server, error) {
@@ -110,7 +109,6 @@ func (s *Server) GetTaskStatus(taskID string) (*db.Task, error) {
 	}
 	return s.db.GetTask(id)
 }
-
 
 func (s *Server) ListPendingTasks(limit int) ([]*db.Task, error) {
 	return s.db.ListTasksByStatus(db.StatusQueued, limit)

@@ -22,7 +22,6 @@ var (
 	wfInput      = flag.String("input", "", "Workflow input JSON")
 )
 
-
 type TaskRequest struct {
 	Data         string `json:"data"`
 	DelaySeconds int    `json:"delay_seconds,omitempty"`
@@ -43,7 +42,6 @@ type TaskStatus struct {
 	CompletedAt *string `json:"completed_at"`
 	FailedAt    *string `json:"failed_at"`
 }
-
 
 func main() {
 	flag.Parse()
@@ -190,7 +188,7 @@ func runFullTest() {
 
 	// Test 3: Check task status
 	fmt.Println("3. Checking task status...")
-	time.Sleep(2 * time.Second) 
+	time.Sleep(2 * time.Second)
 
 	statusResp, err := http.Get(fmt.Sprintf("%s/tasks/status?id=%s", *schedulerURL, taskResp.TaskID))
 	if err != nil {
@@ -255,14 +253,14 @@ type WorkflowSubmitResponse struct {
 }
 
 type WorkflowStatusResp struct {
-	WorkflowID   string              `json:"workflow_id"`
-	WorkflowType string              `json:"workflow_type"`
-	Status       string              `json:"status"`
-	CurrentStep  int                 `json:"current_step"`
-	ErrorMessage string              `json:"error_message,omitempty"`
-	Steps        []WorkflowStepResp  `json:"steps"`
-	CreatedAt    string              `json:"created_at"`
-	UpdatedAt    string              `json:"updated_at"`
+	WorkflowID   string             `json:"workflow_id"`
+	WorkflowType string             `json:"workflow_type"`
+	Status       string             `json:"status"`
+	CurrentStep  int                `json:"current_step"`
+	ErrorMessage string             `json:"error_message,omitempty"`
+	Steps        []WorkflowStepResp `json:"steps"`
+	CreatedAt    string             `json:"created_at"`
+	UpdatedAt    string             `json:"updated_at"`
 }
 
 type WorkflowStepResp struct {

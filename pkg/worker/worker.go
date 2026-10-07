@@ -1,4 +1,4 @@
-package worker 
+package worker
 
 import (
 	"bytes"
@@ -15,20 +15,20 @@ import (
 
 type Server struct {
 	grpcapi.UnimplementedWorkerServiceServer
-	workerID uint32
-	address string
+	workerID          uint32
+	address           string
 	coordinatorClient grpcapi.CoordinatorServiceClient
-	taskQueue chan *grpcapi.TaskRequest
-	mu sync.Mutex
-	isProcessing bool
+	taskQueue         chan *grpcapi.TaskRequest
+	mu                sync.Mutex
+	isProcessing      bool
 }
 
-func NewServer(workerID uint32, address string, coordinatorClient grpcapi.CoordinatorServiceClient)*Server{
-	s:= &Server{
-		workerID: workerID,
-		address: address,
+func NewServer(workerID uint32, address string, coordinatorClient grpcapi.CoordinatorServiceClient) *Server {
+	s := &Server{
+		workerID:          workerID,
+		address:           address,
 		coordinatorClient: coordinatorClient,
-		taskQueue: make(chan *grpcapi.TaskRequest, 100),
+		taskQueue:         make(chan *grpcapi.TaskRequest, 100),
 	}
 
 	go s.processTasksLoop()
@@ -204,4 +204,3 @@ func (s *Server) sendHeartbeat() {
 func isWindows() bool {
 	return os.PathSeparator == '\\' && os.PathListSeparator == ';'
 }
-

@@ -1,12 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
-	"encoding/json"
 	"time"
-
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/scheduler"
@@ -83,29 +82,29 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 type TaskRequest struct {
-	Data string `json:"data"`
-	Priority int `json:"priority,omitempty"`
-	MaxRetries int `json:"max_retries,omitempty"`
-	RetryDelaySeconds int `json:"retry_delay_seconds,omitempty"`
-	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
-	DelaySeconds int `json:"delay_seconds,omitempty"`
-	ScheduledAt int64 `json:"scheduled_at,omitempty"`
+	Data              string `json:"data"`
+	Priority          int    `json:"priority,omitempty"`
+	MaxRetries        int    `json:"max_retries,omitempty"`
+	RetryDelaySeconds int    `json:"retry_delay_seconds,omitempty"`
+	TimeoutSeconds    int    `json:"timeout_seconds,omitempty"`
+	DelaySeconds      int    `json:"delay_seconds,omitempty"`
+	ScheduledAt       int64  `json:"scheduled_at,omitempty"`
 }
 
 type TaskResponse struct {
-	TaskID string `json:"task_id"`
+	TaskID  string `json:"task_id"`
 	Message string `json:"message"`
-	Success bool `json:"success"`
+	Success bool   `json:"success"`
 }
 
 type TaskStatusResponse struct {
-	TaskID string `json:"task_id"`
-	Data string `json:"data"`
-	Status string `json:"status"`
-	Priority int `json:"priority"`
-	MaxRetries int `json:"max_retries"`
-	RetryCount int `json:"retry_count"`
-	TimeoutSeconds int `json:"timeout_seconds"`
+	TaskID         string  `json:"task_id"`
+	Data           string  `json:"data"`
+	Status         string  `json:"status"`
+	Priority       int     `json:"priority"`
+	MaxRetries     int     `json:"max_retries"`
+	RetryCount     int     `json:"retry_count"`
+	TimeoutSeconds int     `json:"timeout_seconds"`
 	ScheduledAt    string  `json:"scheduled_at"`
 	StartedAt      *string `json:"started_at,omitempty"`
 	CompletedAt    *string `json:"completed_at,omitempty"`
@@ -378,10 +377,6 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, stats, http.StatusOK)
 }
 
-
-
-
-
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, map[string]string{"status": "healthy"}, http.StatusOK)
 }
@@ -406,15 +401,15 @@ type WorkflowHTTPResponse struct {
 }
 
 type WorkflowStatusHTTPResponse struct {
-	WorkflowID   string              `json:"workflow_id"`
-	WorkflowType string              `json:"workflow_type"`
-	Status       string              `json:"status"`
-	CurrentStep  int                 `json:"current_step"`
-	Context      json.RawMessage     `json:"context"`
-	ErrorMessage string              `json:"error_message,omitempty"`
-	Steps        []WorkflowStepHTTP  `json:"steps"`
-	CreatedAt    string              `json:"created_at"`
-	UpdatedAt    string              `json:"updated_at"`
+	WorkflowID   string             `json:"workflow_id"`
+	WorkflowType string             `json:"workflow_type"`
+	Status       string             `json:"status"`
+	CurrentStep  int                `json:"current_step"`
+	Context      json.RawMessage    `json:"context"`
+	ErrorMessage string             `json:"error_message,omitempty"`
+	Steps        []WorkflowStepHTTP `json:"steps"`
+	CreatedAt    string             `json:"created_at"`
+	UpdatedAt    string             `json:"updated_at"`
 }
 
 type WorkflowStepHTTP struct {

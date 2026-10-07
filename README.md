@@ -20,7 +20,8 @@ The system is composed of three distinct microservices communicating over gRPC, 
 - **Individual Task Execution** -- submit, dispatch, and execute single tasks
 - **Multi-Step Workflows (Saga Pattern)** -- execute ordered sequences of tasks with automatic compensation (rollback) on failure
 - Task Priorities
-- Automatic Retries
+- Automatic Retries (exponential back-off: `retry_delay_seconds × 2^attempt`, capped at 1 hour)
+- Lost-task recovery (tasks on a worker that stops heartbeating, or that never report a result, are retried)
 - Configurable Timeouts
 - Output Capture
 - Delayed Scheduling
@@ -98,7 +99,7 @@ Run the full workflow test (submits `trip_booking` and monitors it):
 
 ### How Workflows Work
 
-A workflow is a sequence of steps where each step has an **execute** command and a **compensate** (undo) command. The coordinator runs steps one by one. If any step fails permanently, it walks backward through all completed steps and runs their compensation commands.
+A workflow is a sequence of steps where each step has an **execute** command and a **compensate** (undo) command. Input values are substituted into those commands, so they must be strings, numbers or booleans made of letters, digits and `_ . , : @ + -` (not starting with `-`); anything else is rejected to prevent shell injection. The coordinator runs steps one by one. If any step fails permanently, it walks backward through all completed steps and runs their compensation commands.
 
 There are two built-in workflow types to demonstrate both scenarios:
 

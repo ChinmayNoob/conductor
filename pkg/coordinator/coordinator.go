@@ -3,7 +3,9 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,30 +17,55 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const (
+	// Workers run one task at a time, so only hand each worker one task at a
+	// time. Extra tasks would wait in the worker's local queue, where the
+	// stale-task cleanup could mistake them for lost tasks and run them twice.
+	maxTasksPerWorker = 1
+
+	// A worker that misses heartbeats for this long is considered dead.
+	workerTimeout = 30 * time.Second
+
+	// Extra time on top of a task's own timeout before a task with no result
+	// is considered lost.
+	lostTaskGrace = 30 * time.Second
+)
+
 type Worker struct {
 	ID        uint32
 	Address   string
 	LastSeen  time.Time
 	IsHealthy bool
-	IsBusy    bool
+	inFlight  int
 	client    grpcapi.WorkerServiceClient
 	conn      *grpc.ClientConn
 }
 
+// dispatchedTask records which worker a task was handed to, so the worker's
+// slot can be freed and its tasks recovered if it dies.
+type dispatchedTask struct {
+	workerID uint32
+	deadline time.Time
+}
+
 type Server struct {
 	grpcapi.UnimplementedCoordinatorServiceServer
-	db              *db.DB
-	workers         map[uint32]*Worker
-	mu              sync.RWMutex
-	nextWorkerIndex int
-	stopDispatcher  chan struct{}
-	registry        *workflow.Registry
+	db             *db.DB
+	workers        map[uint32]*Worker
+	inFlight       map[uuid.UUID]dispatchedTask
+	mu             sync.RWMutex
+	lastWorkerID   uint32
+	wake           chan struct{}
+	stopDispatcher chan struct{}
+	registry       *workflow.Registry
 }
 
 func NewServer(database *db.DB) *Server {
 	s := &Server{
 		db:             database,
 		workers:        make(map[uint32]*Worker),
+		inFlight:       make(map[uuid.UUID]dispatchedTask),
+		wake:           make(chan struct{}, 1),
 		stopDispatcher: make(chan struct{}),
 		registry:       workflow.NewRegistry(),
 	}
@@ -74,17 +101,58 @@ func (s *Server) checkWorkerHealth() {
 		case <-s.stopDispatcher:
 			return
 		case <-ticker.C:
-			s.mu.Lock()
-			for id, worker := range s.workers {
-				if time.Since(worker.LastSeen) > 30*time.Second {
-					if worker.IsHealthy {
-						log.Printf("Worker %d is unhealthy, marking as unhealthy", id)
-						worker.IsHealthy = false
-					}
-				}
-			}
-			s.mu.Unlock()
+			s.recoverLostTasks()
 		}
+	}
+}
+
+// recoverLostTasks marks workers that stopped heartbeating as unhealthy and
+// fails the tasks they were running, along with any task that ran far past its
+// timeout without a result. Failing them sends them through the normal retry
+// (or workflow compensation) path instead of leaving them stuck forever.
+func (s *Server) recoverLostTasks() {
+	now := time.Now()
+	lost := make(map[uuid.UUID]string)
+
+	s.mu.Lock()
+	for id, worker := range s.workers {
+		if worker.IsHealthy && now.Sub(worker.LastSeen) > workerTimeout {
+			log.Printf("Worker %d is unhealthy, marking as unhealthy", id)
+			worker.IsHealthy = false
+		}
+	}
+	for taskID, t := range s.inFlight {
+		if w, ok := s.workers[t.workerID]; !ok || !w.IsHealthy {
+			lost[taskID] = fmt.Sprintf("worker %d became unhealthy", t.workerID)
+		} else if now.After(t.deadline) {
+			// The task itself is recovered from the database below; here we
+			// only free the worker's slot.
+			s.releaseTaskLocked(taskID)
+		}
+	}
+	s.mu.Unlock()
+
+	// Catches tasks the in-memory bookkeeping doesn't know about, e.g. ones
+	// that were running when the coordinator restarted.
+	overdue, err := s.db.ListOverdueTasks(lostTaskGrace)
+	if err != nil {
+		log.Printf("Error listing overdue tasks: %v", err)
+	}
+	for _, taskID := range overdue {
+		if _, ok := lost[taskID]; !ok {
+			lost[taskID] = "no result reported within the task timeout"
+		}
+	}
+
+	for taskID, reason := range lost {
+		log.Printf("Task %s lost: %s", taskID, reason)
+		s.releaseTask(taskID)
+		if _, err := s.failTask(taskID, "", "task lost: "+reason); err != nil {
+			log.Printf("Failed to recover lost task %s: %v", taskID, err)
+		}
+	}
+	if len(lost) > 0 {
+		s.wakeDispatcher()
 	}
 }
 
@@ -99,38 +167,56 @@ func (s *Server) dispatchTasksLoop() {
 			log.Println("Task dispatcher stopped")
 			return
 		case <-ticker.C:
-			s.dispatchTasks()
+		case <-s.wake:
+		}
+		s.dispatchTasks()
+	}
+}
+
+// wakeDispatcher runs a dispatch round now instead of waiting for the next
+// tick, e.g. because a worker just freed up.
+func (s *Server) wakeDispatcher() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// dispatchTasks hands out queued tasks until the queue is empty or every
+// worker is busy.
+func (s *Server) dispatchTasks() {
+	for {
+		// Find a free worker first so tasks aren't picked only to be put back.
+		worker := s.getNextAvailableWorker()
+		if worker == nil {
+			return
+		}
+
+		task, err := s.db.PickNextTask()
+		if err != nil {
+			log.Printf("Error picking next task: %v", err)
+			return
+		}
+		if task == nil {
+			return
+		}
+
+		if !s.dispatchTask(worker, task) {
+			return
 		}
 	}
 }
 
-func (s *Server) dispatchTasks() {
-	task, err := s.db.PickNextTask()
-
-	if err != nil {
-		log.Printf("Error picking next task: %v", err)
-		return
-	}
-	if task == nil {
-		return
-	}
-
-	worker := s.getNextAvailableWorker()
-
-	if worker == nil {
-		log.Printf("No workers available for task %s (priority=%d), will retry",
-			task.ID.String(), task.Priority)
-		// Reset the task to QUEUED state
-		s.db.UpdateTaskStatus(task.ID, db.StatusQueued, nil, nil, nil)
-		return
-	}
-
+func (s *Server) dispatchTask(worker *Worker, task *db.Task) bool {
 	log.Printf("Dispatching task %s to worker %d (priority=%d, timeout=%ds, retry=%d/%d)",
 		task.ID.String(), worker.ID, task.Priority, task.TimeoutSeconds, task.RetryCount, task.MaxRetries)
 
+	// Track the task before sending it: the worker may report back before the
+	// RPC below returns.
+	s.trackTask(task.ID, worker, time.Duration(task.TimeoutSeconds)*time.Second)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 
 	resp, err := worker.client.SubmitTask(ctx, &grpcapi.TaskRequest{
 		TaskId:         task.ID.String(),
@@ -141,44 +227,87 @@ func (s *Server) dispatchTasks() {
 
 	if err != nil {
 		log.Printf("Failed to dispatch task %s to worker %d: %v", task.ID.String(), worker.ID, err)
-		// Reset task to QUEUED
-		s.db.UpdateTaskStatus(task.ID, db.StatusQueued, nil, nil, nil)
+		s.releaseTask(task.ID)
+		s.requeueTask(task.ID)
 		// Mark worker as potentially unhealthy
 		s.mu.Lock()
 		worker.IsHealthy = false
 		s.mu.Unlock()
-		return
+		return false
 	}
 	if !resp.Success {
 		log.Printf("Worker %d rejected task %s: %s", worker.ID, task.ID.String(), resp.Message)
-		// Reset task to QUEUED
-		s.db.UpdateTaskStatus(task.ID, db.StatusQueued, nil, nil, nil)
-		return
+		s.releaseTask(task.ID)
+		s.requeueTask(task.ID)
+		return false
 	}
 
 	log.Printf("Task %s accepted by worker %d", task.ID.String(), worker.ID)
-
+	return true
 }
 
+func (s *Server) requeueTask(taskID uuid.UUID) {
+	if err := s.db.RequeueTask(taskID); err != nil {
+		log.Printf("Failed to requeue task %s: %v", taskID, err)
+	}
+}
+
+func (s *Server) trackTask(taskID uuid.UUID, worker *Worker, timeout time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.inFlight[taskID] = dispatchedTask{
+		workerID: worker.ID,
+		deadline: time.Now().Add(timeout + lostTaskGrace),
+	}
+	worker.inFlight++
+}
+
+// releaseTask frees the worker slot held by a task. It is a no-op for tasks
+// that aren't tracked.
+func (s *Server) releaseTask(taskID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseTaskLocked(taskID)
+}
+
+func (s *Server) releaseTaskLocked(taskID uuid.UUID) {
+	t, ok := s.inFlight[taskID]
+	if !ok {
+		return
+	}
+	delete(s.inFlight, taskID)
+	if w, ok := s.workers[t.workerID]; ok && w.inFlight > 0 {
+		w.inFlight--
+	}
+}
+
+// getNextAvailableWorker returns the next healthy worker with a free slot,
+// going round-robin in worker ID order.
 func (s *Server) getNextAvailableWorker() *Worker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.workers) == 0 {
-		return nil
-	}
-
-	var healthyWorkers []*Worker
-	for _, w := range s.workers {
-		if w.IsHealthy && w.client != nil {
-			healthyWorkers = append(healthyWorkers, w)
+	var ids []uint32
+	for id, w := range s.workers {
+		if w.IsHealthy && w.client != nil && w.inFlight < maxTasksPerWorker {
+			ids = append(ids, id)
 		}
 	}
-	if len(healthyWorkers) == 0 {
+	if len(ids) == 0 {
 		return nil
 	}
-	s.nextWorkerIndex = (s.nextWorkerIndex + 1) % len(healthyWorkers)
-	return healthyWorkers[s.nextWorkerIndex]
+	slices.Sort(ids)
+
+	next := ids[0]
+	for _, id := range ids {
+		if id > s.lastWorkerID {
+			next = id
+			break
+		}
+	}
+	s.lastWorkerID = next
+	return s.workers[next]
 }
 
 func (s *Server) GetHealthyWorkers() []*Worker {
@@ -298,43 +427,38 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 		return &grpcapi.UpdateTaskStatusResponse{Success: false}, nil
 	}
 
-	// Convert proto timestamps to time.Time pointers
-	var startedAt *time.Time
-
-	if req.StartedAt > 0 {
-		t := time.Unix(req.StartedAt, 0)
-		startedAt = &t
-	}
-
 	shouldRetry := false
 
 	// Handle based on status
 	switch req.Status {
 	case grpcapi.TaskStatus_STARTED:
-		err = s.db.UpdateTaskStatus(taskID, db.StatusStarted, startedAt, nil, nil)
+		var updated bool
+		updated, err = s.db.MarkTaskStarted(taskID)
+		if err == nil && !updated {
+			log.Printf("Ignoring STARTED report for task %s: it is no longer dispatched", req.TaskId)
+		}
 
 	case grpcapi.TaskStatus_COMPLETE:
-		err = s.db.MarkTaskCompleted(taskID, req.Output)
-		log.Printf("Task %s completed successfully", req.TaskId)
-		s.handleWorkflowTaskComplete(taskID)
+		s.releaseTask(taskID)
+		var updated bool
+		updated, err = s.db.MarkTaskCompleted(taskID, req.Output)
+		if err == nil {
+			if updated {
+				log.Printf("Task %s completed successfully", req.TaskId)
+				s.handleWorkflowTaskComplete(taskID)
+			} else {
+				log.Printf("Ignoring COMPLETE report for task %s: it is no longer dispatched", req.TaskId)
+			}
+		}
+		s.wakeDispatcher()
 
 	case grpcapi.TaskStatus_FAILED:
-		canRetry, retryErr := s.db.IncrementRetryCount(taskID)
-		if retryErr != nil {
-			log.Printf("Error checking retry: %v", retryErr)
-		}
-
-		if canRetry {
-			log.Printf("Task %s failed, will retry (error: %s)", req.TaskId, req.ErrorMessage)
-			shouldRetry = true
-		} else {
-			err = s.db.MarkTaskFailed(taskID, req.ErrorMessage)
-			log.Printf("Task %s failed permanently after max retries (error: %s)", req.TaskId, req.ErrorMessage)
-			s.handleWorkflowTaskFailed(taskID, req.ErrorMessage)
-		}
+		s.releaseTask(taskID)
+		shouldRetry, err = s.failTask(taskID, req.Output, req.ErrorMessage)
+		s.wakeDispatcher()
 
 	default:
-		err = s.db.UpdateTaskStatus(taskID, db.StatusQueued, nil, nil, nil)
+		err = fmt.Errorf("unexpected status %v", req.Status)
 	}
 
 	if err != nil {
@@ -346,6 +470,32 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 		Success:     true,
 		ShouldRetry: shouldRetry,
 	}, nil
+}
+
+// failTask records a failed attempt. The task is requeued if it has retries
+// left; otherwise it is marked FAILED and its workflow, if any, is compensated.
+// It returns whether the task will be retried.
+func (s *Server) failTask(taskID uuid.UUID, output, errMsg string) (bool, error) {
+	retrying, err := s.db.RetryTask(taskID, errMsg)
+	if err != nil {
+		return false, err
+	}
+	if retrying {
+		log.Printf("Task %s failed, will retry (error: %s)", taskID, errMsg)
+		return true, nil
+	}
+
+	failed, err := s.db.MarkTaskFailed(taskID, output, errMsg)
+	if err != nil {
+		return false, err
+	}
+	if !failed {
+		log.Printf("Ignoring failure of task %s: it is no longer dispatched", taskID)
+		return false, nil
+	}
+	log.Printf("Task %s failed permanently after max retries (error: %s)", taskID, errMsg)
+	s.handleWorkflowTaskFailed(taskID, errMsg)
+	return false, nil
 }
 
 // --- Saga / Workflow methods ---
@@ -361,6 +511,11 @@ func (s *Server) SubmitWorkflow(ctx context.Context, req *grpcapi.WorkflowReques
 	inputJSON := json.RawMessage(req.InputJson)
 	if req.InputJson == "" {
 		inputJSON = json.RawMessage("{}")
+	}
+
+	// Input values end up in shell commands, so reject unsafe ones up front.
+	if _, err := workflow.ParseInput(inputJSON); err != nil {
+		return &grpcapi.WorkflowResponse{Message: "Invalid workflow input: " + err.Error(), Success: false}, nil
 	}
 
 	wf, err := s.db.CreateWorkflow(req.WorkflowType, inputJSON, len(def.Steps))
@@ -470,7 +625,10 @@ func (s *Server) startWorkflowStep(workflowID uuid.UUID, stepNumber int, ctx jso
 		return nil
 	}
 
-	command := workflow.ExpandCommand(def.Steps[stepNumber].CommandTemplate, ctx)
+	command, err := workflow.ExpandCommand(def.Steps[stepNumber].CommandTemplate, ctx)
+	if err != nil {
+		return err
+	}
 
 	opts := db.DefaultTaskOptions()
 	opts.MaxRetries = 2
@@ -603,7 +761,11 @@ func (s *Server) runCompensationTask(wf *db.Workflow, step *db.WorkflowStep) {
 		return
 	}
 
-	compensateCmd := workflow.ExpandCommand(def.Steps[step.StepNumber].CompensateTemplate, wf.Context)
+	compensateCmd, err := workflow.ExpandCommand(def.Steps[step.StepNumber].CompensateTemplate, wf.Context)
+	if err != nil {
+		s.skipCompensation(wf, step, err)
+		return
+	}
 
 	opts := db.DefaultTaskOptions()
 	opts.MaxRetries = 1
@@ -612,7 +774,7 @@ func (s *Server) runCompensationTask(wf *db.Workflow, step *db.WorkflowStep) {
 
 	task, err := s.db.CreateTaskWithOptions(compensateCmd, opts)
 	if err != nil {
-		log.Printf("Workflow %s: failed to create compensation task for step %d: %v", wf.ID, step.StepNumber, err)
+		s.skipCompensation(wf, step, err)
 		return
 	}
 
@@ -621,4 +783,12 @@ func (s *Server) runCompensationTask(wf *db.Workflow, step *db.WorkflowStep) {
 
 	log.Printf("Workflow %s: compensating step %d (%s) -> task %s",
 		wf.ID, step.StepNumber, step.Name, task.ID)
+}
+
+// skipCompensation gives up on compensating a step and moves on to the next
+// one, so the workflow doesn't get stuck in COMPENSATING.
+func (s *Server) skipCompensation(wf *db.Workflow, step *db.WorkflowStep, err error) {
+	log.Printf("Workflow %s: failed to create compensation task for step %d: %v", wf.ID, step.StepNumber, err)
+	s.db.UpdateStepStatus(step.ID, db.StepFailed)
+	s.continueCompensation(wf)
 }

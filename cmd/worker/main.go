@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"hash/fnv"
 	"log"
 	"net"
 	"os"
@@ -32,15 +33,19 @@ func main() {
 		}
 	}
 
-	if workerID == 0 {
-		workerID = uint32(os.Getpid()) // Use PID as fallback
-	}
-
 	workerAddress := os.Getenv("WORKER_ADDRESS")
 	if workerAddress == "" {
-		workerAddress = "localhost" + *workerPort
-	} else {
-		workerAddress = workerAddress + *workerPort
+		// Replicas share one service name, so advertise this instance's own IP
+		// rather than a hostname that could resolve to any of them.
+		workerAddress = localIP(*coordinatorAddr)
+	}
+	workerAddress += *workerPort
+
+	if workerID == 0 {
+		// Derive the ID from the address so replicas get distinct IDs.
+		h := fnv.New32a()
+		h.Write([]byte(workerAddress))
+		workerID = max(h.Sum32(), 1)
 	}
 
 	log.Printf("Starting Worker Service (ID=%d, Address=%s)...", workerID, workerAddress)
@@ -72,4 +77,16 @@ func main() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
+}
+
+// localIP returns the IP this machine uses to reach the coordinator.
+func localIP(coordinatorAddr string) string {
+	// Dialing UDP sends nothing; it only picks the outgoing interface.
+	conn, err := net.Dial("udp", coordinatorAddr)
+	if err != nil {
+		log.Printf("Could not determine local IP, using localhost: %v", err)
+		return "localhost"
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }

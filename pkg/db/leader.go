@@ -69,20 +69,27 @@ func (s *LeaderSession) Release() {
 func (db *DB) BumpEpoch(ctx context.Context, coordinatorID, address string) (int64, error) {
 	var epoch int64
 	err := db.q.QueryRowContext(ctx,
-		`UPDATE coordinator_leader
-		 SET epoch = epoch + 1, coordinator_id = $1, address = $2, elected_at = NOW(), heartbeat_at = NOW()
-		 WHERE id = 1
-		 RETURNING epoch`, coordinatorID, address).Scan(&epoch)
+		`WITH bumped AS (
+			 UPDATE coordinator_leader
+			 SET epoch = epoch + 1, coordinator_id = $1, address = $2, elected_at = NOW()
+			 WHERE id = 1
+			 RETURNING epoch
+		 ), beat AS (
+			 UPDATE leader_heartbeat SET epoch = bumped.epoch, heartbeat_at = NOW() FROM bumped WHERE id = 1
+		 )
+		 SELECT epoch FROM bumped`, coordinatorID, address).Scan(&epoch)
 	if err != nil {
 		return 0, fmt.Errorf("failed to record new leader: %w", err)
 	}
 	return epoch, nil
 }
 
-// LeaderHeartbeat marks the leader as alive, for visibility.
+// LeaderHeartbeat marks the leader as alive, for visibility. It lives in
+// its own table so it never waits on the fenced writes' share locks on the
+// leader row. A deposed leader's late heartbeat changes nothing.
 func (db *DB) LeaderHeartbeat(ctx context.Context, epoch int64) error {
 	_, err := db.q.ExecContext(ctx,
-		`UPDATE coordinator_leader SET heartbeat_at = NOW() WHERE id = 1 AND epoch = $1`, epoch)
+		`UPDATE leader_heartbeat SET heartbeat_at = NOW() WHERE id = 1 AND epoch = $1`, epoch)
 	return err
 }
 
@@ -90,7 +97,10 @@ func (db *DB) GetLeader(ctx context.Context) (*Leader, error) {
 	l := &Leader{}
 	var id, addr sql.NullString
 	err := db.q.QueryRowContext(ctx,
-		`SELECT epoch, coordinator_id, address, elected_at, heartbeat_at FROM coordinator_leader WHERE id = 1`,
+		`SELECT l.epoch, l.coordinator_id, l.address, l.elected_at, h.heartbeat_at
+		 FROM coordinator_leader l
+		 LEFT JOIN leader_heartbeat h ON h.id = 1 AND h.epoch = l.epoch
+		 WHERE l.id = 1`,
 	).Scan(&l.Epoch, &id, &addr, &l.ElectedAt, &l.HeartbeatAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get leader: %w", err)

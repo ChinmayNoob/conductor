@@ -112,16 +112,22 @@ watch:
 			s.log.Error("Fenced: another coordinator became leader")
 			break watch
 		case <-ticker.C:
-			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+			// Only the session decides leadership: if it is gone, Postgres
+			// has released the lock. A slow database is not a lost session,
+			// so allow the ping plenty of time; fencing covers the gap.
+			pingCtx, pingCancel := context.WithTimeout(ctx, 5*time.Second)
 			err := sess.Ping(pingCtx)
-			if err == nil {
-				err = s.db.LeaderHeartbeat(pingCtx, epoch)
-			}
 			pingCancel()
 			if err != nil {
 				s.log.Error("Lost the leader session", "error", err)
 				break watch
 			}
+			// The heartbeat only tells clients the leader is alive.
+			beatCtx, beatCancel := context.WithTimeout(ctx, 2*time.Second)
+			if err := s.db.LeaderHeartbeat(beatCtx, epoch); err != nil && ctx.Err() == nil {
+				s.log.Warn("Failed to record leader heartbeat", "error", err)
+			}
+			beatCancel()
 		}
 	}
 	ticker.Stop()

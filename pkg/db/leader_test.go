@@ -313,3 +313,46 @@ func TestFinishRecordsLargeWorkerID(t *testing.T) {
 		}
 	}
 }
+
+func TestLeaderHeartbeat(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	old := must[int64](t)(db.BumpEpoch(ctx, "a", "a:8080"))
+	if l := must[*Leader](t)(db.GetLeader(ctx)); l.HeartbeatAt == nil {
+		t.Fatal("a new leader has no heartbeat")
+	}
+
+	// A heartbeat must not wait for the share locks held by fenced writes:
+	// that stalled the hot path and, under latency, timed out.
+	inTx := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = db.WithFencedTx(ctx, old, func(*DB) error {
+			close(inTx)
+			<-release
+			return nil
+		})
+	}()
+	<-inTx
+	beatCtx, cancel := context.WithTimeout(ctx, time.Second)
+	err := db.LeaderHeartbeat(beatCtx, old)
+	cancel()
+	close(release)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("the heartbeat waited for a fenced write: %v", err)
+	}
+
+	// After an election, the old leader's heartbeat doesn't count.
+	current := must[int64](t)(db.BumpEpoch(ctx, "b", "b:8080"))
+	exec(t, db, `UPDATE leader_heartbeat SET heartbeat_at = NOW() - INTERVAL '1 hour'`)
+	if err := db.LeaderHeartbeat(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if l := must[*Leader](t)(db.GetLeader(ctx)); l.Epoch != current || time.Since(*l.HeartbeatAt) < time.Minute {
+		t.Fatalf("a deposed leader's heartbeat refreshed the new leader (%+v)", l)
+	}
+}

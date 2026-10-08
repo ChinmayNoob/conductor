@@ -46,6 +46,8 @@ func NewServer(database *db.DB, coordinator grpcapi.CoordinatorServiceClient, ma
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.Handle("GET /ui/", uiHandler())
+	mux.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
 
 	authed := func(pattern string, h http.HandlerFunc) {
 		mux.Handle(pattern, s.authenticate(h))
@@ -63,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /v1/tasks/{id}/logs", s.handleTaskLogs)
 	authed("GET /v1/dead-letter", s.handleDeadLetter)
 	authed("GET /v1/stats", s.handleStats)
+	authed("GET /v1/stats/timeline", s.handleTimeline)
 
 	authed("PUT /v1/workflow-definitions", s.handleSaveDefinition)
 	authed("POST /v1/workflow-definitions", s.handleSaveDefinition)

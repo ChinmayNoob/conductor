@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -186,7 +187,11 @@ type TaskFilter struct {
 	WorkflowID *uuid.UUID // optional
 	// DeadLetter selects permanently failed tasks that aren't workflow steps.
 	DeadLetter bool
-	Limit      int
+	// Search matches a task ID prefix or part of the command (optional).
+	Search string
+	// Before pages backwards: only tasks created before this (optional).
+	Before *time.Time
+	Limit  int
 }
 
 // ListTasks returns the most recent tasks matching the filter.
@@ -198,9 +203,12 @@ func (db *DB) ListTasks(ctx context.Context, f TaskFilter) ([]*Task, error) {
 		   AND ($3 = '' OR queue = $3)
 		   AND ($4::uuid IS NULL OR workflow_id = $4)
 		   AND (NOT $5 OR (status = 'FAILED' AND workflow_id IS NULL))
+		   AND ($7 = '' OR id::text LIKE $7 || '%' OR data ILIKE '%' || $7 || '%')
+		   AND ($8::timestamp IS NULL OR created_at < $8)
 		 ORDER BY created_at DESC
 		 LIMIT $6`,
 		f.Namespace, string(f.Status), f.Queue, f.WorkflowID, f.DeadLetter, f.Limit,
+		strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(f.Search), f.Before,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tasks: %w", err)
@@ -237,6 +245,36 @@ func (db *DB) TaskCounts(ctx context.Context, namespace string) (map[TaskStatus]
 		counts[s] = n
 	}
 	return counts, rows.Err()
+}
+
+// TimelinePoint counts the tasks created in one minute, by current status.
+type TimelinePoint struct {
+	Minute time.Time
+	Status TaskStatus
+	Count  int
+}
+
+// Timeline counts tasks created per minute over the last `minutes`, by
+// their status now. It reads through the (namespace, created_at) index.
+func (db *DB) Timeline(ctx context.Context, namespace string, minutes int) ([]TimelinePoint, error) {
+	rows, err := db.q.QueryContext(ctx,
+		`SELECT date_trunc('minute', created_at) AS minute, status, count(*)
+		 FROM tasks
+		 WHERE namespace = $1 AND created_at > NOW() - make_interval(mins => $2)
+		 GROUP BY 1, 2 ORDER BY 1`, namespace, minutes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build timeline: %w", err)
+	}
+	defer rows.Close()
+	var out []TimelinePoint
+	for rows.Next() {
+		var p TimelinePoint
+		if err := rows.Scan(&p.Minute, &p.Status, &p.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // CountPendingTasks counts tasks waiting to run in a namespace.

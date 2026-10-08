@@ -7,6 +7,13 @@ on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+  # Also when the suite itself changes.
+  pull_request:
+    paths:
+      - docker-compose.chaos.yml
+      - test/e2e/chaos_test.go
+      - test/e2e/toxiproxy.json
+      - .github/workflows/chaos.yml
 
 jobs:
   chaos:

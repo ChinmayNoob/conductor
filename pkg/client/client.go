@@ -844,3 +844,74 @@ func (c *Client) GetAgentRun(ctx context.Context, id string) (*AgentRun, error) 
 	_, err := c.do(ctx, http.MethodGet, "/v1/agent-runs/"+url.PathEscape(id), nil, &run)
 	return &run, err
 }
+
+// Explanation is the assistant's reading of a failed task.
+type Explanation struct {
+	TaskID       string    `json:"task_id"`
+	Attempt      int       `json:"attempt"`
+	Class        string    `json:"class"` // transient, permanent, needs_attention, unknown
+	Confidence   float64   `json:"confidence"`
+	Source       string    `json:"source"` // rules or model
+	Cause        string    `json:"cause"`
+	Fix          string    `json:"fix"`
+	Model        string    `json:"model"`
+	InputTokens  int64     `json:"input_tokens"`
+	OutputTokens int64     `json:"output_tokens"`
+	CostUSD      float64   `json:"cost_usd"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// GetExplanation returns a task's stored explanation (404 if there is none).
+func (c *Client) GetExplanation(ctx context.Context, taskID string) (*Explanation, error) {
+	var e Explanation
+	_, err := c.do(ctx, http.MethodGet, "/v1/tasks/"+url.PathEscape(taskID)+"/explanation", nil, &e)
+	return &e, err
+}
+
+// ExplainTask asks the assistant to explain a failed task now. The namespace
+// must have ai_assist on.
+func (c *Client) ExplainTask(ctx context.Context, taskID string) (*Explanation, error) {
+	var e Explanation
+	_, err := c.do(ctx, http.MethodPost, "/v1/tasks/"+url.PathEscape(taskID)+"/explain", nil, &e)
+	return &e, err
+}
+
+// WorkflowDraft is a workflow the assistant wrote. It is not saved.
+type WorkflowDraft struct {
+	YAML     string   `json:"yaml"`
+	Valid    bool     `json:"valid"`
+	Errors   string   `json:"errors"`
+	Name     string   `json:"name"`
+	Warnings []string `json:"warnings"`
+	Plan     [][]struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		Summary string `json:"summary"`
+	} `json:"plan"`
+	Usage struct {
+		InputTokens  int64   `json:"input_tokens"`
+		OutputTokens int64   `json:"output_tokens"`
+		CostUSD      float64 `json:"cost_usd"`
+	} `json:"usage"`
+}
+
+// DraftWorkflow asks the assistant to write a workflow definition. Save it
+// with ApplyDefinition once a person has read it.
+func (c *Client) DraftWorkflow(ctx context.Context, description string) (*WorkflowDraft, error) {
+	var d WorkflowDraft
+	_, err := c.do(ctx, http.MethodPost, "/v1/ai/workflow", map[string]string{"description": description}, &d)
+	return &d, err
+}
+
+// Answer is the assistant's reply to a question about the cluster.
+type Answer struct {
+	Answer  string   `json:"answer"`
+	Lookups []string `json:"lookups"`
+}
+
+// Ask asks the assistant a question about the namespace.
+func (c *Client) Ask(ctx context.Context, question string) (*Answer, error) {
+	var a Answer
+	_, err := c.do(ctx, http.MethodPost, "/v1/ai/ask", map[string]string{"question": question}, &a)
+	return &a, err
+}

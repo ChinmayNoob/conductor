@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChinmayNoob/conductor/pkg/ai"
 	"github.com/ChinmayNoob/conductor/pkg/api"
 	"github.com/ChinmayNoob/conductor/pkg/config"
 	"github.com/ChinmayNoob/conductor/pkg/coordclient"
@@ -112,7 +113,15 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 	}
 	defer coord.Close()
 
+	provider, prices, err := modelProvider()
+	if err != nil {
+		return err
+	}
+	assistant := &ai.Assistant{DB: database, Provider: provider, Prices: prices, Model: os.Getenv("CONDUCTOR_AI_MODEL")}
+	go assistant.Run(ctx)
+
 	srv := api.NewServer(database, coord, cfg.MaxRequestBytes)
+	srv.SetAssistant(assistant)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	httpServer := &http.Server{
 		Addr:              cfg.APIListen,

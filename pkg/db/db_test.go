@@ -851,3 +851,46 @@ func TestWaitingSteps(t *testing.T) {
 		t.Fatalf("signal step = %+v", s)
 	}
 }
+
+func TestExplanations(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	must[*Namespace](t)(db.CreateNamespace(ctx, Namespace{Name: "assisted", AIAssist: true}))
+
+	fail := func(ns, data string) *Task {
+		task := create(t, db, data, func(n *NewTask) { n.Namespace = ns; n.MaxRetries = 0 })
+		pick(t, db)
+		must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), 0, "out", "boom"))
+		return must[*Task](t)(db.GetTask(ctx, task.ID))
+	}
+	optedIn, optedOut := fail("assisted", "a"), fail("default", "b")
+
+	// Only namespaces that opted in are listed.
+	todo := must[[]*Task](t)(db.UnexplainedFailures(ctx, time.Hour, 10))
+	if len(todo) != 1 || todo[0].ID != optedIn.ID {
+		t.Fatalf("unexplained = %v; want just the opted-in task (not %s)", todo, optedOut.ID)
+	}
+
+	e := Explanation{TaskID: optedIn.ID, Attempt: optedIn.Attempt, Class: "transient", Confidence: 0.9, Source: "rules", Cause: "c", Fix: "f", InputTokens: 5}
+	if err := db.SaveExplanation(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	got := must[*Explanation](t)(db.GetExplanation(ctx, optedIn.ID))
+	if got == nil || got.Class != "transient" || got.Cause != "c" || got.InputTokens != 5 {
+		t.Fatalf("explanation = %+v", got)
+	}
+	if todo := must[[]*Task](t)(db.UnexplainedFailures(ctx, time.Hour, 10)); len(todo) != 0 {
+		t.Fatalf("an explained failure is still listed: %v", todo)
+	}
+	// Saving again replaces it.
+	e.Class, e.Cause = "permanent", "again"
+	if err := db.SaveExplanation(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if got := must[*Explanation](t)(db.GetExplanation(ctx, optedIn.ID)); got.Class != "permanent" || got.Cause != "again" {
+		t.Fatalf("explanation = %+v", got)
+	}
+	if got := must[*Explanation](t)(db.GetExplanation(ctx, optedOut.ID)); got != nil {
+		t.Fatalf("explanation for an unexplained task: %+v", got)
+	}
+}

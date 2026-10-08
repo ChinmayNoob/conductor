@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ChinmayNoob/conductor/pkg/ai"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
@@ -31,6 +32,7 @@ type Server struct {
 	coordinator     grpcapi.CoordinatorServiceClient
 	maxRequestBytes int64
 	log             *slog.Logger
+	assistant       *ai.Assistant
 }
 
 func NewServer(database *db.DB, coordinator grpcapi.CoordinatorServiceClient, maxRequestBytes int64) *Server {
@@ -62,6 +64,10 @@ func (s *Server) Handler() http.Handler {
 	authed("POST /v1/tasks/{id}/cancel", s.handleCancelTask)
 	authed("POST /v1/tasks/{id}/requeue", s.handleRequeueTask)
 	authed("GET /v1/tasks/{id}/attempts", s.handleTaskAttempts)
+	authed("GET /v1/tasks/{id}/explanation", s.handleGetExplanation)
+	authed("POST /v1/tasks/{id}/explain", s.handleExplainTask)
+	authed("POST /v1/ai/workflow", s.handleAIWorkflow)
+	authed("POST /v1/ai/ask", s.handleAIAsk)
 	authed("GET /v1/tasks/{id}/logs", s.handleTaskLogs)
 	authed("GET /v1/dead-letter", s.handleDeadLetter)
 	authed("GET /v1/stats", s.handleStats)

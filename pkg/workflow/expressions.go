@@ -151,6 +151,7 @@ type TaskSpec struct {
 	Command    string // shell command, or a summary for other types
 	HTTP       *HTTPSpec
 	Container  *ContainerSpec
+	LLM        *LLMSpec
 	Env        map[string]string
 	Retries    int
 	RetryDelay time.Duration
@@ -275,6 +276,29 @@ func (d *Definition) resolve(s *Step, a Action, ownOutputs map[string]string, c 
 		}
 		spec.Container = &ct
 		spec.Command = strings.TrimSpace(ct.Image + " " + strings.Join(ct.Command, " "))
+	case TypeLLM:
+		l := *a.LLM
+		if l.Prompt, err = c.Resolve(l.Prompt); err != nil {
+			return nil, fmt.Errorf("llm.prompt: %w", err)
+		}
+		if l.System, err = c.Resolve(l.System); err != nil {
+			return nil, fmt.Errorf("llm.system: %w", err)
+		}
+		spec.LLM = &l
+		spec.Command = LLMSummary(&l)
 	}
 	return spec, nil
+}
+
+// LLMSummary is a one-line description of an llm task, for lists.
+func LLMSummary(l *LLMSpec) string {
+	p := strings.Join(strings.Fields(l.Prompt), " ")
+	if len(p) > 80 {
+		p = p[:80] + "…"
+	}
+	model := l.Model
+	if model == "" {
+		model = "default model"
+	}
+	return "llm " + model + ": " + p
 }

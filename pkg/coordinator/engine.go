@@ -171,6 +171,13 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 				outputs[st.Name] = st.Outputs
 			}
 
+			if def.Budget != nil && wf.Status == db.WorkflowRunning {
+				spend, err := tx.WorkflowSpend(ctx, wf.ID)
+				if err != nil {
+					return err
+				}
+				run.Abort = def.Budget.Exceeded(spend.Tokens, spend.CostUSD)
+			}
 			plan := workflow.Reconcile(def, run)
 			if plan.Empty() {
 				return tx.TouchWorkflow(ctx, wf.ID)
@@ -215,6 +222,23 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 						return err
 					}
 					continue
+				}
+				if spec.Type == workflow.TypeLLM {
+					msg, err := s.llmBudgetError(ctx, tx, wf.Namespace)
+					if err != nil {
+						return err
+					}
+					if msg != "" {
+						log.Warn("Cannot start step", "step", name, "error", msg)
+						if err := tx.UpdateStepStatus(ctx, step.ID, workflow.StepFailed); err != nil {
+							return err
+						}
+						wf.Status, wf.ErrorMessage = db.WorkflowCompensating, fmt.Sprintf("step %s: %s", name, msg)
+						if err := tx.UpdateWorkflowStatus(ctx, wf.ID, wf.Status, wf.ErrorMessage); err != nil {
+							return err
+						}
+						continue
+					}
 				}
 				t, err := s.createStepTask(ctx, tx, wf, spec)
 				if err != nil {
@@ -315,6 +339,8 @@ func (s *Server) createStepTask(ctx context.Context, tx *db.DB, wf *db.Workflow,
 		detail = spec.HTTP
 	case spec.Container != nil:
 		detail = spec.Container
+	case spec.LLM != nil:
+		detail = spec.LLM
 	}
 	if detail != nil {
 		b, err := json.Marshal(detail)

@@ -103,7 +103,7 @@ func (p *openAI) Complete(ctx context.Context, req Request) (*Response, error) {
 		}
 		body.ResponseFormat = map[string]any{
 			"type":        "json_schema",
-			"json_schema": map[string]any{"name": name, "schema": req.Schema, "strict": true},
+			"json_schema": map[string]any{"name": name, "schema": req.Schema, "strict": closedSchema(req.Schema)},
 		}
 	}
 
@@ -197,4 +197,14 @@ func retryAfter(h http.Header) time.Duration {
 		}
 	}
 	return 10 * time.Second
+}
+
+// closedSchema reports whether a schema forbids extra properties at the top
+// level. Strict structured output requires that (and every property
+// required), so other schemas only guide the answer.
+func closedSchema(schema json.RawMessage) bool {
+	var s struct {
+		AdditionalProperties *bool `json:"additionalProperties"`
+	}
+	return json.Unmarshal(schema, &s) == nil && s.AdditionalProperties != nil && !*s.AdditionalProperties
 }

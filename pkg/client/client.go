@@ -146,11 +146,30 @@ type ContainerSpec struct {
 	Network string   `json:"network,omitempty"`
 }
 
+// LLMSpec asks a language model for a completion (type llm).
+type LLMSpec struct {
+	Model       string         `json:"model,omitempty"`
+	System      string         `json:"system,omitempty"`
+	Prompt      string         `json:"prompt"`
+	Schema      map[string]any `json:"schema,omitempty"` // a JSON Schema object; fields become outputs
+	MaxTokens   int            `json:"max_tokens,omitempty"`
+	Temperature *float64       `json:"temperature,omitempty"`
+}
+
+// LLMUsage is what an llm task spent, over all its attempts.
+type LLMUsage struct {
+	Model        string  `json:"model,omitempty"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+}
+
 type TaskRequest struct {
-	Type              string            `json:"type,omitempty"` // shell (default), http, container
+	Type              string            `json:"type,omitempty"` // shell (default), http, container, llm
 	Command           string            `json:"command,omitempty"`
 	HTTP              *HTTPSpec         `json:"http,omitempty"`
 	Container         *ContainerSpec    `json:"container,omitempty"`
+	LLM               *LLMSpec          `json:"llm,omitempty"`
 	Env               map[string]string `json:"env,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
 	Queue             string            `json:"queue,omitempty"`
@@ -193,6 +212,7 @@ type Task struct {
 	WorkerID       *int64            `json:"worker_id,omitempty"`
 	Attempt        int               `json:"attempt"`
 	TraceID        string            `json:"trace_id,omitempty"` // set when tracing is on
+	LLMUsage       *LLMUsage         `json:"llm_usage,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 
 	// Created is false when SubmitTask matched an existing idempotency key.
@@ -407,6 +427,7 @@ type Workflow struct {
 	ErrorMessage    string          `json:"error_message,omitempty"`
 	CancelRequested bool            `json:"cancel_requested"`
 	TraceID         string          `json:"trace_id,omitempty"`
+	LLMSpend        *LLMSpend       `json:"llm_spend,omitempty"` // detail view only
 	IdempotencyKey  string          `json:"idempotency_key,omitempty"`
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
@@ -556,11 +577,18 @@ func (c *Client) ScheduleAction(ctx context.Context, name, action string) (*Sche
 
 // --- Queues, workers, namespaces ---
 
+// LLMSpend is model usage summed over a workflow run.
+type LLMSpend struct {
+	Tokens  int64   `json:"tokens"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
 type Queue struct {
 	Name              string    `json:"name"`
 	ConcurrencyLimit  *int      `json:"concurrency_limit"`
 	RateLimit         *int      `json:"rate_limit"`
 	RatePeriodSeconds int       `json:"rate_period_seconds"`
+	TokensPerMinute   *int64    `json:"tokens_per_minute"`
 	Paused            bool      `json:"paused"`
 	Queued            int       `json:"queued"`
 	Running           int       `json:"running"`
@@ -568,10 +596,11 @@ type Queue struct {
 }
 
 type QueueSettings struct {
-	ConcurrencyLimit  *int `json:"concurrency_limit"`
-	RateLimit         *int `json:"rate_limit"`
-	RatePeriodSeconds int  `json:"rate_period_seconds,omitempty"`
-	Paused            bool `json:"paused"`
+	ConcurrencyLimit  *int   `json:"concurrency_limit"`
+	RateLimit         *int   `json:"rate_limit"`
+	RatePeriodSeconds int    `json:"rate_period_seconds,omitempty"`
+	TokensPerMinute   *int64 `json:"tokens_per_minute"` // llm tasks' model tokens
+	Paused            bool   `json:"paused"`
 }
 
 func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
@@ -610,14 +639,18 @@ func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
 }
 
 type Namespace struct {
-	Name            string    `json:"name"`
-	MaxPendingTasks *int      `json:"max_pending_tasks"`
-	MaxConcurrency  *int      `json:"max_concurrency"`
-	CreatedAt       time.Time `json:"created_at"`
+	Name               string    `json:"name"`
+	MaxPendingTasks    *int      `json:"max_pending_tasks"`
+	MaxConcurrency     *int      `json:"max_concurrency"`
+	MaxLLMTokensPerDay *int64    `json:"max_llm_tokens_per_day"`
+	MaxLLMCostPerDay   *float64  `json:"max_llm_cost_per_day"`
+	AIAssist           bool      `json:"ai_assist"` // send redacted failures to the model for explanations
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 func namespaceBody(n Namespace) map[string]any {
-	return map[string]any{"name": n.Name, "max_pending_tasks": n.MaxPendingTasks, "max_concurrency": n.MaxConcurrency}
+	return map[string]any{"name": n.Name, "max_pending_tasks": n.MaxPendingTasks, "max_concurrency": n.MaxConcurrency,
+		"max_llm_tokens_per_day": n.MaxLLMTokensPerDay, "max_llm_cost_per_day": n.MaxLLMCostPerDay, "ai_assist": n.AIAssist}
 }
 
 func (c *Client) CreateNamespace(ctx context.Context, n Namespace) (*Namespace, error) {

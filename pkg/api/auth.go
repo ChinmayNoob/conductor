@@ -172,27 +172,41 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 // --- Namespaces ---
 
 type namespaceJSON struct {
-	Name            string    `json:"name"`
-	MaxPendingTasks *int      `json:"max_pending_tasks"`
-	MaxConcurrency  *int      `json:"max_concurrency"`
-	CreatedAt       time.Time `json:"created_at"`
+	Name               string    `json:"name"`
+	MaxPendingTasks    *int      `json:"max_pending_tasks"`
+	MaxConcurrency     *int      `json:"max_concurrency"`
+	MaxLLMTokensPerDay *int64    `json:"max_llm_tokens_per_day"`
+	MaxLLMCostPerDay   *float64  `json:"max_llm_cost_per_day"`
+	AIAssist           bool      `json:"ai_assist"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 type namespaceRequest struct {
-	Name            string `json:"name"`
-	MaxPendingTasks *int   `json:"max_pending_tasks"`
-	MaxConcurrency  *int   `json:"max_concurrency"`
+	Name               string   `json:"name"`
+	MaxPendingTasks    *int     `json:"max_pending_tasks"`
+	MaxConcurrency     *int     `json:"max_concurrency"`
+	MaxLLMTokensPerDay *int64   `json:"max_llm_tokens_per_day"`
+	MaxLLMCostPerDay   *float64 `json:"max_llm_cost_per_day"`
+	AIAssist           bool     `json:"ai_assist"`
 }
 
 func (q namespaceRequest) validate() error {
-	if (q.MaxPendingTasks != nil && *q.MaxPendingTasks < 1) || (q.MaxConcurrency != nil && *q.MaxConcurrency < 1) {
-		return errors.New("limits must be at least 1 (omit or use null for no limit)")
+	if (q.MaxPendingTasks != nil && *q.MaxPendingTasks < 1) || (q.MaxConcurrency != nil && *q.MaxConcurrency < 1) ||
+		(q.MaxLLMTokensPerDay != nil && *q.MaxLLMTokensPerDay < 1) || (q.MaxLLMCostPerDay != nil && *q.MaxLLMCostPerDay <= 0) {
+		return errors.New("limits must be positive (omit or use null for no limit)")
 	}
 	return nil
 }
 
+func (q namespaceRequest) toNamespace(name string) db.Namespace {
+	return db.Namespace{Name: name, MaxPendingTasks: q.MaxPendingTasks, MaxConcurrency: q.MaxConcurrency,
+		MaxLLMTokensPerDay: q.MaxLLMTokensPerDay, MaxLLMCostPerDay: q.MaxLLMCostPerDay, AIAssist: q.AIAssist}
+}
+
 func toNamespaceJSON(n *db.Namespace) namespaceJSON {
-	return namespaceJSON{Name: n.Name, MaxPendingTasks: n.MaxPendingTasks, MaxConcurrency: n.MaxConcurrency, CreatedAt: n.CreatedAt}
+	return namespaceJSON{Name: n.Name, MaxPendingTasks: n.MaxPendingTasks, MaxConcurrency: n.MaxConcurrency,
+		MaxLLMTokensPerDay: n.MaxLLMTokensPerDay, MaxLLMCostPerDay: n.MaxLLMCostPerDay, AIAssist: n.AIAssist,
+		CreatedAt: n.CreatedAt}
 }
 
 func (s *Server) handleCreateNamespace(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +222,7 @@ func (s *Server) handleCreateNamespace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	n, err := s.db.CreateNamespace(r.Context(), db.Namespace{Name: req.Name, MaxPendingTasks: req.MaxPendingTasks, MaxConcurrency: req.MaxConcurrency})
+	n, err := s.db.CreateNamespace(r.Context(), req.toNamespace(req.Name))
 	if errors.Is(err, db.ErrExists) {
 		writeError(w, http.StatusConflict, "namespace "+req.Name+" already exists")
 		return
@@ -229,7 +243,7 @@ func (s *Server) handleUpdateNamespace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	n, err := s.db.UpdateNamespace(r.Context(), db.Namespace{Name: r.PathValue("name"), MaxPendingTasks: req.MaxPendingTasks, MaxConcurrency: req.MaxConcurrency})
+	n, err := s.db.UpdateNamespace(r.Context(), req.toNamespace(r.PathValue("name")))
 	if err != nil {
 		s.internalError(w, "Failed to update namespace", err)
 		return

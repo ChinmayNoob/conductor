@@ -24,6 +24,7 @@ Tasks:
   task submit -cmd "echo hi" [task flags] [-wait]
   task submit -type http -url URL [-method POST] [-body JSON] [-header K=V]
   task submit -type container -image alpine:3.20 [-- command args...]
+  task submit -prompt "Summarize: ..." [-model M] [-system S] [-schema JSON]
   task get|cancel|requeue <id>
   task logs <id> [-f]          Output; -f follows a running task live
   task attempts <id>           Every attempt, with why each failed
@@ -232,15 +233,19 @@ func (m kv) Set(s string) error {
 func taskFlags(fs *flag.FlagSet) func() (client.TaskRequest, error) {
 	var req client.TaskRequest
 	env, labels, headers := kv{}, kv{}, kv{}
-	var url, method, body, image string
+	var url, method, body, image, prompt, model, system, schema string
 	retries := -1
-	fs.StringVar(&req.Type, "type", "", "shell (default), http or container")
+	fs.StringVar(&req.Type, "type", "", "shell (default), http, container or llm")
 	fs.StringVar(&req.Command, "cmd", "", "shell command")
 	fs.StringVar(&url, "url", "", "http: URL")
 	fs.StringVar(&method, "method", "", "http: method (default GET)")
 	fs.StringVar(&body, "body", "", "http: request body")
 	fs.Var(headers, "header", "http: header K=V (repeatable)")
 	fs.StringVar(&image, "image", "", "container: image")
+	fs.StringVar(&prompt, "prompt", "", "llm: the prompt")
+	fs.StringVar(&model, "model", "", "llm: model (default: the workers' CONDUCTOR_LLM_MODEL)")
+	fs.StringVar(&system, "system", "", "llm: system message")
+	fs.StringVar(&schema, "schema", "", "llm: JSON Schema (an object) the answer must match; its fields become outputs")
 	fs.Var(env, "env", "environment variable K=V (repeatable)")
 	fs.Var(labels, "label", "required worker label K=V (repeatable)")
 	fs.StringVar(&req.Queue, "queue", "", "queue name")
@@ -273,8 +278,18 @@ func taskFlags(fs *flag.FlagSet) func() (client.TaskRequest, error) {
 				req.Type = "container"
 			}
 			req.Container = &client.ContainerSpec{Image: image, Command: fs.Args()}
+		case prompt != "":
+			if req.Type == "" {
+				req.Type = "llm"
+			}
+			req.LLM = &client.LLMSpec{Prompt: prompt, Model: model, System: system}
+			if schema != "" {
+				if err := json.Unmarshal([]byte(schema), &req.LLM.Schema); err != nil {
+					return req, fmt.Errorf("-schema is not a JSON object: %w", err)
+				}
+			}
 		case req.Command == "":
-			return req, errors.New("one of -cmd, -url or -image is required")
+			return req, errors.New("one of -cmd, -url, -image or -prompt is required")
 		}
 		return req, nil
 	}
@@ -364,6 +379,13 @@ func (a *cli) printTask(t *client.Task, err error) error {
 	}
 	if len(t.Outputs) > 0 {
 		fmt.Printf("Outputs:  %s\n", formatMap(t.Outputs))
+	}
+	if u := t.LLMUsage; u != nil {
+		fmt.Printf("Model:    %s (%d tokens in, %d out", u.Model, u.InputTokens, u.OutputTokens)
+		if u.CostUSD > 0 {
+			fmt.Printf(", $%.6f", u.CostUSD)
+		}
+		fmt.Println(")")
 	}
 	if t.Output != "" {
 		fmt.Printf("Output:\n%s\n", indent(t.Output))

@@ -138,6 +138,7 @@ type workflowJSON struct {
 	CancelRequested bool              `json:"cancel_requested"`
 	IdempotencyKey  string            `json:"idempotency_key,omitempty"`
 	TraceID         string            `json:"trace_id,omitempty"`
+	Spend           *spendJSON        `json:"llm_spend,omitempty"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 	Steps           []stepJSON        `json:"steps,omitempty"`
@@ -226,7 +227,16 @@ func (s *Server) respondWithWorkflow(w http.ResponseWriter, r *http.Request, raw
 		s.internalError(w, "Failed to get workflow steps", err)
 		return
 	}
-	writeJSON(w, code, toWorkflowJSON(wf, steps))
+	out := toWorkflowJSON(wf, steps)
+	spend, err := s.db.WorkflowSpend(r.Context(), id)
+	if err != nil {
+		s.internalError(w, "Failed to sum workflow spend", err)
+		return
+	}
+	if spend.Tokens > 0 {
+		out.Spend = &spendJSON{Tokens: spend.Tokens, CostUSD: spend.CostUSD}
+	}
+	writeJSON(w, code, out)
 }
 
 func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -269,4 +279,10 @@ func (s *Server) handleCancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.respondWithWorkflow(w, r, id, http.StatusAccepted)
+}
+
+// spendJSON is model usage summed over a workflow run's tasks.
+type spendJSON struct {
+	Tokens  int64   `json:"tokens"`
+	CostUSD float64 `json:"cost_usd"`
 }

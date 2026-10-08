@@ -98,6 +98,19 @@ message UpdateTaskStatusRequest {
   string error_message = 4;            // set when status is FAILED
   map<string, string> outputs = 5;     // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
   int32 attempt = 6;                   // from TaskRequest; stale attempts are ignored
+  // Set when status is FAILED: wait at least this long before retrying (a
+  // provider's Retry-After), or don't retry at all (retrying can't help).
+  int32 retry_after_seconds = 7;
+  bool permanent = 8;
+  // Language model usage of this attempt (llm tasks).
+  LLMUsage llm_usage = 9;
+}
+
+message LLMUsage {
+  string model = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+  double cost_usd = 4;   // 0 when the model has no configured price
 }
 
 message UpdateTaskStatusResponse {

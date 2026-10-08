@@ -46,7 +46,11 @@ type StepState struct {
 type RunState struct {
 	Status          string
 	CancelRequested bool
-	Steps           map[string]StepState
+	// Abort, if set, fails a running workflow for this reason (e.g. its
+	// budget is spent): running steps are cancelled and completed ones
+	// compensated, as for a failed step.
+	Abort string
+	Steps map[string]StepState
 }
 
 // Plan is what should happen next. The caller applies it, reloads the state,
@@ -124,12 +128,14 @@ func Reconcile(d *Definition, r RunState) Plan {
 	}
 
 	status := r.Status
-	if status == StatusRunning && (r.CancelRequested || failure != "") {
+	if status == StatusRunning && (r.CancelRequested || failure != "" || r.Abort != "") {
 		status = StatusCompensating
 		p.SetStatus = status
 		switch {
 		case r.CancelRequested:
 			p.Error = "cancelled"
+		case r.Abort != "":
+			p.Error = r.Abort
 		case steps[failure].Error != "":
 			p.Error = "step " + failure + " failed: " + steps[failure].Error
 		default:

@@ -80,6 +80,19 @@ var (
 	})
 )
 
+// Language models (counted by the coordinator from workers' reports).
+var (
+	LLMTokens = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "llm_tokens_total",
+		Help: "Model tokens used by llm tasks, by model and direction (input, output).",
+	}, []string{"model", "direction"})
+
+	LLMCost = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: ns, Name: "llm_cost_usd_total",
+		Help: "Model spend in US dollars, for models with a configured price.",
+	}, []string{"model"})
+)
+
 // Worker.
 var (
 	WorkerTaskDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -58,8 +58,13 @@ type Task struct {
 	TimeoutSeconds    int
 	// Attempt numbers dispatches: it goes up every time the task is handed
 	// to a worker, and status reports must quote the current one.
-	Attempt        int
-	TraceParent    string
+	Attempt     int
+	TraceParent string
+	// Language model usage, summed over attempts.
+	LLMModel       string
+	InputTokens    int64
+	OutputTokens   int64
+	CostUSD        float64
 	dispatchKey    *time.Time
 	Output         string
 	Outputs        StringMap // key=value pairs a step wrote to $CONDUCTOR_OUTPUT
@@ -107,18 +112,20 @@ func DefaultTask(data string) NewTask {
 const taskColumns = `id, namespace, queue, type, data, spec, env, requirements, status, scheduled_at,
 	picked_at, started_at, completed_at, failed_at, cancelled_at, priority, max_retries, retry_count,
 	retry_delay_seconds, timeout_seconds, output, outputs, error_message, idempotency_key,
-	workflow_id, worker_id, attempt, dispatch_key, trace_parent, created_at`
+	workflow_id, worker_id, attempt, dispatch_key, trace_parent, llm_model, input_tokens, output_tokens,
+	cost_usd, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanTask(row scanner) (*Task, error) {
 	t := &Task{}
 	var spec nullJSON
-	var output, errMsg, idemKey, traceParent sql.NullString
+	var output, errMsg, idemKey, traceParent, llmModel sql.NullString
 	err := row.Scan(&t.ID, &t.Namespace, &t.Queue, &t.Type, &t.Data, &spec, &t.Env, &t.Requirements,
 		&t.Status, &t.ScheduledAt, &t.PickedAt, &t.StartedAt, &t.CompletedAt, &t.FailedAt, &t.CancelledAt,
 		&t.Priority, &t.MaxRetries, &t.RetryCount, &t.RetryDelaySeconds, &t.TimeoutSeconds, &output,
-		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &traceParent, &t.CreatedAt)
+		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &traceParent, &llmModel, &t.InputTokens,
+		&t.OutputTokens, &t.CostUSD, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +134,7 @@ func scanTask(row scanner) (*Task, error) {
 	t.ErrorMessage = errMsg.String
 	t.IdempotencyKey = idemKey.String
 	t.TraceParent = traceParent.String
+	t.LLMModel = llmModel.String
 	return t, nil
 }
 
@@ -332,6 +340,7 @@ func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Ta
 			   AND EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb) w WHERE w @> t.requirements)
 			   AND (q.concurrency_limit IS NULL OR q.concurrency_limit > (`+queueRunning+`))
 			   AND (q.rate_limit IS NULL OR q.rate_limit > (`+queueRecent+`))
+			   AND (q.tokens_per_minute IS NULL OR q.tokens_per_minute > (`+queueRecentTokens+`))
 			   AND (n.max_concurrency IS NULL OR n.max_concurrency > (`+namespaceRunning+`))
 			 ORDER BY t.dispatch_key
 			 LIMIT $2 * 4
@@ -396,6 +405,9 @@ const (
 		AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')`
 	queueRecent = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace AND r.queue = t.queue
 		AND r.last_dispatched_at > NOW() - make_interval(secs => q.rate_period_seconds)`
+	// Tokens used by the queue's tasks dispatched in the last minute.
+	queueRecentTokens = `SELECT COALESCE(sum(r.input_tokens + r.output_tokens), 0) FROM tasks r
+		WHERE r.namespace = t.namespace AND r.queue = t.queue AND r.last_dispatched_at > NOW() - INTERVAL '1 minute'`
 	namespaceRunning = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace
 		AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')`
 )
@@ -443,6 +455,12 @@ const maxRetryDelay = time.Hour
 // left, keeping the failed attempt's output for debugging. It returns false
 // when the retries are used up.
 func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, errorMessage string) (bool, error) {
+	return db.RetryTaskAfter(ctx, id, attempt, output, errorMessage, 0)
+}
+
+// RetryTaskAfter is RetryTask waiting at least minDelay before the retry,
+// e.g. a model provider's Retry-After.
+func (db *DB) RetryTaskAfter(ctx context.Context, id uuid.UUID, attempt int, output, errorMessage string, minDelay time.Duration) (bool, error) {
 	// One statement: lock the attempt, record it in task_attempts, and
 	// requeue the task.
 	var n int
@@ -464,7 +482,8 @@ func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, 
 			     failed_at = NULL,
 			     error_message = $2,
 			     output = $4,
-			     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
+			     scheduled_at = NOW() + make_interval(secs => GREATEST(
+			         LEAST(retry_delay_seconds * POWER(2, retry_count), $3), $6))
 			 FROM failed WHERE t.id = failed.id
 			 RETURNING t.id
 		 ), kept AS (
@@ -474,7 +493,7 @@ func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, 
 			 ON CONFLICT DO NOTHING
 		 )
 		 SELECT count(*) FROM retried`,
-		id, errorMessage, maxRetryDelay.Seconds(), output, attempt,
+		id, errorMessage, maxRetryDelay.Seconds(), output, attempt, minDelay.Seconds(),
 	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("failed to retry task: %w", err)
@@ -609,6 +628,59 @@ func (db *DB) RequeueFailedTask(ctx context.Context, id uuid.UUID) (*Task, error
 		return nil, fmt.Errorf("failed to requeue task: %w", err)
 	}
 	return t, nil
+}
+
+// LLMUsage is what one attempt of an llm task spent.
+type LLMUsage struct {
+	Model        string
+	InputTokens  int64
+	OutputTokens int64
+	CostUSD      float64
+}
+
+// RecordUsage adds an attempt's model usage to its task. Any attempt counts,
+// even a stale one: the tokens were spent either way.
+func (db *DB) RecordUsage(ctx context.Context, id uuid.UUID, u LLMUsage) error {
+	_, err := db.q.ExecContext(ctx,
+		`UPDATE tasks SET llm_model = COALESCE(NULLIF($2, ''), llm_model),
+		     input_tokens = input_tokens + $3, output_tokens = output_tokens + $4, cost_usd = cost_usd + $5
+		 WHERE id = $1`, id, u.Model, u.InputTokens, u.OutputTokens, u.CostUSD)
+	if err != nil {
+		return fmt.Errorf("failed to record model usage: %w", err)
+	}
+	return nil
+}
+
+// Spend is model usage summed over tasks.
+type Spend struct {
+	Tokens  int64
+	CostUSD float64
+}
+
+// WorkflowSpend sums the model usage of a workflow run's tasks.
+func (db *DB) WorkflowSpend(ctx context.Context, workflowID uuid.UUID) (Spend, error) {
+	var s Spend
+	err := db.q.QueryRowContext(ctx,
+		`SELECT COALESCE(sum(input_tokens + output_tokens), 0), COALESCE(sum(cost_usd), 0)
+		 FROM tasks WHERE workflow_id = $1`, workflowID).Scan(&s.Tokens, &s.CostUSD)
+	if err != nil {
+		return s, fmt.Errorf("failed to sum workflow spend: %w", err)
+	}
+	return s, nil
+}
+
+// NamespaceSpend sums the model usage of a namespace's tasks created since
+// a time, through the (namespace, created_at) index.
+func (db *DB) NamespaceSpend(ctx context.Context, namespace string, since time.Time) (Spend, error) {
+	var s Spend
+	err := db.q.QueryRowContext(ctx,
+		`SELECT COALESCE(sum(input_tokens + output_tokens), 0), COALESCE(sum(cost_usd), 0)
+		 FROM tasks WHERE namespace = $1 AND created_at >= $2 AND type = 'llm'`,
+		namespace, since.UTC()).Scan(&s.Tokens, &s.CostUSD)
+	if err != nil {
+		return s, fmt.Errorf("failed to sum namespace spend: %w", err)
+	}
+	return s, nil
 }
 
 // AttemptRecord is an earlier attempt of a task, kept when it failed.

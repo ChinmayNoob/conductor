@@ -35,6 +35,7 @@ const (
 	TypeShell     = "shell"
 	TypeHTTP      = "http"
 	TypeContainer = "container"
+	TypeLLM       = "llm"
 )
 
 var (
@@ -47,6 +48,7 @@ type Definition struct {
 	Description string           `yaml:"description,omitempty" json:"description,omitempty"`
 	Inputs      map[string]Input `yaml:"inputs,omitempty" json:"inputs,omitempty"`
 	Defaults    Options          `yaml:"defaults,omitempty" json:"defaults,omitempty"`
+	Budget      *Budget          `yaml:"budget,omitempty" json:"budget,omitempty"`
 	Steps       []Step           `yaml:"steps" json:"steps"`
 }
 
@@ -74,7 +76,41 @@ type Action struct {
 	Run       string            `yaml:"run,omitempty" json:"run,omitempty"`
 	HTTP      *HTTPSpec         `yaml:"http,omitempty" json:"http,omitempty"`
 	Container *ContainerSpec    `yaml:"container,omitempty" json:"container,omitempty"`
+	LLM       *LLMSpec          `yaml:"llm,omitempty" json:"llm,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+}
+
+// LLMSpec asks a language model for a completion. Prompt and System may use
+// ${{ }} expressions (a prompt is not code). With a Schema the model must
+// answer with a JSON object matching it, and its top-level fields become
+// the step's outputs.
+type LLMSpec struct {
+	Model       string         `yaml:"model,omitempty" json:"model,omitempty"` // default CONDUCTOR_LLM_MODEL
+	System      string         `yaml:"system,omitempty" json:"system,omitempty"`
+	Prompt      string         `yaml:"prompt" json:"prompt"`
+	Schema      map[string]any `yaml:"schema,omitempty" json:"schema,omitempty"`
+	MaxTokens   int            `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+	Temperature *float64       `yaml:"temperature,omitempty" json:"temperature,omitempty"`
+}
+
+// Budget caps what a workflow run may spend on language models. Once a run
+// goes over, it fails and compensates like any failed run.
+type Budget struct {
+	MaxTokens  int64   `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+	MaxCostUSD float64 `yaml:"max_cost_usd,omitempty" json:"max_cost_usd,omitempty"`
+}
+
+// Exceeded describes how spend breaks the budget, or returns "".
+func (b *Budget) Exceeded(tokens int64, costUSD float64) string {
+	switch {
+	case b == nil:
+		return ""
+	case b.MaxTokens > 0 && tokens > b.MaxTokens:
+		return fmt.Sprintf("budget exceeded: used %d model tokens of %d", tokens, b.MaxTokens)
+	case b.MaxCostUSD > 0 && costUSD > b.MaxCostUSD:
+		return fmt.Sprintf("budget exceeded: spent $%.4f of $%.4f on models", costUSD, b.MaxCostUSD)
+	}
+	return ""
 }
 
 type HTTPSpec struct {
@@ -329,8 +365,8 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("http steps need 'http.url'")
 			break
 		}
-		if a.Run != "" || a.Container != nil {
-			add("http steps cannot have 'run' or 'container'")
+		if a.Run != "" || a.Container != nil || a.LLM != nil {
+			add("http steps cannot have 'run', 'container' or 'llm'")
 		}
 		if m := a.HTTP.Method; m != "" && !slices.Contains([]string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}, strings.ToUpper(m)) {
 			add("unsupported HTTP method %q", m)
@@ -345,8 +381,8 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("container steps need 'container.image'")
 			break
 		}
-		if a.Run != "" || a.HTTP != nil {
-			add("container steps cannot have 'run' or 'http'")
+		if a.Run != "" || a.HTTP != nil || a.LLM != nil {
+			add("container steps cannot have 'run', 'http' or 'llm'")
 		}
 		if n := a.Container.Network; n != "" && n != "bridge" && n != "none" {
 			add("container.network must be 'bridge' or 'none'")
@@ -354,8 +390,21 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 		for i, arg := range a.Container.Command {
 			checkExpr(fmt.Sprintf("container.command[%d]", i), arg)
 		}
+	case TypeLLM:
+		if a.LLM == nil || strings.TrimSpace(a.LLM.Prompt) == "" {
+			add("llm steps need 'llm.prompt'")
+			break
+		}
+		if a.Run != "" || a.HTTP != nil || a.Container != nil {
+			add("llm steps cannot have 'run', 'http' or 'container'")
+		}
+		if err := ValidateLLM(a.LLM); err != nil {
+			add("%v", err)
+		}
+		checkExpr("llm.prompt", a.LLM.Prompt)
+		checkExpr("llm.system", a.LLM.System)
 	default:
-		add("unknown type %q (want shell, http or container)", a.Type)
+		add("unknown type %q (want shell, http, container or llm)", a.Type)
 	}
 
 	for k, v := range a.Env {
@@ -450,3 +499,20 @@ func joinErrors(errs []error) error {
 
 // MarshalYAML writes a compensation as its action's fields, not nested.
 func (c Compensation) MarshalYAML() (any, error) { return c.Action, nil }
+
+// ValidateLLM checks an llm spec's settings (not its expressions).
+func ValidateLLM(l *LLMSpec) error {
+	var errs []error
+	if l.Schema != nil {
+		if t, _ := l.Schema["type"].(string); t != "object" {
+			errs = append(errs, fmt.Errorf("llm.schema must be a JSON Schema with type: object"))
+		}
+	}
+	if l.MaxTokens < 0 {
+		errs = append(errs, fmt.Errorf("llm.max_tokens must not be negative"))
+	}
+	if l.Temperature != nil && (*l.Temperature < 0 || *l.Temperature > 2) {
+		errs = append(errs, fmt.Errorf("llm.temperature must be between 0 and 2"))
+	}
+	return joinErrors(errs)
+}

@@ -50,6 +50,7 @@ type taskJSON struct {
 	WorkerID       *int64            `json:"worker_id,omitempty"`
 	Attempt        int               `json:"attempt"`
 	TraceID        string            `json:"trace_id,omitempty"`
+	LLM            *usageJSON        `json:"llm_usage,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 }
 
@@ -68,7 +69,7 @@ func toTaskJSON(t *db.Task) taskJSON {
 		PickedAt: t.PickedAt, StartedAt: t.StartedAt, CompletedAt: t.CompletedAt, FailedAt: t.FailedAt,
 		CancelledAt: t.CancelledAt, Output: t.Output, Outputs: t.Outputs, ErrorMessage: t.ErrorMessage,
 		IdempotencyKey: userKey(t.IdempotencyKey), WorkflowID: t.WorkflowID, WorkerID: t.WorkerID,
-		Attempt: t.Attempt, TraceID: tracing.TraceID(t.TraceParent), CreatedAt: t.CreatedAt,
+		Attempt: t.Attempt, TraceID: tracing.TraceID(t.TraceParent), LLM: usageOf(t), CreatedAt: t.CreatedAt,
 	}
 }
 
@@ -296,4 +297,19 @@ func userKey(key string) string {
 		return ""
 	}
 	return key
+}
+
+// usageJSON is the model usage of an llm task, summed over its attempts.
+type usageJSON struct {
+	Model        string  `json:"model,omitempty"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+}
+
+func usageOf(t *db.Task) *usageJSON {
+	if t.InputTokens == 0 && t.OutputTokens == 0 && t.LLMModel == "" {
+		return nil
+	}
+	return &usageJSON{Model: t.LLMModel, InputTokens: t.InputTokens, OutputTokens: t.OutputTokens, CostUSD: t.CostUSD}
 }

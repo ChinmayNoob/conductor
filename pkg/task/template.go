@@ -23,10 +23,11 @@ var (
 
 // Template describes a task. For a shell task, Command is run with `sh -c`.
 type Template struct {
-	Type              string                  `json:"type,omitempty"` // shell (default), http, container
+	Type              string                  `json:"type,omitempty"` // shell (default), http, container, llm
 	Command           string                  `json:"command,omitempty"`
 	HTTP              *workflow.HTTPSpec      `json:"http,omitempty"`
 	Container         *workflow.ContainerSpec `json:"container,omitempty"`
+	LLM               *workflow.LLMSpec       `json:"llm,omitempty"`
 	Env               map[string]string       `json:"env,omitempty"`
 	Labels            map[string]string       `json:"labels,omitempty"` // a worker must have all of these
 	Queue             string                  `json:"queue,omitempty"`
@@ -53,8 +54,8 @@ func (t *Template) Validate() error {
 		if strings.TrimSpace(t.Command) == "" {
 			add("command is required for shell tasks")
 		}
-		if t.HTTP != nil || t.Container != nil {
-			add("shell tasks cannot have http or container settings")
+		if t.HTTP != nil || t.Container != nil || t.LLM != nil {
+			add("shell tasks cannot have http, container or llm settings")
 		}
 	case workflow.TypeHTTP:
 		if t.HTTP == nil || t.HTTP.URL == "" {
@@ -75,8 +76,17 @@ func (t *Template) Validate() error {
 		if t.HTTP != nil {
 			add("container tasks cannot have http settings")
 		}
+	case workflow.TypeLLM:
+		if t.LLM == nil || strings.TrimSpace(t.LLM.Prompt) == "" {
+			add("llm tasks need llm.prompt")
+		} else if err := workflow.ValidateLLM(t.LLM); err != nil {
+			add("%v", err)
+		}
+		if t.HTTP != nil || t.Container != nil || t.Command != "" {
+			add("llm tasks cannot have a command, http or container settings")
+		}
 	default:
-		add("unknown type %q (want shell, http or container)", t.Type)
+		add("unknown type %q (want shell, http, container or llm)", t.Type)
 	}
 
 	if t.Queue != "" && !queueRe.MatchString(t.Queue) {
@@ -140,6 +150,9 @@ func (t *Template) NewTask(namespace string) (db.NewTask, error) {
 	case workflow.TypeContainer:
 		spec = t.Container
 		n.Data = strings.TrimSpace(t.Container.Image + " " + strings.Join(t.Container.Command, " "))
+	case workflow.TypeLLM:
+		spec = t.LLM
+		n.Data = workflow.LLMSummary(t.LLM)
 	}
 	if spec != nil {
 		b, err := json.Marshal(spec)

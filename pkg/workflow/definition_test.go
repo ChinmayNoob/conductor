@@ -220,3 +220,54 @@ steps:
 		t.Fatalf("env = %v", spec.Env)
 	}
 }
+
+func TestLLMSteps(t *testing.T) {
+	d, err := Parse([]byte(`
+name: triage
+budget: {max_tokens: 5000, max_cost_usd: 0.25}
+steps:
+  - name: fetch
+    run: echo "body=$(cat ticket.txt)" >> "$CONDUCTOR_OUTPUT"
+  - name: classify
+    depends_on: [fetch]
+    type: llm
+    llm:
+      model: gpt-4o-mini
+      system: You triage support tickets.
+      prompt: "Classify this ticket: ${{ steps.fetch.outputs.body }}"
+      schema:
+        type: object
+        properties: {severity: {type: string, enum: [low, high]}}
+      temperature: 0.2
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Budget == nil || d.Budget.MaxTokens != 5000 {
+		t.Fatalf("budget = %+v", d.Budget)
+	}
+	spec, err := d.StepTask("classify", Context{Outputs: map[string]map[string]string{"fetch": {"body": "site is down"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Type != TypeLLM || spec.LLM.Prompt != "Classify this ticket: site is down" || !strings.HasPrefix(spec.Command, "llm gpt-4o-mini: Classify") {
+		t.Fatalf("spec = %+v / %+v", spec, spec.LLM)
+	}
+	if got := d.Budget.Exceeded(4000, 0.30); !strings.Contains(got, "$0.3000 of $0.2500") {
+		t.Fatalf("Exceeded = %q", got)
+	}
+	if got := d.Budget.Exceeded(4000, 0.10); got != "" {
+		t.Fatalf("under budget, Exceeded = %q", got)
+	}
+
+	for yaml, want := range map[string]string{
+		"name: x\nsteps:\n  - name: a\n    type: llm\n":                                                     "llm steps need 'llm.prompt'",
+		"name: x\nsteps:\n  - name: a\n    type: llm\n    llm: {prompt: hi, schema: {type: string}}\n":      "type: object",
+		"name: x\nsteps:\n  - name: a\n    type: llm\n    llm: {prompt: hi, temperature: 3}\n":              "between 0 and 2",
+		"name: x\nsteps:\n  - name: a\n    type: llm\n    llm: {prompt: \"${{ steps.nope.outputs.x }}\"}\n": "nope",
+	} {
+		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Parse(%q) = %v, want an error mentioning %q", yaml, err, want)
+		}
+	}
+}

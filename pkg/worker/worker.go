@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/llm"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/prometheus/client_golang/prometheus"
@@ -51,8 +52,10 @@ type Server struct {
 	slots       int
 	labels      map[string]string
 	maxOutput   int
-	env         []string // base environment for tasks
-	docker      *docker  // nil if containers aren't available
+	env         []string     // base environment for tasks
+	docker      *docker      // nil if containers aren't available
+	llm         llm.Provider // nil if no language model is configured
+	llmPrices   llm.Prices
 	coordinator grpcapi.CoordinatorServiceClient
 	log         *slog.Logger
 
@@ -78,7 +81,11 @@ type Options struct {
 	PassEnv []string
 	// DockerSocket enables the container executor if the daemon answers.
 	DockerSocket string
-	Coordinator  grpcapi.CoordinatorServiceClient
+	// LLM enables llm tasks; nil disables them. Prices turn token usage
+	// into cost.
+	LLM         llm.Provider
+	LLMPrices   llm.Prices
+	Coordinator grpcapi.CoordinatorServiceClient
 }
 
 func NewServer(opts Options) *Server {
@@ -94,6 +101,8 @@ func NewServer(opts Options) *Server {
 		tasksCtx:    ctx,
 		killTasks:   kill,
 		running:     make(map[string]*runningTask),
+		llm:         opts.LLM,
+		llmPrices:   opts.LLMPrices,
 	}
 
 	s.labels = maps.Clone(opts.Labels)
@@ -102,6 +111,9 @@ func NewServer(opts Options) *Server {
 	}
 	s.labels[LabelShell] = "true"
 	s.labels[LabelHTTP] = "true"
+	if s.llm != nil {
+		s.labels[LabelLLM] = "true"
+	}
 	if opts.DockerSocket != "" {
 		d := newDocker(opts.DockerSocket)
 		if err := d.Ping(context.Background()); err != nil {
@@ -154,6 +166,8 @@ func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*
 		return reject("task is already running here")
 	case req.Type == "container" && s.docker == nil:
 		return reject("container tasks are not available on this worker")
+	case req.Type == "llm" && s.llm == nil:
+		return reject("llm tasks are not available on this worker: no language model is configured")
 	}
 
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)
@@ -237,54 +251,56 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 
 	start := time.Now()
 	var (
-		output  string
-		outputs map[string]string
-		err     error
+		res result
+		err error
 	)
 	switch task.Type {
 	case "", "shell":
-		output, outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.outputOf(task.TaskId))
+		res.output, res.outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.outputOf(task.TaskId))
 	case "http":
-		output, outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
+		res.output, res.outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
 	case "container":
-		output, err = s.docker.run(ctx, task.TaskId, task.SpecJson, taskEnv(nil, env), timeout, s.maxOutput)
+		res.output, err = s.docker.run(ctx, task.TaskId, task.SpecJson, taskEnv(nil, env), timeout, s.maxOutput)
+	case "llm":
+		res, err = s.runLLM(ctx, task.SpecJson, timeout)
 	default:
 		err = fmt.Errorf("unknown task type %q", task.Type)
 	}
 
+	report := &grpcapi.UpdateTaskStatusRequest{
+		TaskId: task.TaskId, Attempt: task.Attempt, Status: grpcapi.TaskStatus_COMPLETE,
+		Output: res.output, Outputs: res.outputs, LlmUsage: res.usage,
+	}
 	if err != nil {
 		if cause := context.Cause(ctx); cause != nil {
 			err = cause
 		}
-		log.Warn("Task failed", "error", err, "duration", time.Since(start))
+		retryAfter, isPermanent := retryAdvice(err)
+		log.Warn("Task failed", "error", err, "duration", time.Since(start), "permanent", isPermanent, "retry_after", retryAfter)
 		metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "failed").Observe(time.Since(start).Seconds())
 		span.SetStatus(codes.Error, err.Error())
-		release()
-		s.report(ctx, task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
-		return
+		report.Status, report.ErrorMessage, report.Outputs = grpcapi.TaskStatus_FAILED, err.Error(), nil
+		report.RetryAfterSeconds, report.Permanent = int32(retryAfter.Round(time.Second)/time.Second), isPermanent
+		if retryAfter > 0 && report.RetryAfterSeconds == 0 {
+			report.RetryAfterSeconds = 1
+		}
+	} else {
+		log.Info("Task completed", "duration", time.Since(start))
+		metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "completed").Observe(time.Since(start).Seconds())
 	}
-	log.Info("Task completed", "duration", time.Since(start))
-	metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "completed").Observe(time.Since(start).Seconds())
 	release()
-	s.report(ctx, task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
+	s.report(ctx, report)
 }
 
-func (s *Server) report(ctx context.Context, task *grpcapi.TaskRequest, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
-	taskID := task.TaskId
+func (s *Server) report(ctx context.Context, req *grpcapi.UpdateTaskStatusRequest) {
+	taskID, status := req.TaskId, req.Status
 	// Results must be reported even if the task was cancelled or the worker
 	// is shutting down, so keep only ctx's trace. Allow long enough to ride
 	// out a coordinator failover.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 	defer cancel()
 
-	resp, err := s.coordinator.UpdateTaskStatus(ctx, &grpcapi.UpdateTaskStatusRequest{
-		TaskId:       taskID,
-		Status:       status,
-		Output:       output,
-		ErrorMessage: errMsg,
-		Outputs:      outputs,
-		Attempt:      task.Attempt,
-	})
+	resp, err := s.coordinator.UpdateTaskStatus(ctx, req)
 	if err != nil {
 		s.log.Error("Failed to report task status", "task_id", taskID, "status", status, "error", err)
 		metrics.WorkerReportFailures.Inc()

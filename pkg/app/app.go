@@ -19,6 +19,7 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/coordinator"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/llm"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/security"
 	"github.com/ChinmayNoob/conductor/pkg/tracing"
@@ -165,6 +166,10 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	}
 	slog.SetDefault(slog.Default().With("worker_id", id))
 
+	provider, prices, err := modelProvider()
+	if err != nil {
+		return err
+	}
 	w := worker.NewServer(worker.Options{
 		ID:           id,
 		Address:      address,
@@ -173,6 +178,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		MaxOutput:    cfg.MaxOutputBytes,
 		PassEnv:      cfg.Worker.PassEnv,
 		DockerSocket: cfg.Worker.DockerSocket,
+		LLM:          provider,
+		LLMPrices:    prices,
 		Coordinator:  coord,
 	})
 	prometheus.MustRegister(w.Collector())
@@ -335,4 +342,24 @@ func gracefulStop(s *grpc.Server, timeout time.Duration) {
 	case <-time.After(timeout):
 		s.Stop()
 	}
+}
+
+// modelProvider returns the language model provider configured in the
+// environment, or nil when there is none (llm tasks are then unavailable).
+func modelProvider() (llm.Provider, llm.Prices, error) {
+	prices, err := llm.PricesFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	c := llm.ConfigFromEnv()
+	if !c.Configured() {
+		slog.Info("llm tasks disabled: set OPENAI_API_KEY (or CONDUCTOR_LLM_BASE_URL) to enable them")
+		return nil, prices, nil
+	}
+	p, err := llm.New(c)
+	if err != nil {
+		return nil, nil, err
+	}
+	slog.Info("llm tasks enabled", "base_url", c.BaseURL, "default_model", c.DefaultModel, "priced_models", len(prices))
+	return p, prices, nil
 }

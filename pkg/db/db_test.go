@@ -716,3 +716,87 @@ func TestAttemptHistory(t *testing.T) {
 		t.Fatalf("history after requeue = %+v", got)
 	}
 }
+
+func TestLLMUsageAndSpend(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	wf, _, err := db.CreateWorkflow(ctx, NewWorkflow{Namespace: "default", Name: "x", Definition: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := create(t, db, "llm a", func(n *NewTask) { n.Type = "llm"; n.WorkflowID = &wf.ID })
+	b := create(t, db, "llm b", func(n *NewTask) { n.Type = "llm"; n.WorkflowID = &wf.ID })
+
+	// Usage accumulates across attempts.
+	for range 2 {
+		if err := db.RecordUsage(ctx, a.ID, LLMUsage{Model: "m", InputTokens: 100, OutputTokens: 20, CostUSD: 0.001}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.RecordUsage(ctx, b.ID, LLMUsage{Model: "m", InputTokens: 50, OutputTokens: 10, CostUSD: 0.0005}); err != nil {
+		t.Fatal(err)
+	}
+	got := must[*Task](t)(db.GetTask(ctx, a.ID))
+	if got.LLMModel != "m" || got.InputTokens != 200 || got.OutputTokens != 40 || got.CostUSD < 0.00199 || got.CostUSD > 0.00201 {
+		t.Fatalf("task usage = %s %d/%d $%f", got.LLMModel, got.InputTokens, got.OutputTokens, got.CostUSD)
+	}
+	if s := must[Spend](t)(db.WorkflowSpend(ctx, wf.ID)); s.Tokens != 300 {
+		t.Fatalf("workflow spend = %+v, want 300 tokens", s)
+	}
+	if s := must[Spend](t)(db.NamespaceSpend(ctx, "default", time.Now().Add(-time.Hour))); s.Tokens != 300 || s.CostUSD < 0.0024 {
+		t.Fatalf("namespace spend = %+v", s)
+	}
+	if s := must[Spend](t)(db.NamespaceSpend(ctx, "default", time.Now().Add(time.Hour))); s.Tokens != 0 {
+		t.Fatalf("spend since the future = %+v", s)
+	}
+}
+
+func TestRetryTaskAfterWaitsAtLeast(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	task := create(t, db, "rate limited", func(n *NewTask) { n.RetryDelaySeconds = 1 })
+	pick(t, db)
+	if !must[bool](t)(db.RetryTaskAfter(ctx, task.ID, 1, "", "429", 30*time.Second)) {
+		t.Fatal("not retried")
+	}
+	got := must[*Task](t)(db.GetTask(ctx, task.ID))
+	if wait := time.Until(got.ScheduledAt); wait < 28*time.Second || wait > 32*time.Second {
+		t.Fatalf("retry scheduled in %v, want about the provider's 30s", wait)
+	}
+}
+
+func TestQueueTokensPerMinute(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	limit := int64(100)
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "llm", TokensPerMinute: &limit}))
+	if q := must[*Queue](t)(db.GetQueue(ctx, "default", "llm")); q.TokensPerMinute == nil || *q.TokensPerMinute != 100 {
+		t.Fatalf("queue = %+v", q)
+	}
+	first := create(t, db, "first", func(n *NewTask) { n.Queue = "llm" })
+	create(t, db, "second", func(n *NewTask) { n.Queue = "llm" })
+	if got := pick(t, db); got == nil || got.ID != first.ID {
+		t.Fatalf("picked %v, want the first task", got)
+	}
+	// The first task used up the minute's tokens: the second waits.
+	if err := db.RecordUsage(ctx, first.ID, LLMUsage{InputTokens: 90, OutputTokens: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if got := pick(t, db); got != nil {
+		t.Fatalf("picked %s although the queue's tokens per minute are spent", got.Data)
+	}
+}
+
+func TestNamespaceModelLimits(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tokens, cost := int64(1000), 0.5
+	n := must[*Namespace](t)(db.CreateNamespace(ctx, Namespace{Name: "ai", MaxLLMTokensPerDay: &tokens, MaxLLMCostPerDay: &cost, AIAssist: true}))
+	if n.MaxLLMTokensPerDay == nil || *n.MaxLLMTokensPerDay != 1000 || n.MaxLLMCostPerDay == nil || *n.MaxLLMCostPerDay != 0.5 || !n.AIAssist {
+		t.Fatalf("namespace = %+v", n)
+	}
+	n = must[*Namespace](t)(db.UpdateNamespace(ctx, Namespace{Name: "ai"}))
+	if n.MaxLLMTokensPerDay != nil || n.AIAssist {
+		t.Fatalf("after clearing: %+v", n)
+	}
+}

@@ -23,6 +23,16 @@ x-cluster-env: &cluster-env
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
 # Only the coordinator and API talk to Postgres; workers never see these.
+# Language models, for llm tasks and the AI assistant (workers and API).
+# OPENAI_API_KEY comes from .env; tasks never see it. Point
+# CONDUCTOR_LLM_BASE_URL at http://mock-llm:8090/v1 (--profile mock-llm) to
+# use the free scripted stand-in instead.
+x-llm-env: &llm-env
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  CONDUCTOR_LLM_BASE_URL: ${CONDUCTOR_LLM_BASE_URL:-}
+  CONDUCTOR_LLM_MODEL: ${CONDUCTOR_LLM_MODEL:-}
+  CONDUCTOR_LLM_PRICES: ${CONDUCTOR_LLM_PRICES:-}
+
 x-db-env: &db-env
   <<: *cluster-env
   POSTGRES_HOST: postgres
@@ -67,7 +77,7 @@ services:
     <<: *conductor
     command: ["api"]
     environment:
-      <<: *db-env
+      <<: [*db-env, *llm-env]
       CONDUCTOR_API_KEY: ${CONDUCTOR_API_KEY:-insecure-dev-api-key}
     ports:
       - "8081:8081"
@@ -86,7 +96,7 @@ services:
     <<: *conductor
     command: ["worker"]
     environment:
-      <<: *cluster-env
+      <<: [*cluster-env, *llm-env]
       CONDUCTOR_WORKER_SLOTS: ${CONDUCTOR_WORKER_SLOTS:-2}
     # Workers advertise their own container IP, so replicas never collide.
     # On shutdown they finish running tasks for up to CONDUCTOR_SHUTDOWN_TIMEOUT
@@ -106,13 +116,21 @@ services:
     profiles: ["containers"]
     user: root
     environment:
-      <<: *cluster-env
+      <<: [*cluster-env, *llm-env]
       CONDUCTOR_WORKER_SLOTS: 2
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     stop_grace_period: 30s
     depends_on:
       - coordinator
+
+  # A scripted stand-in for a language model (OpenAI-compatible), for tests
+  # and demos: docker compose --profile mock-llm up, with
+  # CONDUCTOR_LLM_BASE_URL=http://mock-llm:8090/v1.
+  mock-llm:
+    <<: *conductor
+    command: ["mock-llm"]
+    profiles: ["mock-llm"]
 
   # Observability (opt-in): every Conductor process serves /metrics on :9090.
   prometheus:

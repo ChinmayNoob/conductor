@@ -20,7 +20,8 @@ Postgres is the only dependency.
 flowchart LR
     CLI["conductorctl / Go SDK / curl"] -- "HTTP + API key" --> API
     subgraph cluster [Conductor cluster]
-        API["api<br/>HTTP :8081"] -- "gRPC + cluster token (+mTLS)" --> COORD["coordinator<br/>gRPC :8080"]
+        API["api<br/>HTTP :8081"] -- "gRPC + cluster token (+mTLS)" --> COORD["coordinator (leader)<br/>gRPC :8080"]
+        STANDBY["coordinator (standby)"] -. "redirects to leader" .-> COORD
         COORD -- "dispatch / cancel" --> W1["worker<br/>shell · http"]
         COORD -- "dispatch / cancel" --> W2["worker<br/>shell · http"]
         COORD -- "dispatch / cancel" --> W3["container-worker<br/>+ container"]
@@ -28,12 +29,13 @@ flowchart LR
     end
     API -- "reads" --> PG[("PostgreSQL")]
     COORD -- "queue, workflows, schedules" --> PG
+    STANDBY -. "campaigns for leadership" .-> PG
 ```
 
 | Component | Role |
 |---|---|
 | **api** | Stateless HTTP API. Authenticates API keys, reads state from Postgres, and sends commands to the coordinator. |
-| **coordinator** | Tracks workers, claims tasks from Postgres with `FOR UPDATE SKIP LOCKED` (respecting queue limits and worker labels), dispatches them, retries failures, recovers tasks from dead workers, drives workflow DAGs, and fires cron schedules. |
+| **coordinator** | Tracks workers, claims tasks from Postgres with `FOR UPDATE SKIP LOCKED` (respecting queue limits and worker labels), dispatches them, retries failures, recovers tasks from dead workers, drives workflow DAGs, and fires cron schedules. Run two or more: one is elected leader through a Postgres advisory lock and the rest are hot standbys that take over within about a second. Every leader write is fenced by an epoch, and every result by an attempt number, so a deposed leader or a partitioned worker can't change anything. |
 | **worker** | Runs tasks (shell, HTTP, or containers) in a clean environment. Cancellation kills everything a task started. Drains gracefully on shutdown. |
 
 All three are subcommands of one binary, `conductor`, shipped as one Docker image.
@@ -226,6 +228,8 @@ make test        # unit tests
 make lint        # golangci-lint (runs in Docker)
 make up          # start the stack with 3 workers
 make e2e         # end-to-end suite against the running stack
+make chaos       # chaos suite: faults injected under load, then invariant checks
+make bench       # benchmarks at 1, 10 and 50 workers
 make proto       # regenerate gRPC code (protoc runs in Docker)
 ```
 
@@ -235,7 +239,14 @@ Database tests need a Postgres server; they create and drop a throwaway database
 CONDUCTOR_TEST_DATABASE_URL='postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable' go test ./pkg/db/
 ```
 
-CI runs lint, unit and database tests with the race detector, and the 29-test end-to-end suite over both plaintext and mutual TLS.
+CI runs lint, unit and database tests with the race detector, and the 31-test end-to-end suite over both plaintext and mutual TLS. The chaos suite runs nightly.
+
+## Reliability and performance
+
+- **High availability:** killing the leader coordinator mid-workflow loses nothing; a standby takes over in 0.5–1 s.
+- **Chaos-tested:** a steady workload survives killed workers and coordinators, a network partition, Postgres latency, a cut database connection and a Postgres restart, with every task completed and every saga compensated exactly where it should be.
+- **Benchmarks:** about 800 no-op tasks/s drained and ~5 ms idle dispatch on a laptop; see [BENCHMARKS.md](BENCHMARKS.md).
+- **Design records:** [docs/adr](docs/adr/).
 
 ## License
 

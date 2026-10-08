@@ -143,7 +143,7 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 
 ---
 
-## Phase 3: Distributed-systems depth 🟡 (in progress, PR #4)
+## Phase 3: Distributed-systems depth ✅ (done, PR #4)
 
 **Goal:** no single point of failure, provable correctness under failure, and published performance numbers.
 
@@ -161,16 +161,18 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 ### 3.3 Faster dispatch
 - ✅ `LISTEN/NOTIFY` on task insert and retry wakes the dispatcher immediately instead of waiting for the 1s tick
 - ✅ Batch claiming (`LIMIT n`) to cut round trips under load, with queue and namespace limits still enforced inside a batch; plus an indexed `dispatch_key` so a pick no longer sorts every queued task
-- ⬜ **Design decision record:** keep coordinator push, or switch to a worker pull / long-poll model. Pull scales more simply, works behind NAT and removes the coordinator → worker connections. Evaluate it with benchmarks.
+- ✅ **Design decision record:** [ADR 0001](docs/adr/0001-dispatch-push-vs-pull.md). Scheduling stays in the leader (workers never get database credentials, and the per-task cost is Postgres work under either model); the transport moves to worker-opened streams in Phase 6
+- ✅ Hot-path profiling and fixes: NOTIFY no longer serializes commits, single-statement fences, no worker STARTED round trip, a persistent connection pool, and a worker slot race
 
 ### 3.4 Benchmarks and chaos testing
 - ✅ Benchmark harness (`cmd/conductor-bench`): throughput (tasks/s), dispatch latency p50/p99, and workflow end-to-end latency at 1, 10 and 50 workers
-- ⬜ Publish baseline numbers in the docs; set targets after measuring
-- ⬜ Chaos suite in CI (nightly):
-  - Kill workers and coordinators mid-workflow
-  - Network partitions and latency via Toxiproxy
+- ✅ Baseline numbers published in [BENCHMARKS.md](BENCHMARKS.md), with targets for the next phases
+- ✅ Chaos suite (`make chaos`, nightly in [chaos.yml](.github/workflows/chaos.yml)) running a steady workload of tasks and sagas through:
+  - Killing a worker, the leader coordinator, and both coordinators
+  - A worker partitioned from the network
+  - Postgres latency and a cut connection via Toxiproxy
   - A Postgres restart
-- ⬜ Invariant checks after every chaos run: no task lost, no task stuck, every workflow terminal, and compensation run exactly where required
+- ✅ Invariant checks after the run: no task lost, none stuck, every task completed, every workflow terminal, and compensation run exactly where required (all three steps of every failing saga, no step of any succeeding one)
 
 **Exit criteria:** killing the leader coordinator mid-workflow causes no lost or stuck work; chaos tests pass nightly; benchmark numbers are published.
 
@@ -346,7 +348,7 @@ Phases describe *areas*. The order below gets the most value soonest and front-l
 | 0 | Foundation and bug-fix round | ✅ Done |
 | 1 | Production basics (CI, e2e, migrations, auth, TLS, cancellation) | ✅ Done |
 | 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | ✅ Done |
-| 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | 🟡 In progress |
+| 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ✅ Done |
 | 4 | Observability and UI (metrics, tracing, dashboard) | ⬜ |
 | 5 | AI-native durable execution (LLM steps, agents, explainer) | ⬜ |
 | 6 | Kubernetes and cloud-native (Helm, KEDA, operator) | ⬜ |

@@ -646,9 +646,9 @@ conductorctl workflow watch <id>
 
 ---
 
-## Phase 3: Distributed-systems depth (in progress)
+## Phase 3: Distributed-systems depth
 
-**Done so far (PR #4):** coordinator high availability, fencing, attempt IDs, instant dispatch, batch claiming, and a benchmark tool. **Still to do:** published benchmarks at 1/10/50 workers, the nightly chaos suite, and the push-vs-pull design record.
+**Done (PR #4):** coordinator high availability with epoch fencing and attempt IDs, a hot path that drains ~980 no-op tasks/s where it managed ~400 on the same 50 slots, published benchmarks at 1, 10 and 50 workers, a nightly chaos suite with invariant checks, and the push-vs-pull design record.
 
 ### Leader election and failover
 
@@ -684,19 +684,151 @@ sequenceDiagram
 | Calls aimed at the dead leader waited for gRPC's **20 s** connect timeout (a killed container's IP never answers) | Task results arrived about 20 s late after a failover | 3 s per-attempt timeout and a 2 s connect timeout: lag ≤ 2 s |
 | Forgetting a dead leader **closed a connection another call was using** | A result report failed with `Canceled` and was never retried; the task stayed `STARTED` | Keep connections and treat caller-independent cancellation as retryable |
 
-### Throughput: what the benchmark showed
+### Making the hot path fast
 
-| Change | No-op tasks/s (4 workers, 8 slots) | Note |
+The first benchmark said throughput was flat at about 230 tasks/s whatever
+the number of workers, and I blamed round trips. That was only partly right,
+and the way to find out was to stop guessing and measure Postgres directly:
+`pg_stat_statements`, wait events sampled from `pg_stat_activity` during a
+run, and the Go connection pool's own statistics. Each pass found one limit.
+
+```mermaid
+flowchart TB
+    subgraph before [Per task, before]
+        direction LR
+        A1[API insert<br/>+ NOTIFY 🔒] --> A2[claim<br/>4 round trips] --> A3[send to worker] --> A4[worker → STARTED<br/>4 round trips] --> A5[run] --> A6[COMPLETE<br/>4 round trips]
+    end
+    subgraph after [Per task, after]
+        direction LR
+        B1[API insert<br/>no NOTIFY] --> B2[batch claim<br/>1 statement] --> B3[send, async] --> B5[run] --> B6[COMPLETE<br/>1 statement]
+        B3 -.-> B4[STARTED<br/>off the slot's path]
+    end
+    before ~~~ after
+```
+
+| # | What the measurement showed | Fix |
 |---|---|---|
-| Before Phase 3 | 139 | |
-| `LISTEN/NOTIFY` | | Idle dispatch latency: up to 1 s → **~3 ms** |
-| Indexed `dispatch_key` + batch claiming + parallel dispatch | **220** | A pick no longer sorts every queued task (it was O(N) per pick) |
-| 10 workers, 22 slots | ~230 | Flat: the limit is the coordinator, not the workers |
+| 1 | Inserts waiting on the wait event `Lock: object`. That is the `NOTIFY` queue lock, which Postgres holds from a notifying commit until its WAL flush, so **notifying commits run one at a time** | The leader wakes its own dispatcher. Its sessions set `conductor.local_wake=on` and the triggers skip `NOTIFY` for them (migration 0006). Other writers still notify |
+| 2 | Postgres at **~510% CPU** (my earlier "8%" was sampled while idle) and backend PIDs climbing fast | The pool kept 10 idle connections out of 20, so every load spike forked new backends with cold caches. Keep all 20 |
+| 3 | 15,026 pool waits in a 10 s run, 189 s waited in total | Each STARTED/COMPLETE report held a connection for a 4-round-trip fenced transaction. The fence now sits inside the statement: `AND EXISTS (SELECT 1 FROM coordinator_leader WHERE epoch = $n FOR SHARE)`. That is the same share lock, so the same guarantee (two new DB tests), in one round trip |
+| 4 | About 65 requeues per run | **Slot race:** workers freed a slot only after their result report returned, but the coordinator counted it free on arrival and sent the next task straight away, which the worker refused. Workers now free the slot first |
+| 5 | Steady-load latency far above drain capacity would predict | Workers sent a **blocking STARTED report** before every task. The coordinator now records the start itself when the worker accepts |
+| 6 | "Throughput" could never exceed the submit rate | **The benchmark was wrong**: it timed submission and dispatch together. It now measures ingest, drain (a paused queue, resumed) and latency at fixed rates separately |
 
-Profiling showed every container nearly idle (Postgres at 8% CPU) during the run, so the remaining limit is **round-trip latency** on the per-task path: claim, then STARTED and COMPLETE reports, each a fenced transaction. I tried fencing only belief-driven writes, which saves round trips. It didn't measurably help (~230/s), so I reverted it to keep the simpler "every leader write is fenced" guarantee. The next experiments are coalescing STARTED and COMPLETE reports and single-statement fences. They'll be measured by the published benchmark runs.
+Results on the same laptop: drain went from ~400 to **~980 tasks/s** (50
+slots), and dispatch p50 under steady load from **1,607 ms to 96 ms**. Full
+numbers at 1, 10 and 50 workers are in [BENCHMARKS.md](BENCHMARKS.md).
+
+Two experiments didn't pay off and were reverted. Fencing only "belief-driven"
+writes made no difference, so the simple rule that every leader write is
+fenced stayed. A 64-connection pool removed the waits without adding
+throughput, and three processes × 64 would exceed Postgres's default
+100-connection limit anyway.
+
+### A bug the benchmark caught
+
+At 10 workers, a few workflows took **17 s** instead of 1 s. The step timings
+showed the fan-in step being created about 15 s late. The coordinator log
+explained it:
+
+```
+failed to mark task completed: pq: value "2937479422" is out of range for type integer
+```
+
+My new back-fill `worker_id = COALESCE(NULLIF($5, 0), worker_id)` let
+Postgres infer `$5` as a 32-bit integer from the literal `0`. Worker IDs use
+the full uint32 range. The report failed, and only the worker's retry got
+through, by luck: the slot had already been released, so the retry sent
+worker ID 0. Fixed with `$5::bigint` and a test with a large worker ID. The
+unit tests had used ID 0 and the e2e suite's workers happened to have small
+IDs, so only the benchmark exposed it. Workflow p99 at 10 workers: 17 s →
+1.9 s.
+
+### Push or pull?
+
+The plan asked whether workers should pull work instead of being pushed it.
+[ADR 0001](docs/adr/0001-dispatch-push-vs-pull.md) records the answer, using
+the profiling above. Every limit was in Postgres and the database work per
+task is the same either way, so pull wouldn't make tasks cheaper. Letting
+workers claim straight from Postgres would also hand database credentials to
+the machines that run untrusted code. Scheduling stays in the leader. What
+does change, in Phase 6, is the transport: workers will open the connection
+(a gRPC stream), so they work behind NAT and need no address the coordinator
+can dial.
+
+### Chaos testing
+
+```mermaid
+timeline
+    title One chaos run, with tasks and sagas submitted throughout
+    kill a worker : 10 s down
+    kill the leader : standby takes over
+    Postgres latency : 150 ± 100 ms for 15 s (Toxiproxy)
+    partition a worker : 25 s off the network
+    cut Postgres : 8 s, coordinators and API
+    restart Postgres
+    kill both coordinators : 5 s with no coordinator at all
+```
+
+`TestChaos` (`make chaos`, nightly in CI) runs a steady workload the whole
+time: a task every 200 ms (0.2–3 s of work, up to 10 retries) and a saga
+every 800 ms. A saga is a four-step diamond where every step has a
+compensation; one in four uses a definition whose last step always fails.
+Submissions retry through outages with idempotency keys. Toxiproxy sits
+between Postgres and the coordinators and API (`docker-compose.chaos.yml`).
+
+Afterwards it checks:
+- **No task lost:** every accepted task can still be read.
+- **None stuck:** every task and workflow reached a terminal state.
+- **Every task completed.** Retries must absorb every fault.
+- **Compensation exactly where required:** each failing saga is `FAILED` with
+  its three earlier steps `COMPENSATED` and their undo tasks completed; each
+  succeeding saga is `COMPLETED` and never compensated.
+
+**Results:** both local runs pass. Each submitted 708 tasks and 177 sagas;
+50–54 submissions had to retry through an outage, and 6–8 tasks were
+dispatched more than once because they lost their worker. Every task
+completed, and every saga ended exactly as its definition requires.
+
+**What the first run found.** It passed, but the logs showed the leader
+**stepping down during the latency fault**, when Postgres was slow but
+nowhere near gone:
+
+| Fault | Leadership changes (first run) | After the fix |
+|---|---|---|
+| kill the leader | ✔ expected | ✔ |
+| Postgres latency 150 ± 100 ms | ✘ leader stepped down | none |
+| cut Postgres for 8 s | ✔ expected (both coordinators campaign until it returns) | ✔ |
+| restart Postgres | ✔ expected | ✔ |
+| kill both coordinators | ✔ expected | ✔ |
+
+The heartbeat was an `UPDATE` of the `coordinator_leader` row, the row every
+fenced write share-locks. It had to wait for all of them, and every fenced
+write arriving meanwhile queued behind it. Under latency those locks are held
+longer, the heartbeat hit its 2 s timeout, and the watchdog treated that as
+a lost session. The same contention showed in the earlier profile, where the
+heartbeat's mean time was 28 ms, a hot-path stall once a second. Two fixes:
+
+- The heartbeat moved to its own table, `leader_heartbeat` (migration 0007),
+  tagged with its epoch so a deposed leader's late heartbeat counts for
+  nothing. A DB test checks that it no longer waits behind a fenced write.
+- Only the session ping decides leadership, and it gets 5 s. A slow database
+  is not a lost lock, and fencing covers the gap if it really is lost.
+
+### Phase 3 scorecard
+
+| Exit criterion | Result |
+|---|---|
+| Killing the leader mid-workflow loses or strands no work | ✅ e2e `TestLeaderFailover`, and the chaos suite |
+| Chaos tests pass nightly | ✅ `chaos.yml`, run locally before merging |
+| Benchmark numbers are published | ✅ [BENCHMARKS.md](BENCHMARKS.md) |
 
 ---
 
 ## What's next
 
-Finish Phase 3: published benchmarks at 1/10/50 workers, a nightly chaos suite (kill coordinators and workers, network partitions, Postgres latency via Toxiproxy, Postgres restarts) with invariant checks, and the push-vs-pull design record. See [plan.md](plan.md).
+Phase 4: observability and a UI (Prometheus metrics, OpenTelemetry tracing,
+live log streaming and a dashboard with a live workflow graph). The
+benchmark's "where the time goes" list feeds a later performance pass:
+batched result writes, cached key and namespace lookups, and prepared
+statements. See [plan.md](plan.md).

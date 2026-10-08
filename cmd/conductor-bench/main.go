@@ -3,8 +3,8 @@
 //   - ingest: how fast the API accepts tasks
 //   - drain: how fast the cluster works through a backlog (tasks are
 //     submitted to a paused queue, which is then resumed)
-//   - latency: dispatch and end-to-end latency at a steady load (a fraction
-//     of the measured drain rate), and on an idle cluster
+//   - latency: dispatch and end-to-end latency at several steady
+//     submission rates, and on an idle cluster
 //   - workflows: end-to-end time of a four-step diamond workflow
 //
 // Every task is a no-op shell command, so the numbers measure Conductor's
@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,12 +39,7 @@ type Result struct {
 	Tasks             int     `json:"tasks"`
 	IngestPerSec      float64 `json:"ingest_per_sec"`
 	DrainPerSec       float64 `json:"drain_per_sec"`
-	LoadPerSec        float64 `json:"load_per_sec"`
-	DispatchP50Ms     float64 `json:"dispatch_p50_ms"`
-	DispatchP95Ms     float64 `json:"dispatch_p95_ms"`
-	DispatchP99Ms     float64 `json:"dispatch_p99_ms"`
-	EndToEndP50Ms     float64 `json:"end_to_end_p50_ms"`
-	EndToEndP99Ms     float64 `json:"end_to_end_p99_ms"`
+	Load              []Load  `json:"load"`
 	IdleDispatchP50Ms float64 `json:"idle_dispatch_p50_ms"`
 	IdleDispatchP99Ms float64 `json:"idle_dispatch_p99_ms"`
 	Workflows         int     `json:"workflows"`
@@ -51,13 +48,22 @@ type Result struct {
 	WorkflowsPerSec   float64 `json:"workflows_per_sec"`
 }
 
+// Load is the latency measured at one steady submission rate.
+type Load struct {
+	RatePerSec    float64 `json:"rate_per_sec"` // achieved submission rate
+	DispatchP50Ms float64 `json:"dispatch_p50_ms"`
+	DispatchP99Ms float64 `json:"dispatch_p99_ms"`
+	EndToEndP50Ms float64 `json:"end_to_end_p50_ms"`
+	EndToEndP99Ms float64 `json:"end_to_end_p99_ms"`
+}
+
 func main() {
 	url := flag.String("url", "http://localhost:8081", "API URL")
 	key := flag.String("key", os.Getenv("CONDUCTOR_API_KEY"), "admin API key")
 	dsn := flag.String("dsn", "postgres://postgres:postgres@localhost:5433/taskscheduler?sslmode=disable&timezone=UTC", "Postgres DSN, for timings")
 	tasks := flag.Int("tasks", 4000, "tasks in the drain run")
-	loadFraction := flag.Float64("load", 0.5, "steady load as a fraction of the drain rate")
-	loadSeconds := flag.Int("load-seconds", 10, "length of the steady-load run")
+	rates := flag.String("rates", "50,100,200,400", "steady submission rates (tasks/s) to measure latency at; rates above 80% of the drain rate are skipped")
+	loadSeconds := flag.Int("load-seconds", 10, "length of each steady-load run")
 	workflows := flag.Int("workflows", 50, "workflow runs to start")
 	concurrency := flag.Int("concurrency", 32, "parallel submitters")
 	label := flag.String("label", "", "label for this run")
@@ -111,24 +117,17 @@ func main() {
 	res.DrainPerSec = float64(*tasks) / span
 	must(c.DeleteQueue(ctx, queue))
 
-	// 3. Latency under a steady load, submitted at a fixed rate (open loop).
-	rate := res.DrainPerSec * *loadFraction
-	n := int(rate * float64(*loadSeconds))
-	queue = fmt.Sprintf("bench-load-%d", time.Now().UnixNano())
-	start = time.Now()
-	parallel(n, *concurrency, func(i int) {
-		time.Sleep(time.Until(start.Add(time.Duration(float64(i) / rate * float64(time.Second)))))
-		_, err := c.SubmitTask(ctx, client.TaskRequest{Command: "true", Queue: queue, MaxRetries: client.Retries(0)})
+	// 3. Latency at steady loads, submitted at fixed rates (open loop).
+	for _, f := range strings.Split(*rates, ",") {
+		rate, err := strconv.ParseFloat(strings.TrimSpace(f), 64)
 		must(err)
-	})
-	res.LoadPerSec = float64(n) / time.Since(start).Seconds()
-	waitDone(db, `SELECT count(*) FROM tasks WHERE queue = $1 AND status NOT IN ('COMPLETED','FAILED','CANCELLED')`, queue)
-	dispatch := durations(db, queue, "picked_at", "created_at")
-	e2e := durations(db, queue, "completed_at", "created_at")
-	res.DispatchP50Ms, res.DispatchP95Ms, res.DispatchP99Ms = pct(dispatch, 50), pct(dispatch, 95), pct(dispatch, 99)
-	res.EndToEndP50Ms, res.EndToEndP99Ms = pct(e2e, 50), pct(e2e, 99)
+		if rate > 0.8*res.DrainPerSec {
+			continue // past capacity, the queue only grows
+		}
+		res.Load = append(res.Load, steadyLoad(ctx, c, db, rate, *loadSeconds, *concurrency))
+	}
 
-	// 3. Workflows: a four-step diamond of no-op steps.
+	// 4. Workflows: a four-step diamond of no-op steps.
 	if *workflows > 0 {
 		name := "bench_diamond"
 		_, err := c.ApplyDefinition(ctx, []byte(`
@@ -183,6 +182,26 @@ steps:
 		fmt.Fprintln(f, string(line))
 		f.Close()
 	}
+}
+
+// steadyLoad submits no-op tasks at rate for the given seconds and measures
+// their latency.
+func steadyLoad(ctx context.Context, c *client.Client, db *sql.DB, rate float64, seconds, concurrency int) Load {
+	n := int(rate * float64(seconds))
+	queue := fmt.Sprintf("bench-load-%d", time.Now().UnixNano())
+	start := time.Now()
+	parallel(n, concurrency, func(i int) {
+		time.Sleep(time.Until(start.Add(time.Duration(float64(i) / rate * float64(time.Second)))))
+		_, err := c.SubmitTask(ctx, client.TaskRequest{Command: "true", Queue: queue, MaxRetries: client.Retries(0)})
+		must(err)
+	})
+	l := Load{RatePerSec: float64(n) / time.Since(start).Seconds()}
+	waitDone(db, `SELECT count(*) FROM tasks WHERE queue = $1 AND status NOT IN ('COMPLETED','FAILED','CANCELLED')`, queue)
+	dispatch := durations(db, queue, "picked_at", "created_at")
+	e2e := durations(db, queue, "completed_at", "created_at")
+	l.DispatchP50Ms, l.DispatchP99Ms = pct(dispatch, 50), pct(dispatch, 99)
+	l.EndToEndP50Ms, l.EndToEndP99Ms = pct(e2e, 50), pct(e2e, 99)
+	return l
 }
 
 // durations returns sorted millisecond gaps between two task timestamps.

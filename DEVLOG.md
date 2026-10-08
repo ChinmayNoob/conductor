@@ -825,10 +825,86 @@ heartbeat's mean time was 28 ms, a hot-path stall once a second. Two fixes:
 
 ---
 
+## Phase 4: Observability and UI
+
+**Done (PR #5):** Prometheus metrics with Grafana and alert rules, OpenTelemetry tracing that follows a task through the queue and into user code, live task output and attempt history, and a web dashboard whose workflow page answers "which step failed, why, and what was undone" at a glance.
+
+![The dashboard's workflow run page](docs/images/dashboard-workflow.png)
+
+### Metrics
+
+Every process serves `/metrics` on `:9090`. Counters and histograms are updated on paths that already do the work; anything describing state is computed when Prometheus scrapes, so it costs nothing in between:
+
+| From | Metrics |
+|---|---|
+| Coordinator (counted as it works) | dispatches, results by outcome (`completed`, `failed`, `retried`, `stale`), lost tasks, dispatch failures, dispatch-latency and turnaround histograms, workflow outcomes, compensations, schedule runs, elections |
+| Coordinator (at scrape, leader only) | leadership and epoch, workers by state, slots total and busy, per-queue tasks `ready` / `delayed` / `paused` / `running`, oldest due task's age |
+| Worker | run time by type and outcome, slots, running tasks, undeliverable results |
+| API | requests and latency by **route pattern** (a bounded label, unlike the path) |
+
+`docker compose --profile observability up` adds Prometheus (which finds every replica through Compose DNS), Grafana with a provisioned 21-panel dashboard, and alert rules: no leader, no healthy workers, a queue backing up, a failure-rate spike, lost tasks.
+
+**The first alert to fire was real.** On its first run, `ConductorQueueBackingUp` went pending: 2,000 tasks left over from an earlier experiment required a label no worker had, and had waited 9.5 hours. That exposed a gap too: a deliberately paused queue would have paged someone, so paused queues now report their tasks as `paused`, not `ready`.
+
+### Tracing across the queue
+
+A trace normally follows RPCs, but a task's life has a gap no RPC spans: it waits in Postgres between being submitted and being dispatched. The submitter's W3C `traceparent` is stored on the task row (migration 0008), so the trace survives the wait:
+
+```mermaid
+sequenceDiagram
+    participant U as Client
+    participant A as API
+    participant C as Coordinator
+    participant PG as Postgres
+    participant W as Worker
+    participant T as Task (user code)
+    U->>A: POST /v1/tasks  (span: POST /v1/tasks)
+    A->>C: SubmitTask  (gRPC carries the trace)
+    C->>PG: INSERT … trace_parent = 00-4bf9…
+    Note over PG: the task waits, maybe for hours
+    C->>PG: claim a batch
+    C->>C: span "dispatch", continuing 00-4bf9…
+    C->>W: SubmitTask  (gRPC carries the trace)
+    W->>T: span "run shell", TRACEPARENT=00-4bf9…
+    W->>C: UpdateTaskStatus  (same trace)
+```
+
+Workflow steps and their compensations join their run's trace, so a failed saga is one trace. In testing, `order_pipeline` with a failing shipment came out as one trace of **42 spans** across the API, the coordinator and the workers. Tracing is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+
+**Bug found:** API spans were all named `http`. otelhttp renames its span *after* the handler returns, overwriting the route name set inside it. A unit test with a span recorder passed, because the unmatched test route skipped that rename. The route now comes from a span-name formatter, and the e2e test checks a real trace in Jaeger.
+
+### Live output, without paying for it
+
+The plan said workers would stream output chunks to Postgres. Phase 3 had just shown that **Postgres writes are the throughput limit**, and that would add writes to every task whether or not anyone watched. So the output is read on demand instead:
+
+```mermaid
+flowchart LR
+    B["Browser or<br/>conductorctl task logs -f"] -- "GET /v1/tasks/ID/logs?follow=true" --> API
+    API -- "running? GetTaskOutput(attempt, offset)" --> C["Leader"]
+    C -- "proxied to the worker running it" --> W["Worker<br/>(output buffer)"]
+    API -- "finished? stored output" --> PG[("Postgres")]
+```
+
+While a task runs, the API polls the leader, which asks the worker for the output after an offset. When the attempt ends, the rest comes from the stored output; a retry starts a new section headed `--- attempt 2 ---`. Nothing happens unless someone is watching. A new `task_attempts` table keeps each failed attempt's worker, timing, error and output when the task is retried or requeued. It's written in the same statement as the retry, so only failure paths pay for it.
+
+### The dashboard
+
+Served at `/ui` from the binary. [ADR 0002](docs/adr/0002-dashboard-stack.md) records the stack: plain JavaScript modules on the JSON API, with no framework and no build step. That means one interface with exactly the API's permissions, and no CSRF surface, since the key travels as a Bearer header. The page holds an API key, so XSS is the risk to manage: all data is inserted as text, and a strict CSP allows only the dashboard's own files, refusing even inline style attributes.
+
+The design takes its cue from the name. A conductor dispatches along routes, so the dashboard is a **signal box**: enamel panels, engraved plate labels, and signal lamps whose colours mean the same everywhere (green done, amber moving, red stopped, violet undone). The workflow page draws a run as a **mimic diagram**, the track plan a signaller watches. Steps are track sections, the route lights as steps complete, it turns red where it stopped, and compensation runs back along it as a moving violet line.
+
+![The overview](docs/images/dashboard-overview.png)
+
+Found while checking it in a browser: a stray `0` rendered wherever a step had no outputs (`outputs.length && …`), inline `style` attributes silently refused by the CSP, and a sideways-scrolling page on phones (a grid track sized by its content, fixed with `minmax(0, 1fr)`).
+
+### Phase 4 scorecard
+
+| Exit criterion | Result |
+|---|---|
+| A failed workflow can be diagnosed from the dashboard alone: which step failed, why, and what was compensated | ✅ One banner states all three; the failed step opens with its error and output; the diagram shows the undo |
+
+---
+
 ## What's next
 
-Phase 4: observability and a UI (Prometheus metrics, OpenTelemetry tracing,
-live log streaming and a dashboard with a live workflow graph). The
-benchmark's "where the time goes" list feeds a later performance pass:
-batched result writes, cached key and namespace lookups, and prepared
-statements. See [plan.md](plan.md).
+Phase 5, AI-native durable execution: LLM steps with retries and token budgets, agent loops as durable workflows, and an "explain this failure" assistant built on the attempt history and traces added here. See [plan.md](plan.md).

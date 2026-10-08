@@ -22,9 +22,10 @@ import (
 // hot standbys that redirect callers to it. Postgres releases the lock when
 // the leader's session dies, so a standby takes over within about a second.
 //
-// Every write the leader makes goes through fenced(), which re-checks the
-// epoch under a share lock in the same transaction. A new leader's epoch bump
-// waits for those transactions, and once it commits the old leader's writes
+// Every write the leader makes is fenced: it re-checks the epoch under a
+// share lock on the leader row, in the same transaction (fenced) or the same
+// statement (fencedStmt, for the hot task transitions). A new leader's epoch
+// bump waits for those locks, and once it commits the old leader's writes
 // fail with db.ErrFenced: a deposed leader can't change anything, even if it
 // hasn't noticed yet.
 
@@ -136,13 +137,19 @@ watch:
 // fenced runs fn in a transaction that only commits while this coordinator
 // is the leader that was elected.
 func (s *Server) fenced(ctx context.Context, fn func(tx *db.DB) error) error {
+	return s.fencedStmt(ctx, func(q *db.DB) error { return q.WithTx(ctx, fn) })
+}
+
+// fencedStmt runs fn with a handle fenced to this leader's epoch, outside a
+// transaction. Only db methods that fence their own statement may be used.
+func (s *Server) fencedStmt(_ context.Context, fn func(q *db.DB) error) error {
 	s.mu.RLock()
 	epoch, fencedOut := s.epoch, s.fencedOut
 	s.mu.RUnlock()
 	if epoch == 0 {
 		return errNotLeader
 	}
-	err := s.db.WithFencedTx(ctx, epoch, fn)
+	err := fn(s.db.Fenced(epoch))
 	if errors.Is(err, db.ErrFenced) {
 		s.mu.Lock()
 		if s.fencedOut == fencedOut && fencedOut != nil {

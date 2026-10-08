@@ -171,15 +171,20 @@ func (s *Server) CancelTask(_ context.Context, req *grpcapi.CancelTaskRequest) (
 
 func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	defer s.wg.Done()
-	defer func() {
+	// Free the slot before reporting the result: the coordinator counts the
+	// slot free as soon as the report arrives and may send the next task
+	// right away.
+	release := func() {
 		s.mu.Lock()
 		delete(s.running, task.TaskId)
 		s.mu.Unlock()
-	}()
+	}
+	defer release()
 
 	log := s.log.With("task_id", task.TaskId, "type", task.Type, "attempt", task.Attempt)
+	// No STARTED report: the coordinator records the start when this worker
+	// accepts the task, which keeps a round trip off every task's path.
 	log.Info("Task started")
-	s.report(task, grpcapi.TaskStatus_STARTED, "", "", nil)
 
 	timeout := time.Duration(task.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -217,10 +222,12 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 			err = cause
 		}
 		log.Warn("Task failed", "error", err, "duration", time.Since(start))
+		release()
 		s.report(task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
 		return
 	}
 	log.Info("Task completed", "duration", time.Since(start))
+	release()
 	s.report(task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
 }
 

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 func TestAttemptFencing(t *testing.T) {
@@ -31,7 +33,7 @@ func TestAttemptFencing(t *testing.T) {
 	if must[bool](t)(db.MarkTaskStarted(ctx, task.ID, 1, 1)) {
 		t.Fatal("a STARTED report from the old attempt was accepted")
 	}
-	if must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, 1, "stale", nil)).Updated {
+	if must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, 1, 0, "stale", nil)).Updated {
 		t.Fatal("a COMPLETE report from the old attempt was accepted")
 	}
 	if must[bool](t)(db.RetryTask(ctx, task.ID, 1, "", "stale failure")) {
@@ -42,7 +44,7 @@ func TestAttemptFencing(t *testing.T) {
 	if !must[bool](t)(db.MarkTaskStarted(ctx, task.ID, 2, 2)) {
 		t.Fatal("the current attempt's STARTED report was rejected")
 	}
-	if !must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, 2, "ok", nil)).Updated {
+	if !must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, 2, 0, "ok", nil)).Updated {
 		t.Fatal("the current attempt's COMPLETE report was rejected")
 	}
 	if got := must[*Task](t)(db.GetTask(ctx, task.ID)); got.Output != "ok" {
@@ -160,5 +162,127 @@ func TestRebuildQueries(t *testing.T) {
 	next := must[*time.Time](t)(db.NextDueAt(ctx))
 	if next == nil || time.Until(*next) < 59*time.Minute || time.Until(*next) > 61*time.Minute {
 		t.Fatalf("next due = %v, want about an hour from now", next)
+	}
+}
+
+func TestStatementFencing(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	old := db.Fenced(must[int64](t)(db.BumpEpoch(ctx, "a", "a:8080")))
+
+	// While leading, the hot transitions work as usual.
+	task := create(t, db, "running")
+	picked := must[[]*Task](t)(old.PickTasks(ctx, shellWorkers, 10))
+	if len(picked) != 1 || !must[bool](t)(old.MarkTaskStarted(ctx, task.ID, 1, 1)) {
+		t.Fatalf("the leader could not dispatch (picked %d)", len(picked))
+	}
+
+	// A new leader is elected; the old one hasn't noticed yet.
+	current := db.Fenced(must[int64](t)(db.BumpEpoch(ctx, "b", "b:8080")))
+	queued := create(t, db, "queued")
+	if _, err := old.PickTasks(ctx, shellWorkers, 10); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a deposed leader's pick returned %v, want ErrFenced", err)
+	}
+	if _, err := old.MarkTaskCompleted(ctx, task.ID, 1, 0, "late", nil); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a deposed leader's completion returned %v, want ErrFenced", err)
+	}
+	if err := old.WithTx(ctx, func(*DB) error { return nil }); !errors.Is(err, ErrFenced) {
+		t.Fatalf("a deposed leader's transaction returned %v, want ErrFenced", err)
+	}
+	if got := must[*Task](t)(db.GetTask(ctx, task.ID)); got.Status != "STARTED" {
+		t.Fatalf("a deposed leader changed a task to %s", got.Status)
+	}
+	if got := must[*Task](t)(db.GetTask(ctx, queued.ID)); got.Attempt != 0 {
+		t.Fatal("a deposed leader claimed a task")
+	}
+
+	// The new leader carries on. A completion for the wrong attempt is
+	// simply not applied, not mistaken for fencing.
+	if r, err := current.MarkTaskCompleted(ctx, task.ID, 2, 0, "", nil); err != nil || r.Updated {
+		t.Fatalf("stale attempt: updated=%v err=%v", r.Updated, err)
+	}
+	if r := must[TaskResult](t)(current.MarkTaskCompleted(ctx, task.ID, 1, 0, "ok", nil)); !r.Updated {
+		t.Fatal("the current leader's completion was rejected")
+	}
+	if got := must[[]*Task](t)(current.PickTasks(ctx, shellWorkers, 10)); len(got) != 1 {
+		t.Fatalf("the current leader picked %d tasks, want 1", len(got))
+	}
+}
+
+func TestBumpEpochWaitsForFencedStatements(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	old := must[int64](t)(db.BumpEpoch(ctx, "a", "a:8080"))
+	task := create(t, db, "running")
+	pick(t, db)
+
+	// A fenced statement holds its share lock on the leader row until its
+	// transaction ends; run one in a transaction to hold it open.
+	inTx := make(chan struct{})
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = db.WithTx(ctx, func(tx *DB) error {
+			if _, err := tx.Fenced(old).MarkTaskStarted(ctx, task.ID, 1, 1); err != nil {
+				return err
+			}
+			close(inTx)
+			<-release
+			return nil
+		})
+	}()
+	<-inTx
+
+	bumped := make(chan struct{})
+	go func() {
+		must[int64](t)(db.BumpEpoch(ctx, "b", "b:8080"))
+		close(bumped)
+	}()
+	select {
+	case <-bumped:
+		t.Fatal("the epoch changed while a fenced statement was in progress")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	wg.Wait()
+	<-bumped
+}
+
+func TestLocalWakeSkipsNotify(t *testing.T) {
+	dsn := testDSN(t)
+	ctx := context.Background()
+	db := must[*DB](t)(Open(ctx, dsn))
+	defer db.Close()
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	leader := must[*DB](t)(Open(ctx, WithLocalWake(dsn)))
+	defer leader.Close()
+
+	l := pq.NewListener(WithUTC(dsn), time.Second, time.Second, nil)
+	defer l.Close()
+	if err := l.Listen("conductor_tasks"); err != nil {
+		t.Fatal(err)
+	}
+	notified := func() bool {
+		select {
+		case n := <-l.Notify:
+			return n != nil
+		case <-time.After(500 * time.Millisecond):
+			return false
+		}
+	}
+
+	// The leader wakes its own dispatcher, so its inserts don't notify.
+	create(t, leader, "from the leader")
+	if notified() {
+		t.Fatal("the leader's insert sent a notification")
+	}
+	// Anyone else's do.
+	create(t, db, "from elsewhere")
+	if !notified() {
+		t.Fatal("an insert from another session sent no notification")
 	}
 }

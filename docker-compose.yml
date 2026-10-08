@@ -29,6 +29,7 @@ x-db-env: &db-env
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}

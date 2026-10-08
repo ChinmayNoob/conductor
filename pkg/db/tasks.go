@@ -278,7 +278,7 @@ func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Ta
 		return nil, err
 	}
 
-	rows, err := db.q.QueryContext(ctx,
+	query, args := db.fence(
 		`WITH candidates AS (
 			 SELECT t.id, t.namespace, t.queue, t.dispatch_key
 			 FROM tasks t
@@ -315,10 +315,11 @@ func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Ta
 		 )
 		 UPDATE tasks
 		 SET picked_at = NOW(), last_dispatched_at = NOW(), attempt = attempt + 1
-		 WHERE id IN (SELECT id FROM allowed)
+		 WHERE id IN (SELECT id FROM allowed) `+fenceMarker+`
 		 RETURNING `+taskColumns,
 		labels, limit,
 	)
+	rows, err := db.q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pick tasks: %w", err)
 	}
@@ -334,6 +335,9 @@ func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Ta
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to pick tasks: %w", err)
+	}
+	if len(tasks) == 0 {
+		return nil, db.unchanged(ctx)
 	}
 	// RETURNING has no order; restore dispatch order.
 	slices.SortFunc(tasks, func(a, b *Task) int {
@@ -421,15 +425,20 @@ func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, 
 }
 
 func (db *DB) MarkTaskStarted(ctx context.Context, id uuid.UUID, attempt int, workerID int64) (bool, error) {
-	result, err := db.q.ExecContext(ctx,
+	query, args := db.fence(
 		`UPDATE tasks SET status = 'STARTED', started_at = NOW(), worker_id = $2
-		 WHERE id = $1 AND status = 'QUEUED' AND picked_at IS NOT NULL AND attempt = $3`,
+		 WHERE id = $1 AND status = 'QUEUED' AND picked_at IS NOT NULL AND attempt = $3 `+fenceMarker,
 		id, workerID, attempt,
 	)
+	result, err := db.q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("failed to mark task started: %w", err)
 	}
-	return rowsChanged(result)
+	changed, err := rowsChanged(result)
+	if err == nil && !changed {
+		err = db.unchanged(ctx)
+	}
+	return changed, err
 }
 
 // TaskResult is returned by the terminal transitions: whether the task was
@@ -452,25 +461,36 @@ func (db *DB) finish(ctx context.Context, query string, args ...any) (TaskResult
 	return r, nil
 }
 
-func (db *DB) MarkTaskCompleted(ctx context.Context, id uuid.UUID, attempt int, output string, outputs StringMap) (TaskResult, error) {
-	r, err := db.finish(ctx,
-		`UPDATE tasks SET status = 'COMPLETED', completed_at = NOW(), output = $2, outputs = $3, error_message = NULL
-		 WHERE id = $1 AND `+dispatchedCondition+` AND attempt = $4
+// finishColumns fill in what the STARTED transition records, for a task
+// whose result arrived before the coordinator marked it started. $5 is the
+// worker ID (0 when unknown).
+const finishColumns = `started_at = COALESCE(started_at, picked_at), worker_id = COALESCE(NULLIF($5, 0), worker_id)`
+
+func (db *DB) MarkTaskCompleted(ctx context.Context, id uuid.UUID, attempt int, workerID int64, output string, outputs StringMap) (TaskResult, error) {
+	query, args := db.fence(
+		`UPDATE tasks SET status = 'COMPLETED', completed_at = NOW(), output = $2, outputs = $3, error_message = NULL,
+		     `+finishColumns+`
+		 WHERE id = $1 AND `+dispatchedCondition+` AND attempt = $4 `+fenceMarker+`
 		 RETURNING workflow_id`,
-		id, output, outputs, attempt,
+		id, output, outputs, attempt, workerID,
 	)
+	r, err := db.finish(ctx, query, args...)
+	if err == nil && !r.Updated {
+		err = db.unchanged(ctx)
+	}
 	if err != nil {
 		return r, fmt.Errorf("failed to mark task completed: %w", err)
 	}
 	return r, nil
 }
 
-func (db *DB) MarkTaskFailed(ctx context.Context, id uuid.UUID, attempt int, output, errorMessage string) (TaskResult, error) {
+func (db *DB) MarkTaskFailed(ctx context.Context, id uuid.UUID, attempt int, workerID int64, output, errorMessage string) (TaskResult, error) {
 	r, err := db.finish(ctx,
-		`UPDATE tasks SET status = 'FAILED', failed_at = NOW(), output = $2, error_message = $3
+		`UPDATE tasks SET status = 'FAILED', failed_at = NOW(), output = $2, error_message = $3,
+		     `+finishColumns+`
 		 WHERE id = $1 AND `+dispatchedCondition+` AND attempt = $4
 		 RETURNING workflow_id`,
-		id, output, errorMessage, attempt,
+		id, output, errorMessage, attempt, workerID,
 	)
 	if err != nil {
 		return r, fmt.Errorf("failed to mark task failed: %w", err)

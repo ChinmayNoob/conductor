@@ -1,11 +1,17 @@
-// Command conductor-bench measures a running Conductor cluster: task
-// throughput, dispatch and end-to-end latency, and workflow latency.
+// Command conductor-bench measures a running Conductor cluster:
 //
-// It submits work through the HTTP API like any client, then reads the
-// timestamps Postgres recorded (all from the database clock) to compute
-// percentiles.
+//   - ingest: how fast the API accepts tasks
+//   - drain: how fast the cluster works through a backlog (tasks are
+//     submitted to a paused queue, which is then resumed)
+//   - latency: dispatch and end-to-end latency at a steady load (a fraction
+//     of the measured drain rate), and on an idle cluster
+//   - workflows: end-to-end time of a four-step diamond workflow
 //
-//	go run ./cmd/conductor-bench -tasks 2000 -workflows 100 -dsn postgres://...
+// Every task is a no-op shell command, so the numbers measure Conductor's
+// own overhead. It submits work through the HTTP API like any client, then
+// reads the timestamps Postgres recorded (all from the database clock).
+//
+//	go run ./cmd/conductor-bench -tasks 4000 -workflows 100 -dsn postgres://...
 package main
 
 import (
@@ -29,25 +35,29 @@ type Result struct {
 	Workers           int     `json:"workers"`
 	Slots             int     `json:"slots"`
 	Tasks             int     `json:"tasks"`
-	SubmitPerSec      float64 `json:"submit_per_sec"`
-	ThroughputPerSec  float64 `json:"throughput_per_sec"`
+	IngestPerSec      float64 `json:"ingest_per_sec"`
+	DrainPerSec       float64 `json:"drain_per_sec"`
+	LoadPerSec        float64 `json:"load_per_sec"`
 	DispatchP50Ms     float64 `json:"dispatch_p50_ms"`
 	DispatchP95Ms     float64 `json:"dispatch_p95_ms"`
 	DispatchP99Ms     float64 `json:"dispatch_p99_ms"`
 	EndToEndP50Ms     float64 `json:"end_to_end_p50_ms"`
 	EndToEndP99Ms     float64 `json:"end_to_end_p99_ms"`
+	IdleDispatchP50Ms float64 `json:"idle_dispatch_p50_ms"`
+	IdleDispatchP99Ms float64 `json:"idle_dispatch_p99_ms"`
 	Workflows         int     `json:"workflows"`
 	WorkflowP50Ms     float64 `json:"workflow_p50_ms"`
 	WorkflowP99Ms     float64 `json:"workflow_p99_ms"`
 	WorkflowsPerSec   float64 `json:"workflows_per_sec"`
-	IdleDispatchP50Ms float64 `json:"idle_dispatch_p50_ms"`
 }
 
 func main() {
 	url := flag.String("url", "http://localhost:8081", "API URL")
 	key := flag.String("key", os.Getenv("CONDUCTOR_API_KEY"), "admin API key")
 	dsn := flag.String("dsn", "postgres://postgres:postgres@localhost:5433/taskscheduler?sslmode=disable&timezone=UTC", "Postgres DSN, for timings")
-	tasks := flag.Int("tasks", 1000, "tasks to submit in the throughput run")
+	tasks := flag.Int("tasks", 4000, "tasks in the drain run")
+	loadFraction := flag.Float64("load", 0.5, "steady load as a fraction of the drain rate")
+	loadSeconds := flag.Int("load-seconds", 10, "length of the steady-load run")
 	workflows := flag.Int("workflows", 50, "workflow runs to start")
 	concurrency := flag.Int("concurrency", 32, "parallel submitters")
 	label := flag.String("label", "", "label for this run")
@@ -73,28 +83,46 @@ func main() {
 
 	// 1. Idle dispatch latency: one task at a time on an idle cluster.
 	queue := fmt.Sprintf("bench-idle-%d", time.Now().UnixNano())
-	for range 20 {
+	for range 30 {
 		t, err := c.SubmitTask(ctx, client.TaskRequest{Command: "true", Queue: queue})
 		must(err)
 		_, err = c.WaitForTask(ctx, t.ID)
 		must(err)
 	}
 	idle := durations(db, queue, "picked_at", "created_at")
-	res.IdleDispatchP50Ms = pct(idle, 50)
+	res.IdleDispatchP50Ms, res.IdleDispatchP99Ms = pct(idle, 50), pct(idle, 99)
 
-	// 2. Throughput: submit everything at once and drain it.
-	queue = fmt.Sprintf("bench-%d", time.Now().UnixNano())
+	// 2. Ingest and drain: fill a paused queue, then resume it.
+	queue = fmt.Sprintf("bench-drain-%d", time.Now().UnixNano())
+	_, err = c.PutQueue(ctx, queue, client.QueueSettings{Paused: true})
+	must(err)
 	start := time.Now()
 	parallel(*tasks, *concurrency, func(int) {
 		_, err := c.SubmitTask(ctx, client.TaskRequest{Command: "true", Queue: queue, MaxRetries: client.Retries(0)})
 		must(err)
 	})
-	res.SubmitPerSec = float64(*tasks) / time.Since(start).Seconds()
+	res.IngestPerSec = float64(*tasks) / time.Since(start).Seconds()
+	resumed, err := c.PutQueue(ctx, queue, client.QueueSettings{Paused: false})
+	must(err)
 	waitDone(db, `SELECT count(*) FROM tasks WHERE queue = $1 AND status NOT IN ('COMPLETED','FAILED','CANCELLED')`, queue)
-
 	var span float64
-	must(db.QueryRow(`SELECT EXTRACT(EPOCH FROM max(completed_at) - min(created_at)) FROM tasks WHERE queue = $1`, queue).Scan(&span))
-	res.ThroughputPerSec = float64(*tasks) / span
+	must(db.QueryRow(`SELECT EXTRACT(EPOCH FROM max(completed_at) - $2) FROM tasks WHERE queue = $1`,
+		queue, resumed.UpdatedAt).Scan(&span))
+	res.DrainPerSec = float64(*tasks) / span
+	must(c.DeleteQueue(ctx, queue))
+
+	// 3. Latency under a steady load, submitted at a fixed rate (open loop).
+	rate := res.DrainPerSec * *loadFraction
+	n := int(rate * float64(*loadSeconds))
+	queue = fmt.Sprintf("bench-load-%d", time.Now().UnixNano())
+	start = time.Now()
+	parallel(n, *concurrency, func(i int) {
+		time.Sleep(time.Until(start.Add(time.Duration(float64(i) / rate * float64(time.Second)))))
+		_, err := c.SubmitTask(ctx, client.TaskRequest{Command: "true", Queue: queue, MaxRetries: client.Retries(0)})
+		must(err)
+	})
+	res.LoadPerSec = float64(n) / time.Since(start).Seconds()
+	waitDone(db, `SELECT count(*) FROM tasks WHERE queue = $1 AND status NOT IN ('COMPLETED','FAILED','CANCELLED')`, queue)
 	dispatch := durations(db, queue, "picked_at", "created_at")
 	e2e := durations(db, queue, "completed_at", "created_at")
 	res.DispatchP50Ms, res.DispatchP95Ms, res.DispatchP99Ms = pct(dispatch, 50), pct(dispatch, 95), pct(dispatch, 99)

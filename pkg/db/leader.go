@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -116,12 +117,45 @@ func (db *DB) CheckEpoch(ctx context.Context, epoch int64) error {
 // WithFencedTx runs fn in a transaction that only commits if this
 // coordinator is still the leader for epoch.
 func (db *DB) WithFencedTx(ctx context.Context, epoch int64, fn func(tx *DB) error) error {
-	return db.WithTx(ctx, func(tx *DB) error {
-		if err := tx.CheckEpoch(ctx, epoch); err != nil {
-			return err
-		}
-		return fn(tx)
-	})
+	return db.Fenced(epoch).WithTx(ctx, fn)
+}
+
+// Fenced returns a handle whose writes only apply while epoch is the current
+// leader epoch. Transactions check it once up front (WithTx). The hot
+// single-statement task transitions (PickTasks, MarkTaskStarted,
+// MarkTaskCompleted) instead carry the check inside the statement, which
+// saves three round trips: the statement takes the same share lock on the
+// leader row as a fenced transaction, so the new leader's epoch bump waits
+// for it just the same. When such a statement changes nothing, it returns
+// ErrFenced if the epoch has moved on.
+func (db *DB) Fenced(epoch int64) *DB {
+	f := *db
+	f.epoch = epoch
+	return &f
+}
+
+// fenceMarker marks where a statement takes its epoch check.
+const fenceMarker = "/*fence*/"
+
+// fence fills in a statement's fence: on a Fenced handle, a condition that
+// holds only while the epoch is current; otherwise nothing. The subquery is
+// uncorrelated, so Postgres evaluates it once, before touching any row.
+func (db *DB) fence(query string, args ...any) (string, []any) {
+	cond := ""
+	if db.epoch != 0 {
+		args = append(args, db.epoch)
+		cond = fmt.Sprintf("AND EXISTS (SELECT 1 FROM coordinator_leader WHERE id = 1 AND epoch = $%d FOR SHARE)", len(args))
+	}
+	return strings.Replace(query, fenceMarker, cond, 1), args
+}
+
+// unchanged explains a fenced statement that changed no rows: ErrFenced if
+// the epoch moved on, nil if the rows simply didn't qualify.
+func (db *DB) unchanged(ctx context.Context) error {
+	if db.epoch == 0 {
+		return nil
+	}
+	return db.CheckEpoch(ctx, db.epoch)
 }
 
 type CoordinatorRecord struct {

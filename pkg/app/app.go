@@ -25,7 +25,7 @@ import (
 
 // RunCoordinator serves the coordinator's gRPC API and dispatches tasks.
 func RunCoordinator(ctx context.Context, cfg *config.Config) error {
-	database, err := openDB(ctx, cfg)
+	database, err := openDB(ctx, db.WithLocalWake(cfg.DB.DSN()))
 	if err != nil {
 		return err
 	}
@@ -81,7 +81,7 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 
 // RunAPI serves the HTTP API.
 func RunAPI(ctx context.Context, cfg *config.Config) error {
-	database, err := openDB(ctx, cfg)
+	database, err := openDB(ctx, cfg.DB.DSN())
 	if err != nil {
 		return err
 	}
@@ -211,7 +211,7 @@ func RunDev(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// Migrate once up front so the components don't race to do it.
-	database, err := openDB(ctx, cfg)
+	database, err := openDB(ctx, cfg.DB.DSN())
 	if err != nil {
 		return err
 	}
@@ -241,10 +241,10 @@ func RunDev(ctx context.Context, cfg *config.Config) error {
 	return firstErr
 }
 
-func openDB(ctx context.Context, cfg *config.Config) (*db.DB, error) {
+func openDB(ctx context.Context, dsn string) (*db.DB, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	database, err := db.Open(connectCtx, cfg.DB.DSN())
+	database, err := db.Open(connectCtx, dsn)
 	if err != nil {
 		return nil, err
 	}

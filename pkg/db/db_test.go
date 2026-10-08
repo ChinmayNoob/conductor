@@ -23,6 +23,21 @@ import (
 //	CONDUCTOR_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable
 func testDB(t *testing.T) *DB {
 	t.Helper()
+	db, err := Open(context.Background(), testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// testDSN creates an empty database that is dropped after the test, and
+// returns its connection string.
+func testDSN(t *testing.T) string {
+	t.Helper()
 	base := os.Getenv("CONDUCTOR_TEST_DATABASE_URL")
 	if base == "" {
 		t.Skip("CONDUCTOR_TEST_DATABASE_URL not set")
@@ -48,15 +63,7 @@ func testDB(t *testing.T) *DB {
 		t.Fatal(err)
 	}
 	u.Path = "/" + name
-	db, err := Open(ctx, u.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatal(err)
-	}
-	return db
+	return u.String()
 }
 
 func must[T any](t *testing.T) func(T, error) T {
@@ -158,7 +165,7 @@ func TestTaskLifecycle(t *testing.T) {
 	if !must[bool](t)(db.MarkTaskStarted(ctx, task.ID, att(t, db, task.ID), 42)) {
 		t.Fatal("MarkTaskStarted did not update")
 	}
-	if r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, att(t, db, task.ID), "hi\n", StringMap{"k": "v"})); !r.Updated {
+	if r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, att(t, db, task.ID), 0, "hi\n", StringMap{"k": "v"})); !r.Updated {
 		t.Fatal("MarkTaskCompleted did not update")
 	}
 
@@ -169,7 +176,7 @@ func TestTaskLifecycle(t *testing.T) {
 	}
 
 	// Late or duplicate reports must not change a finished task.
-	if must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), "", "late failure")).Updated {
+	if must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), 0, "", "late failure")).Updated {
 		t.Fatal("a late failure report changed a completed task")
 	}
 	if must[bool](t)(db.RetryTask(ctx, task.ID, att(t, db, task.ID), "", "late failure")) {
@@ -455,7 +462,7 @@ func TestCancelTask(t *testing.T) {
 		t.Fatalf("CancelTask returned %+v, want the started task", before)
 	}
 	// The killed process's failure report must not resurrect the task.
-	if must[bool](t)(db.RetryTask(ctx, running.ID, att(t, db, running.ID), "", "killed")) || must[TaskResult](t)(db.MarkTaskFailed(ctx, running.ID, att(t, db, running.ID), "", "killed")).Updated {
+	if must[bool](t)(db.RetryTask(ctx, running.ID, att(t, db, running.ID), "", "killed")) || must[TaskResult](t)(db.MarkTaskFailed(ctx, running.ID, att(t, db, running.ID), 0, "", "killed")).Updated {
 		t.Fatal("a report from the killed process changed the cancelled task")
 	}
 }
@@ -466,7 +473,7 @@ func TestDeadLetterAndRequeue(t *testing.T) {
 
 	task := create(t, db, "doomed", func(n *NewTask) { n.MaxRetries = 0 })
 	pick(t, db)
-	must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), "", "boom"))
+	must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), 0, "", "boom"))
 
 	dead := must[[]*Task](t)(db.ListTasks(ctx, TaskFilter{Namespace: "default", DeadLetter: true, Limit: 10}))
 	if len(dead) != 1 || dead[0].ID != task.ID {
@@ -576,7 +583,7 @@ func TestWorkflowRunAndStepStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	pick(t, db)
-	r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, att(t, db, task.ID), "", StringMap{"out": "x"}))
+	r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, task.ID, att(t, db, task.ID), 0, "", StringMap{"out": "x"}))
 	if r.WorkflowID == nil || *r.WorkflowID != wf.ID {
 		t.Fatal("MarkTaskCompleted did not report the task's workflow")
 	}

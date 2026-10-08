@@ -7,12 +7,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/app"
 	"github.com/ChinmayNoob/conductor/pkg/config"
+	"github.com/ChinmayNoob/conductor/pkg/llm"
 	"github.com/ChinmayNoob/conductor/pkg/logging"
 	"github.com/ChinmayNoob/conductor/pkg/security"
 	_ "time/tzdata" // schedules may use any time zone, even without OS tz data
@@ -28,6 +31,7 @@ Commands:
   coordinator   Dispatch tasks to workers and drive workflows (gRPC, default :8080)
   api           Serve the HTTP API (default :8081)
   worker        Execute tasks (gRPC, default :9000)
+  mock-llm      Serve a scripted stand-in for a language model (for tests and demos, default :8090)
   version       Print the version
 
 Configuration is read from environment variables; see .env.example.
@@ -53,6 +57,9 @@ func main() {
 		return
 	case "help", "-h", "--help":
 		fmt.Print(usage)
+		return
+	case "mock-llm":
+		runMockLLM()
 		return
 	}
 	run, ok := runners[cmd]
@@ -92,5 +99,26 @@ func devDefaults() {
 	}
 	if os.Getenv("CONDUCTOR_API_KEY") == "" {
 		_ = os.Setenv("CONDUCTOR_API_KEY", config.DevPrefix+"api-key")
+	}
+}
+
+// runMockLLM serves llm.Mock on CONDUCTOR_MOCK_LLM_LISTEN (default :8090),
+// an OpenAI-compatible endpoint at /v1. It needs no other configuration.
+func runMockLLM() {
+	addr := os.Getenv("CONDUCTOR_MOCK_LLM_LISTEN")
+	if addr == "" {
+		addr = ":8090"
+	}
+	slog.Info("Mock language model listening", "addr", addr, "base_url", "http://<host>"+addr+"/v1")
+	srv := &http.Server{Addr: addr, Handler: llm.NewMock(), ReadHeaderTimeout: 10 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Shutdown(context.Background())
+	}()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Error("Mock language model stopped", "error", err)
+		os.Exit(1)
 	}
 }

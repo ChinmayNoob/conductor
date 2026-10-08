@@ -769,9 +769,7 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 			}
 			if r.Updated {
 				log.Info("Task completed")
-				if r.WorkflowID != nil {
-					s.reconcile(ctx, *r.WorkflowID)
-				}
+				s.afterTask(ctx, r)
 			} else {
 				log.Info("Ignoring COMPLETE report: not the current attempt")
 			}
@@ -828,9 +826,7 @@ func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, d 
 	}
 	observeResult(d, "failed")
 	log.Error("Task failed permanently", "error", errMsg)
-	if r.WorkflowID != nil {
-		s.reconcile(ctx, *r.WorkflowID)
-	}
+	s.afterTask(ctx, r)
 	return false, nil
 }
 
@@ -862,4 +858,15 @@ func (s *Server) llmBudgetError(ctx context.Context, q *db.DB, namespace string)
 			namespace, spend.CostUSD, *n.MaxLLMCostPerDay), nil
 	}
 	return "", nil
+}
+
+// afterTask moves on whatever a finished task belonged to: an agent run
+// (which reconciles its workflow when it ends) or a workflow run.
+func (s *Server) afterTask(ctx context.Context, r db.TaskResult) {
+	switch {
+	case r.AgentRunID != nil:
+		s.advanceAgent(ctx, *r.AgentRunID)
+	case r.WorkflowID != nil:
+		s.reconcile(ctx, *r.WorkflowID)
+	}
 }

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ChinmayNoob/conductor/pkg/llm"
 	"regexp"
 	"slices"
 	"strings"
@@ -39,6 +40,8 @@ const (
 	// Waiting steps run no task: they wait for a person or a signal.
 	TypeApproval = "approval"
 	TypeSignal   = "signal"
+	// An agent step runs a model with tools in a loop, each call a task.
+	TypeAgent = "agent"
 )
 
 var (
@@ -82,6 +85,7 @@ type Action struct {
 	LLM       *LLMSpec          `yaml:"llm,omitempty" json:"llm,omitempty"`
 	Approval  *ApprovalSpec     `yaml:"approval,omitempty" json:"approval,omitempty"`
 	Signal    *SignalSpec       `yaml:"signal,omitempty" json:"signal,omitempty"`
+	Agent     *AgentSpec        `yaml:"agent,omitempty" json:"agent,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 }
 
@@ -116,7 +120,50 @@ type LLMSpec struct {
 	Schema      map[string]any `yaml:"schema,omitempty" json:"schema,omitempty"`
 	MaxTokens   int            `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
 	Temperature *float64       `yaml:"temperature,omitempty" json:"temperature,omitempty"`
+
+	// Set by the agent engine, not by definitions: the whole conversation
+	// (instead of System and Prompt) and the tools the model may call.
+	Messages []llm.Message `yaml:"-" json:"messages,omitempty"`
+	Tools    []llm.Tool    `yaml:"-" json:"tools,omitempty"`
 }
+
+// AgentSpec is a model that calls tools in a loop until it answers. Every
+// model call and every tool call is its own task, so a crash resumes from
+// the last finished call instead of starting over. The answer is the step's
+// "answer" output.
+type AgentSpec struct {
+	Model       string      `yaml:"model,omitempty" json:"model,omitempty"`
+	System      string      `yaml:"system,omitempty" json:"system,omitempty"`
+	Prompt      string      `yaml:"prompt" json:"prompt"`
+	Tools       []AgentTool `yaml:"tools,omitempty" json:"tools,omitempty"`
+	MaxTokens   int         `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"` // per model call
+	Temperature *float64    `yaml:"temperature,omitempty" json:"temperature,omitempty"`
+	// Limits on the whole run.
+	MaxTurns     int      `yaml:"max_turns,omitempty" json:"max_turns,omitempty"`           // model calls (default 10)
+	MaxToolCalls int      `yaml:"max_tool_calls,omitempty" json:"max_tool_calls,omitempty"` // default 50
+	MaxDuration  Duration `yaml:"max_duration,omitempty" json:"max_duration,omitempty"`     // default 15m
+	Budget       *Budget  `yaml:"budget,omitempty" json:"budget,omitempty"`
+}
+
+// AgentTool is a tool the model may call: a shell command. The model's
+// arguments arrive as environment variables, never in the command line:
+// $TOOL_ARGS holds them as JSON, and each top-level argument is also
+// $ARG_<NAME>. The command's output is what the model sees.
+type AgentTool struct {
+	Name        string         `yaml:"name" json:"name"`
+	Description string         `yaml:"description,omitempty" json:"description,omitempty"`
+	Parameters  map[string]any `yaml:"parameters,omitempty" json:"parameters,omitempty"` // a JSON Schema object
+	Run         string         `yaml:"run" json:"run"`
+	Timeout     Duration       `yaml:"timeout,omitempty" json:"timeout,omitempty"` // default 2m
+}
+
+// Agent defaults.
+const (
+	DefaultAgentTurns     = 10
+	DefaultAgentToolCalls = 50
+	DefaultAgentDuration  = 15 * time.Minute
+	DefaultToolTimeout    = 2 * time.Minute
+)
 
 // Budget caps what a workflow run may spend on language models. Once a run
 // goes over, it fails and compensates like any failed run.
@@ -452,8 +499,21 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 		if a.Signal.Timeout < 0 {
 			add("signal.timeout must not be negative")
 		}
+	case TypeAgent:
+		if a.Agent == nil || strings.TrimSpace(a.Agent.Prompt) == "" {
+			add("agent steps need 'agent.prompt'")
+			break
+		}
+		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Approval != nil || a.Signal != nil {
+			add("agent steps cannot have 'run', 'http', 'container', 'llm', 'approval' or 'signal'")
+		}
+		if err := validateAgent(a.Agent); err != nil {
+			add("%v", err)
+		}
+		checkExpr("agent.prompt", a.Agent.Prompt)
+		checkExpr("agent.system", a.Agent.System)
 	default:
-		add("unknown type %q (want shell, http, container, llm, approval or signal)", a.Type)
+		add("unknown type %q (want shell, http, container, llm, approval, signal or agent)", a.Type)
 	}
 
 	for k, v := range a.Env {
@@ -570,3 +630,42 @@ var signalNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
 
 // IsWait reports whether a step type waits instead of running a task.
 func IsWait(stepType string) bool { return stepType == TypeApproval || stepType == TypeSignal }
+
+var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func validateAgent(a *AgentSpec) error {
+	var errs []error
+	add := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+	seen := map[string]bool{}
+	for i, t := range a.Tools {
+		where := fmt.Sprintf("agent.tools[%d]", i)
+		switch {
+		case !toolNameRe.MatchString(t.Name):
+			add("%s: name must be 1-64 letters, digits, '_' or '-'", where)
+		case seen[t.Name]:
+			add("%s: duplicate tool %q", where, t.Name)
+		}
+		seen[t.Name] = true
+		if strings.TrimSpace(t.Run) == "" {
+			add("%s: 'run' is required", where)
+		}
+		if strings.Contains(t.Run, "${{") {
+			add("%s: 'run' cannot contain ${{ }} expressions; the model's arguments arrive as $ARG_<NAME> and $TOOL_ARGS", where)
+		}
+		if t.Parameters != nil {
+			if typ, _ := t.Parameters["type"].(string); typ != "object" {
+				add("%s: parameters must be a JSON Schema with type: object", where)
+			}
+		}
+	}
+	if a.MaxTurns < 0 || a.MaxTurns > 100 {
+		add("agent.max_turns must be between 1 and 100")
+	}
+	if a.MaxToolCalls < 0 || a.MaxDuration < 0 || a.MaxTokens < 0 {
+		add("agent limits must not be negative")
+	}
+	if a.Temperature != nil && (*a.Temperature < 0 || *a.Temperature > 2) {
+		add("agent.temperature must be between 0 and 2")
+	}
+	return joinErrors(errs)
+}

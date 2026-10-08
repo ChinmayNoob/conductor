@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
@@ -30,11 +31,17 @@ func (s *Server) runLLM(ctx context.Context, specJSON []byte, timeout time.Durat
 	if err := json.Unmarshal(specJSON, &spec); err != nil {
 		return result{}, permanent(fmt.Errorf("invalid llm spec: %w", err))
 	}
-	req := llm.Request{Model: spec.Model, MaxTokens: spec.MaxTokens, Temperature: spec.Temperature}
-	if spec.System != "" {
-		req.Messages = append(req.Messages, llm.Message{Role: "system", Content: spec.System})
+	req := llm.Request{Model: spec.Model, MaxTokens: spec.MaxTokens, Temperature: spec.Temperature, Tools: spec.Tools}
+	agentTurn := len(spec.Messages) > 0
+	switch {
+	case agentTurn:
+		req.Messages = spec.Messages
+	default:
+		if spec.System != "" {
+			req.Messages = append(req.Messages, llm.Message{Role: "system", Content: spec.System})
+		}
+		req.Messages = append(req.Messages, llm.Message{Role: "user", Content: spec.Prompt})
 	}
-	req.Messages = append(req.Messages, llm.Message{Role: "user", Content: spec.Prompt})
 	if spec.Schema != nil {
 		schema, err := json.Marshal(spec.Schema)
 		if err != nil {
@@ -51,6 +58,23 @@ func (s *Server) runLLM(ctx context.Context, specJSON []byte, timeout time.Durat
 	}
 
 	res := result{output: resp.Message.Content, usage: s.usage(resp, req.Model)}
+	if agentTurn {
+		// An agent's turn: hand the whole reply, tool calls included, back
+		// to the agent engine.
+		msg, err := json.Marshal(resp.Message)
+		if err != nil {
+			return res, err
+		}
+		res.outputs = map[string]string{"message": string(msg)}
+		if res.output == "" && len(resp.Message.ToolCalls) > 0 {
+			names := make([]string, len(resp.Message.ToolCalls))
+			for i, c := range resp.Message.ToolCalls {
+				names[i] = c.Name
+			}
+			res.output = "calling " + strings.Join(names, ", ")
+		}
+		return res, nil
+	}
 	if spec.Schema == nil {
 		res.outputs = map[string]string{"text": truncate(resp.Message.Content, maxOutputsBytes)}
 		return res, nil

@@ -226,6 +226,14 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					}
 					continue
 				}
+				if spec.Agent != nil {
+					if err := s.startAgent(ctx, tx, wf, step, spec); err != nil {
+						return err
+					}
+					createdTasks = true
+					log.Info("Workflow step started an agent", "step", name)
+					continue
+				}
 				if spec.Wait != nil {
 					if err := s.startWait(ctx, tx, wf, step, spec.Wait); err != nil {
 						return err
@@ -290,6 +298,14 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					if err := cancelWait(ctx, tx, step); err != nil {
 						return err
 					}
+					continue
+				}
+				if step.AgentRunID != nil {
+					kill, err := cancelAgent(ctx, tx, *step.AgentRunID)
+					if err != nil {
+						return err
+					}
+					toKill = append(toKill, kill...)
 					continue
 				}
 				if step.TaskID == nil {
@@ -391,6 +407,19 @@ func (s *Server) workflowSweepLoop(ctx context.Context) {
 					return
 				}
 				s.reconcile(ctx, id)
+			}
+			// Agent runs too: one may have missed a task's completion
+			// across a failover. Advancing is idempotent.
+			runs, err := s.db.RunningAgentRuns(ctx, 500)
+			if err != nil {
+				s.log.Error("Failed to list agent runs", "error", err)
+				continue
+			}
+			for _, id := range runs {
+				if ctx.Err() != nil {
+					return
+				}
+				s.advanceAgent(ctx, id)
 			}
 		}
 	}

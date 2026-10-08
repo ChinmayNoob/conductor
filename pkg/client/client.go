@@ -448,6 +448,7 @@ type WorkflowStep struct {
 	CompensationTaskID     string            `json:"compensation_task_id,omitempty"`
 	CompensationTaskStatus string            `json:"compensation_task_status,omitempty"`
 	Wait                   *StepWait         `json:"wait,omitempty"` // approval and signal steps
+	AgentRunID             string            `json:"agent_run_id,omitempty"`
 }
 
 // Step returns the step with this name, or nil.
@@ -809,4 +810,37 @@ func poll[T any](ctx context.Context, check func() (T, bool, error)) (T, error) 
 		case <-ticker.C:
 		}
 	}
+}
+
+// AgentRun is a durable agent's progress, conversation and calls.
+type AgentRun struct {
+	ID         string          `json:"id"`
+	WorkflowID string          `json:"workflow_id"`
+	Status     string          `json:"status"`
+	Turn       int             `json:"turn"`
+	Phase      string          `json:"phase"`
+	ToolCalls  int             `json:"tool_calls"`
+	Answer     string          `json:"answer"`
+	Error      string          `json:"error"`
+	Messages   json.RawMessage `json:"messages"`
+	Tasks      []AgentCall     `json:"tasks"`
+	LLMSpend   LLMSpend        `json:"llm_spend"`
+}
+
+// AgentCall is one model call (role llm) or tool call (role tool).
+type AgentCall struct {
+	TaskID     string `json:"task_id"`
+	Turn       int    `json:"turn"`
+	Role       string `json:"role"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Command    string `json:"command"`
+	Status     string `json:"status"`
+	Attempt    int    `json:"attempt"`
+}
+
+// GetAgentRun returns an agent run.
+func (c *Client) GetAgentRun(ctx context.Context, id string) (*AgentRun, error) {
+	var run AgentRun
+	_, err := c.do(ctx, http.MethodGet, "/v1/agent-runs/"+url.PathEscape(id), nil, &run)
+	return &run, err
 }

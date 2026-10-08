@@ -152,7 +152,8 @@ type TaskSpec struct {
 	HTTP       *HTTPSpec
 	Container  *ContainerSpec
 	LLM        *LLMSpec
-	Wait       *WaitSpec // approval and signal steps: no task
+	Wait       *WaitSpec  // approval and signal steps: no task
+	Agent      *AgentSpec // agent steps: a run of model and tool tasks
 	Env        map[string]string
 	Retries    int
 	RetryDelay time.Duration
@@ -305,6 +306,25 @@ func (d *Definition) resolve(s *Step, a Action, ownOutputs map[string]string, c 
 	case TypeSignal:
 		spec.Wait = &WaitSpec{Kind: TypeSignal, Signal: a.Signal.Name, Timeout: time.Duration(a.Signal.Timeout), OnTimeout: "fail"}
 		spec.Command = "signal: " + a.Signal.Name
+	case TypeAgent:
+		ag := *a.Agent
+		if ag.Prompt, err = c.Resolve(ag.Prompt); err != nil {
+			return nil, fmt.Errorf("agent.prompt: %w", err)
+		}
+		if ag.System, err = c.Resolve(ag.System); err != nil {
+			return nil, fmt.Errorf("agent.system: %w", err)
+		}
+		if ag.MaxTurns == 0 {
+			ag.MaxTurns = DefaultAgentTurns
+		}
+		if ag.MaxToolCalls == 0 {
+			ag.MaxToolCalls = DefaultAgentToolCalls
+		}
+		if ag.MaxDuration == 0 {
+			ag.MaxDuration = Duration(DefaultAgentDuration)
+		}
+		spec.Agent = &ag
+		spec.Command = "agent: " + LLMSummary(&LLMSpec{Model: ag.Model, Prompt: ag.Prompt})[len("llm "):]
 	}
 	return spec, nil
 }

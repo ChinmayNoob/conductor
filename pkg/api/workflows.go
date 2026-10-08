@@ -156,6 +156,7 @@ type stepJSON struct {
 	CompensationTaskID     *uuid.UUID        `json:"compensation_task_id,omitempty"`
 	CompensationTaskStatus string            `json:"compensation_task_status,omitempty"`
 	Wait                   *waitJSON         `json:"wait,omitempty"` // approval and signal steps
+	AgentRunID             *uuid.UUID        `json:"agent_run_id,omitempty"`
 }
 
 // waitJSON is what a waiting step waits for, and how it was decided.
@@ -185,7 +186,7 @@ func toWorkflowJSON(wf *db.Workflow, steps []*db.StepState) workflowJSON {
 			Name: st.Name, Status: st.Status, DependsOn: deps[st.Name], TaskID: st.TaskID,
 			TaskStatus: st.TaskStatus, Error: st.TaskError, Outputs: st.Outputs,
 			CompensationTaskID: st.CompensationTaskID, CompensationTaskStatus: st.CompensationStatus,
-			Wait: waitOf(st),
+			Wait: waitOf(st), AgentRunID: st.AgentRunID,
 		})
 	}
 	return out
@@ -385,4 +386,53 @@ func keyName(r *http.Request) string {
 		return k.Name
 	}
 	return ""
+}
+
+// handleGetAgentRun shows an agent run: its progress, the conversation, and
+// every model and tool call it made (each a task).
+func (s *Server) handleGetAgentRun(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid agent run ID")
+		return
+	}
+	run, err := s.db.GetAgentRun(r.Context(), id)
+	if err != nil {
+		s.internalError(w, "Failed to get agent run", err)
+		return
+	}
+	if run == nil || run.Namespace != namespace(r) {
+		writeError(w, http.StatusNotFound, "agent run not found")
+		return
+	}
+	tasks, err := s.db.AgentTasks(r.Context(), id, 0)
+	if err != nil {
+		s.internalError(w, "Failed to list agent tasks", err)
+		return
+	}
+	spend, err := s.db.AgentRunSpend(r.Context(), id)
+	if err != nil {
+		s.internalError(w, "Failed to sum agent spend", err)
+		return
+	}
+	type callJSON struct {
+		TaskID     uuid.UUID     `json:"task_id"`
+		Turn       int           `json:"turn"`
+		Role       string        `json:"role"` // llm or tool
+		ToolCallID string        `json:"tool_call_id,omitempty"`
+		Command    string        `json:"command"`
+		Status     db.TaskStatus `json:"status"`
+		Attempt    int           `json:"attempt"`
+	}
+	calls := make([]callJSON, 0, len(tasks))
+	for _, t := range tasks {
+		calls = append(calls, callJSON{TaskID: t.ID, Turn: t.AgentTurn, Role: t.AgentRole, ToolCallID: t.ToolCallID,
+			Command: t.Data, Status: t.Status, Attempt: t.Attempt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": run.ID, "workflow_id": run.WorkflowID, "status": run.Status, "turn": run.Turn, "phase": run.Phase,
+		"tool_calls": run.ToolCalls, "answer": run.Answer, "error": run.Error, "deadline": run.Deadline,
+		"messages": run.Messages, "tasks": calls, "llm_spend": spendJSON{Tokens: spend.Tokens, CostUSD: spend.CostUSD},
+		"created_at": run.CreatedAt, "updated_at": run.UpdatedAt,
+	})
 }

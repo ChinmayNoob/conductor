@@ -12,9 +12,13 @@ import (
 	"github.com/ChinmayNoob/conductor/examples"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/task"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/ChinmayNoob/conductor/pkg/workflow"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -65,6 +69,9 @@ func (s *Server) startWorkflow(ctx context.Context, q *db.DB, ns, name string, v
 	for i, st := range def.Steps {
 		names[i] = st.Name
 	}
+	// Every step's spans join this one's trace.
+	ctx, span := tracing.Start(ctx, "workflow "+name, trace.WithAttributes(attribute.String("conductor.workflow", name)))
+	defer span.End()
 	wf, created, err := q.CreateWorkflow(ctx, db.NewWorkflow{
 		Namespace:         ns,
 		Name:              name,
@@ -73,6 +80,7 @@ func (s *Server) startWorkflow(ctx context.Context, q *db.DB, ns, name string, v
 		Input:             normalized,
 		Steps:             names,
 		IdempotencyKey:    idemKey,
+		TraceParent:       tracing.TraceParent(ctx),
 	})
 	if err != nil {
 		s.log.Error("Failed to create workflow", "name", name, "error", err)
@@ -119,12 +127,17 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 	log := s.log.With("workflow_id", wfID)
 	var toKill []uuid.UUID
 	createdTasks := false
+	var finished db.WorkflowStatus // set when this pass ends the run
+	compensations := 0
+	namespace := ""
 
 	err := s.fenced(ctx, func(tx *db.DB) error {
 		wf, err := tx.LockWorkflow(ctx, wfID)
 		if err != nil || wf == nil || wf.Status.Terminal() {
 			return err
 		}
+		namespace = wf.Namespace
+		finished, compensations = "", 0 // a retried transaction starts over
 		if wf.Definition == nil {
 			log.Warn("Workflow predates workflow definitions and cannot continue")
 			return tx.UpdateWorkflowStatus(ctx, wf.ID, db.WorkflowFailed, "created by an older version without a definition")
@@ -180,6 +193,9 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					return err
 				}
 				wf.Status, wf.ErrorMessage = db.WorkflowStatus(plan.SetStatus), errMsg
+				if wf.Status.Terminal() {
+					finished = wf.Status
+				}
 				log.Info("Workflow status changed", "status", plan.SetStatus, "error", errMsg)
 			}
 
@@ -229,6 +245,7 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					return err
 				}
 				createdTasks = true
+				compensations++
 				log.Info("Compensating workflow step", "step", name, "task_id", t.ID)
 			}
 
@@ -264,6 +281,10 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 		return
 	}
 
+	if finished != "" {
+		metrics.WorkflowsFinished.WithLabelValues(namespace, string(finished)).Inc()
+	}
+	metrics.StepsCompensated.Add(float64(compensations))
 	for _, id := range toKill {
 		s.killOnWorker(ctx, id)
 	}
@@ -286,6 +307,7 @@ func (s *Server) createStepTask(ctx context.Context, tx *db.DB, wf *db.Workflow,
 		RetryDelaySeconds: max(1, int(math.Ceil(spec.RetryDelay.Seconds()))),
 		TimeoutSeconds:    max(1, int(math.Ceil(spec.Timeout.Seconds()))),
 		WorkflowID:        &wf.ID,
+		TraceParent:       wf.TraceParent,
 	}
 	var detail any
 	switch {

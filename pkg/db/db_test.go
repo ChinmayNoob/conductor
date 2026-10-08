@@ -660,3 +660,59 @@ func TestAPIKeys(t *testing.T) {
 		t.Fatal("a revoked key still authenticates")
 	}
 }
+
+func TestQueueDepths(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "held", Paused: true}))
+	create(t, db, "ready")
+	create(t, db, "ready too")
+	create(t, db, "later", func(n *NewTask) { n.ScheduledAt = time.Now().Add(time.Hour) })
+	create(t, db, "held", func(n *NewTask) { n.Queue = "held" })
+	pick(t, db) // one ready task starts running
+
+	got := map[string]QueueDepth{}
+	for _, d := range must[[]QueueDepth](t)(db.QueueDepths(ctx)) {
+		got[d.Queue] = d
+	}
+	def, held := got["default"], got["held"]
+	if def.Ready != 1 || def.Delayed != 1 || def.Running != 1 || def.Paused != 0 || def.OldestReady == nil {
+		t.Errorf("default queue = %+v, want 1 ready (with an age), 1 delayed, 1 running", def)
+	}
+	if held.Paused != 1 || held.Ready != 0 || held.OldestReady != nil {
+		t.Errorf("paused queue = %+v, want its task counted as paused, not ready", held)
+	}
+}
+
+func TestAttemptHistory(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	task := create(t, db, "flaky", func(n *NewTask) { n.MaxRetries = 1; n.RetryDelaySeconds = 0 })
+
+	// Attempt 1 fails and is retried: it moves to the history.
+	pick(t, db)
+	must[bool](t)(db.MarkTaskStarted(ctx, task.ID, 1, 7))
+	if !must[bool](t)(db.RetryTask(ctx, task.ID, 1, "out 1", "boom 1")) {
+		t.Fatal("not retried")
+	}
+	// Attempt 2 fails for good: it stays on the task row.
+	exec(t, db, `UPDATE tasks SET scheduled_at = NOW() - INTERVAL '1 second' WHERE id = $1`, task.ID)
+	pick(t, db)
+	if must[bool](t)(db.RetryTask(ctx, task.ID, 2, "out 2", "boom 2")) {
+		t.Fatal("retried past max_retries")
+	}
+	must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, 2, 8, "out 2", "boom 2"))
+
+	got := must[[]AttemptRecord](t)(db.ListAttempts(ctx, task.ID))
+	if len(got) != 1 || got[0].Attempt != 1 || got[0].ErrorMessage != "boom 1" || got[0].Output != "out 1" ||
+		got[0].WorkerID == nil || *got[0].WorkerID != 7 || got[0].StartedAt == nil {
+		t.Fatalf("history after retry = %+v", got)
+	}
+
+	// Requeueing the failed task keeps attempt 2 before resetting the row.
+	must[*Task](t)(db.RequeueFailedTask(ctx, task.ID))
+	got = must[[]AttemptRecord](t)(db.ListAttempts(ctx, task.ID))
+	if len(got) != 2 || got[1].Attempt != 2 || got[1].ErrorMessage != "boom 2" {
+		t.Fatalf("history after requeue = %+v", got)
+	}
+}

@@ -19,8 +19,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	WorkerService_SubmitTask_FullMethodName = "/grpcapi.WorkerService/SubmitTask"
-	WorkerService_CancelTask_FullMethodName = "/grpcapi.WorkerService/CancelTask"
+	WorkerService_SubmitTask_FullMethodName    = "/grpcapi.WorkerService/SubmitTask"
+	WorkerService_CancelTask_FullMethodName    = "/grpcapi.WorkerService/CancelTask"
+	WorkerService_GetTaskOutput_FullMethodName = "/grpcapi.WorkerService/GetTaskOutput"
 )
 
 // WorkerServiceClient is the client API for WorkerService service.
@@ -32,6 +33,8 @@ type WorkerServiceClient interface {
 	SubmitTask(ctx context.Context, in *TaskRequest, opts ...grpc.CallOption) (*TaskResponse, error)
 	// Kills the task if it is running on this worker.
 	CancelTask(ctx context.Context, in *CancelTaskRequest, opts ...grpc.CallOption) (*CancelTaskResponse, error)
+	// Returns a running task's output so far, from an offset.
+	GetTaskOutput(ctx context.Context, in *TaskOutputRequest, opts ...grpc.CallOption) (*TaskOutputResponse, error)
 }
 
 type workerServiceClient struct {
@@ -62,6 +65,16 @@ func (c *workerServiceClient) CancelTask(ctx context.Context, in *CancelTaskRequ
 	return out, nil
 }
 
+func (c *workerServiceClient) GetTaskOutput(ctx context.Context, in *TaskOutputRequest, opts ...grpc.CallOption) (*TaskOutputResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TaskOutputResponse)
+	err := c.cc.Invoke(ctx, WorkerService_GetTaskOutput_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WorkerServiceServer is the server API for WorkerService service.
 // All implementations must embed UnimplementedWorkerServiceServer
 // for forward compatibility.
@@ -71,6 +84,8 @@ type WorkerServiceServer interface {
 	SubmitTask(context.Context, *TaskRequest) (*TaskResponse, error)
 	// Kills the task if it is running on this worker.
 	CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error)
+	// Returns a running task's output so far, from an offset.
+	GetTaskOutput(context.Context, *TaskOutputRequest) (*TaskOutputResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
 
@@ -86,6 +101,9 @@ func (UnimplementedWorkerServiceServer) SubmitTask(context.Context, *TaskRequest
 }
 func (UnimplementedWorkerServiceServer) CancelTask(context.Context, *CancelTaskRequest) (*CancelTaskResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CancelTask not implemented")
+}
+func (UnimplementedWorkerServiceServer) GetTaskOutput(context.Context, *TaskOutputRequest) (*TaskOutputResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetTaskOutput not implemented")
 }
 func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
 func (UnimplementedWorkerServiceServer) testEmbeddedByValue()                       {}
@@ -144,6 +162,24 @@ func _WorkerService_CancelTask_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerService_GetTaskOutput_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TaskOutputRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).GetTaskOutput(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_GetTaskOutput_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).GetTaskOutput(ctx, req.(*TaskOutputRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -159,6 +195,10 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "CancelTask",
 			Handler:    _WorkerService_CancelTask_Handler,
 		},
+		{
+			MethodName: "GetTaskOutput",
+			Handler:    _WorkerService_GetTaskOutput_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "pkg/grpcapi/api.proto",
@@ -171,6 +211,7 @@ const (
 	CoordinatorService_UpdateTaskStatus_FullMethodName = "/grpcapi.CoordinatorService/UpdateTaskStatus"
 	CoordinatorService_SubmitWorkflow_FullMethodName   = "/grpcapi.CoordinatorService/SubmitWorkflow"
 	CoordinatorService_CancelWorkflow_FullMethodName   = "/grpcapi.CoordinatorService/CancelWorkflow"
+	CoordinatorService_GetTaskOutput_FullMethodName    = "/grpcapi.CoordinatorService/GetTaskOutput"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -185,6 +226,8 @@ type CoordinatorServiceClient interface {
 	UpdateTaskStatus(ctx context.Context, in *UpdateTaskStatusRequest, opts ...grpc.CallOption) (*UpdateTaskStatusResponse, error)
 	SubmitWorkflow(ctx context.Context, in *WorkflowRequest, opts ...grpc.CallOption) (*WorkflowResponse, error)
 	CancelWorkflow(ctx context.Context, in *CancelWorkflowRequest, opts ...grpc.CallOption) (*CancelWorkflowResponse, error)
+	// Returns a running task's live output from the worker running it.
+	GetTaskOutput(ctx context.Context, in *TaskOutputRequest, opts ...grpc.CallOption) (*TaskOutputResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -255,6 +298,16 @@ func (c *coordinatorServiceClient) CancelWorkflow(ctx context.Context, in *Cance
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) GetTaskOutput(ctx context.Context, in *TaskOutputRequest, opts ...grpc.CallOption) (*TaskOutputResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TaskOutputResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_GetTaskOutput_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -267,6 +320,8 @@ type CoordinatorServiceServer interface {
 	UpdateTaskStatus(context.Context, *UpdateTaskStatusRequest) (*UpdateTaskStatusResponse, error)
 	SubmitWorkflow(context.Context, *WorkflowRequest) (*WorkflowResponse, error)
 	CancelWorkflow(context.Context, *CancelWorkflowRequest) (*CancelWorkflowResponse, error)
+	// Returns a running task's live output from the worker running it.
+	GetTaskOutput(context.Context, *TaskOutputRequest) (*TaskOutputResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -294,6 +349,9 @@ func (UnimplementedCoordinatorServiceServer) SubmitWorkflow(context.Context, *Wo
 }
 func (UnimplementedCoordinatorServiceServer) CancelWorkflow(context.Context, *CancelWorkflowRequest) (*CancelWorkflowResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CancelWorkflow not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) GetTaskOutput(context.Context, *TaskOutputRequest) (*TaskOutputResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetTaskOutput not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -424,6 +482,24 @@ func _CoordinatorService_CancelWorkflow_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_GetTaskOutput_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TaskOutputRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).GetTaskOutput(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_GetTaskOutput_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).GetTaskOutput(ctx, req.(*TaskOutputRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -454,6 +530,10 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CancelWorkflow",
 			Handler:    _CoordinatorService_CancelWorkflow_Handler,
+		},
+		{
+			MethodName: "GetTaskOutput",
+			Handler:    _CoordinatorService_GetTaskOutput_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

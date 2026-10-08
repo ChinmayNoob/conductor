@@ -15,6 +15,12 @@ import (
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -56,7 +62,7 @@ type Server struct {
 	killTasks context.CancelCauseFunc
 
 	mu       sync.Mutex
-	running  map[string]context.CancelCauseFunc
+	running  map[string]*runningTask
 	draining bool
 	wg       sync.WaitGroup
 }
@@ -87,7 +93,7 @@ func NewServer(opts Options) *Server {
 		log:         slog.Default(),
 		tasksCtx:    ctx,
 		killTasks:   kill,
-		running:     make(map[string]context.CancelCauseFunc),
+		running:     make(map[string]*runningTask),
 	}
 
 	s.labels = maps.Clone(opts.Labels)
@@ -132,7 +138,7 @@ func LocalIP(coordinatorAddr string) string {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func (s *Server) SubmitTask(_ context.Context, req *grpcapi.TaskRequest) (*grpcapi.TaskResponse, error) {
+func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*grpcapi.TaskResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -151,22 +157,43 @@ func (s *Server) SubmitTask(_ context.Context, req *grpcapi.TaskRequest) (*grpca
 	}
 
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)
-	s.running[req.TaskId] = cancel
+	s.running[req.TaskId] = &runningTask{cancel: cancel, attempt: req.Attempt, out: newCappedBuffer(s.maxOutput)}
 	s.wg.Add(1)
-	go s.run(ctx, req)
+	// The task outlives this call; keep its trace.
+	go s.run(trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(rpcCtx)), req)
 
 	return &grpcapi.TaskResponse{TaskId: req.TaskId, Message: "accepted", Success: true}, nil
 }
 
 func (s *Server) CancelTask(_ context.Context, req *grpcapi.CancelTaskRequest) (*grpcapi.CancelTaskResponse, error) {
 	s.mu.Lock()
-	cancel, ok := s.running[req.TaskId]
+	rt, ok := s.running[req.TaskId]
 	s.mu.Unlock()
 	if ok {
 		s.log.Info("Cancelling task", "task_id", req.TaskId)
-		cancel(errCancelled)
+		rt.cancel(errCancelled)
 	}
 	return &grpcapi.CancelTaskResponse{Cancelled: ok}, nil
+}
+
+// runningTask is a task this worker is running.
+type runningTask struct {
+	cancel  context.CancelCauseFunc
+	attempt int32
+	out     *cappedBuffer // shell output, readable while it runs
+}
+
+// GetTaskOutput returns a running task's output so far. Only shell tasks
+// produce output while running; the others report it when they finish.
+func (s *Server) GetTaskOutput(_ context.Context, req *grpcapi.TaskOutputRequest) (*grpcapi.TaskOutputResponse, error) {
+	s.mu.Lock()
+	rt, ok := s.running[req.TaskId]
+	s.mu.Unlock()
+	if !ok || rt.attempt != req.Attempt {
+		return &grpcapi.TaskOutputResponse{Running: false, NextOffset: req.Offset}, nil
+	}
+	data, next := rt.out.ReadFrom(req.Offset)
+	return &grpcapi.TaskOutputResponse{Running: true, Data: data, NextOffset: next}, nil
 }
 
 func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
@@ -180,6 +207,10 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 		s.mu.Unlock()
 	}
 	defer release()
+
+	ctx, span := tracing.Start(ctx, "run "+taskType(task.Type), trace.WithAttributes(
+		attribute.String("conductor.task_id", task.TaskId), attribute.Int("conductor.attempt", int(task.Attempt))))
+	defer span.End()
 
 	log := s.log.With("task_id", task.TaskId, "type", task.Type, "attempt", task.Attempt)
 	// No STARTED report: the coordinator records the start when this worker
@@ -199,6 +230,10 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	// side effects, since a task can run more than once.
 	env["CONDUCTOR_ATTEMPT"] = strconv.Itoa(int(task.Attempt))
 	env["CONDUCTOR_RETRY"] = strconv.Itoa(int(task.RetryCount))
+	// User code can continue the trace (W3C Trace Context).
+	if tp := tracing.TraceParent(ctx); tp != "" {
+		env["TRACEPARENT"] = tp
+	}
 
 	start := time.Now()
 	var (
@@ -208,7 +243,7 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	)
 	switch task.Type {
 	case "", "shell":
-		output, outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.maxOutput)
+		output, outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.outputOf(task.TaskId))
 	case "http":
 		output, outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
 	case "container":
@@ -222,20 +257,24 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 			err = cause
 		}
 		log.Warn("Task failed", "error", err, "duration", time.Since(start))
+		metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "failed").Observe(time.Since(start).Seconds())
+		span.SetStatus(codes.Error, err.Error())
 		release()
-		s.report(task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
+		s.report(ctx, task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
 		return
 	}
 	log.Info("Task completed", "duration", time.Since(start))
+	metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "completed").Observe(time.Since(start).Seconds())
 	release()
-	s.report(task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
+	s.report(ctx, task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
 }
 
-func (s *Server) report(task *grpcapi.TaskRequest, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
+func (s *Server) report(ctx context.Context, task *grpcapi.TaskRequest, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
 	taskID := task.TaskId
-	// Use a fresh context: results must be reported even while shutting
-	// down. Allow long enough to ride out a coordinator failover.
-	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
+	// Results must be reported even if the task was cancelled or the worker
+	// is shutting down, so keep only ctx's trace. Allow long enough to ride
+	// out a coordinator failover.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 	defer cancel()
 
 	resp, err := s.coordinator.UpdateTaskStatus(ctx, &grpcapi.UpdateTaskStatusRequest{
@@ -248,6 +287,7 @@ func (s *Server) report(task *grpcapi.TaskRequest, status grpcapi.TaskStatus, ou
 	})
 	if err != nil {
 		s.log.Error("Failed to report task status", "task_id", taskID, "status", status, "error", err)
+		metrics.WorkerReportFailures.Inc()
 		return
 	}
 	if resp.ShouldRetry {
@@ -269,6 +309,46 @@ func (s *Server) RunHeartbeats(ctx context.Context) {
 			s.sendHeartbeat(ctx)
 		}
 	}
+}
+
+func taskType(t string) string {
+	if t == "" {
+		return "shell"
+	}
+	return t
+}
+
+// outputOf returns the live output buffer of a running task.
+func (s *Server) outputOf(taskID string) *cappedBuffer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rt, ok := s.running[taskID]; ok {
+		return rt.out
+	}
+	return newCappedBuffer(s.maxOutput)
+}
+
+// Collector reports this worker's slots and running tasks when scraped.
+func (s *Server) Collector() prometheus.Collector { return workerCollector{s} }
+
+type workerCollector struct{ s *Server }
+
+var (
+	workerSlotsDesc   = prometheus.NewDesc("conductor_worker_slots", "Tasks this worker can run at once.", nil, nil)
+	workerRunningDesc = prometheus.NewDesc("conductor_worker_tasks_running", "Tasks running on this worker.", nil, nil)
+)
+
+func (c workerCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- workerSlotsDesc
+	ch <- workerRunningDesc
+}
+
+func (c workerCollector) Collect(ch chan<- prometheus.Metric) {
+	c.s.mu.Lock()
+	running := len(c.s.running)
+	c.s.mu.Unlock()
+	ch <- prometheus.MustNewConstMetric(workerSlotsDesc, prometheus.GaugeValue, float64(c.s.slots))
+	ch <- prometheus.MustNewConstMetric(workerRunningDesc, prometheus.GaugeValue, float64(running))
 }
 
 func (s *Server) sendHeartbeat(ctx context.Context) {

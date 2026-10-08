@@ -39,3 +39,6 @@ go.work.sum
 # Build output
 /bin/
 bench-results.jsonl
+
+# Browser automation output
+.playwright-mcp/

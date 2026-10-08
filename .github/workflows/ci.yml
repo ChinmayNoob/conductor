@@ -68,16 +68,26 @@ jobs:
           echo "E2E_COMPOSE_FILES=docker-compose.yml,docker-compose.tls.yml" >> "$GITHUB_ENV"
           echo "COMPOSE_FILE=docker-compose.yml:docker-compose.tls.yml" >> "$GITHUB_ENV"
 
+      # The plaintext run also turns on tracing and the observability
+      # stack, so the tracing tests check whole traces in Jaeger; the mTLS
+      # run covers tracing off.
+      - name: Enable observability
+        if: matrix.transport == 'plaintext'
+        run: |
+          echo "EXTRA_PROFILES=--profile observability" >> "$GITHUB_ENV"
+          echo "OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317" >> "$GITHUB_ENV"
+          echo "E2E_JAEGER_URL=http://localhost:16686" >> "$GITHUB_ENV"
+
       - name: Start the stack
-        run: docker compose --profile containers up -d --build --wait --scale worker=$E2E_WORKERS
+        run: docker compose --profile containers $EXTRA_PROFILES up -d --build --wait --scale worker=$E2E_WORKERS
 
       - name: Run end-to-end tests
         run: go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/
 
       - name: Dump logs on failure
         if: failure()
-        run: docker compose --profile containers logs --no-color --timestamps
+        run: docker compose --profile containers $EXTRA_PROFILES logs --no-color --timestamps
 
       - name: Stop the stack
         if: always()
-        run: docker compose --profile containers down -v
+        run: docker compose --profile containers $EXTRA_PROFILES down -v

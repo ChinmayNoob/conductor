@@ -25,6 +25,8 @@ Tasks:
   task submit -type http -url URL [-method POST] [-body JSON] [-header K=V]
   task submit -type container -image alpine:3.20 [-- command args...]
   task get|cancel|requeue <id>
+  task logs <id> [-f]          Output; -f follows a running task live
+  task attempts <id>           Every attempt, with why each failed
   task list [-status S] [-queue Q] [-limit N]
   dlq                          Permanently failed tasks (dead-letter queue)
   stats
@@ -136,6 +138,10 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return id(func(x string) error { return a.printTask(a.c.RequeueTask(ctx, x)) })
 	case "task list":
 		return a.taskList(ctx, rest)
+	case "task logs":
+		return a.taskLogs(ctx, rest)
+	case "task attempts":
+		return id(func(x string) error { return a.taskAttempts(ctx, x) })
 
 	case "workflow apply":
 		return a.workflowApply(ctx, rest)
@@ -931,4 +937,46 @@ func envOr(key, fallback string) string {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(1)
+}
+
+func (a *cli) taskLogs(ctx context.Context, args []string) error {
+	pos, rest, err := positional(args, 1, "task logs <id> [-f]")
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("task logs", flag.ExitOnError)
+	follow := fs.Bool("f", false, "follow a running task")
+	_ = fs.Parse(rest)
+	return a.c.TaskLogs(ctx, pos[0], *follow, os.Stdout)
+}
+
+func (a *cli) taskAttempts(ctx context.Context, id string) error {
+	list, err := a.c.TaskAttempts(ctx, id)
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(list)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ATTEMPT\tSTATUS\tWORKER\tSTARTED\tTOOK\tERROR")
+	for _, at := range list {
+		worker, started, took := "-", "-", "-"
+		if at.WorkerID != nil {
+			worker = fmt.Sprint(*at.WorkerID)
+		}
+		if at.StartedAt != nil {
+			started = at.StartedAt.Local().Format(time.DateTime)
+			if at.FinishedAt != nil {
+				took = at.FinishedAt.Sub(*at.StartedAt).Round(time.Millisecond).String()
+			}
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", at.Attempt, at.Status, worker, started, took, firstLine(at.Error))
+	}
+	return tw.Flush()
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
 }

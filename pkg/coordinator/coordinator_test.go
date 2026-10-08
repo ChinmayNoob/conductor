@@ -1,8 +1,8 @@
 package coordinator
 
 import (
+	"github.com/ChinmayNoob/conductor/pkg/db"
 	"testing"
-	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/google/uuid"
@@ -49,7 +49,7 @@ func TestChooseWorkerSkipsBusyUnhealthyAndDraining(t *testing.T) {
 	s := newTestServer(1, 2, 3, 4)
 	s.workers[2].IsHealthy = false
 	s.workers[4].Draining = true
-	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
+	s.trackTask(&db.Task{ID: uuid.New(), Attempt: 1, TimeoutSeconds: 60}, s.workers[1])
 
 	for range 3 {
 		if w := s.chooseWorker(shell); w.ID != 3 {
@@ -67,11 +67,11 @@ func TestChooseWorkerUsesSlots(t *testing.T) {
 	s := newTestServer(1)
 	s.workers[1].Slots = 2
 
-	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
+	s.trackTask(&db.Task{ID: uuid.New(), Attempt: 1, TimeoutSeconds: 60}, s.workers[1])
 	if s.chooseWorker(shell) == nil {
 		t.Fatal("worker with a free slot was not chosen")
 	}
-	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
+	s.trackTask(&db.Task{ID: uuid.New(), Attempt: 1, TimeoutSeconds: 60}, s.workers[1])
 	if s.chooseWorker(shell) != nil {
 		t.Fatal("worker with no free slot was chosen")
 	}
@@ -104,7 +104,7 @@ func TestReleaseTaskFreesWorkerSlot(t *testing.T) {
 	s := newTestServer(1)
 	taskID := uuid.New()
 
-	s.trackTask(taskID, 1, s.workers[1], time.Minute)
+	s.trackTask(&db.Task{ID: taskID, Attempt: 1, TimeoutSeconds: 60}, s.workers[1])
 	if w := s.chooseWorker(shell); w != nil {
 		t.Fatal("worker should be busy while its task is in flight")
 	}

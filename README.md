@@ -9,8 +9,11 @@ Run shell commands, HTTP calls and containers across a cluster of workers, with:
 - **DAG workflows** that undo completed steps when a later one fails (sagas)
 - **cron schedules**, queues with concurrency and rate limits, and label-based routing
 - namespaces with quotas
+- a **web dashboard**, Prometheus metrics, OpenTelemetry tracing and live task output
 
 Postgres is the only dependency.
+
+![The dashboard's workflow run page: the failed step, why, and what was undone](docs/images/dashboard-workflow.png)
 
 > **Status:** pre-1.0 and under active development. See [plan.md](plan.md) for the roadmap and [DEVLOG.md](DEVLOG.md) for how it's built, with diagrams.
 
@@ -54,6 +57,8 @@ export CONDUCTOR_API_KEY=insecure-dev-api-key   # the development default
 bin/conductorctl task submit -cmd 'echo hello from $(hostname)' -wait
 bin/conductorctl workflow start order_pipeline -input '{"order_id": "A1"}' -wait
 ```
+
+Then open the dashboard at http://localhost:8081 and sign in with the same key.
 
 **Or as a single process** (only Postgres needed):
 
@@ -181,12 +186,12 @@ Every `/v1` route needs `Authorization: Bearer <api key>`. Admin keys may add `X
 
 | Area | Endpoints |
 |---|---|
-| Tasks | `POST /v1/tasks` · `GET /v1/tasks?status=&queue=` · `GET /v1/tasks/{id}` · `POST /v1/tasks/{id}/cancel` · `POST /v1/tasks/{id}/requeue` · `GET /v1/dead-letter` · `GET /v1/stats` |
+| Tasks | `POST /v1/tasks` · `GET /v1/tasks?status=&queue=&q=&before=` · `GET /v1/tasks/{id}` · `GET /v1/tasks/{id}/logs?follow=true` · `GET /v1/tasks/{id}/attempts` · `POST /v1/tasks/{id}/cancel` · `POST /v1/tasks/{id}/requeue` · `GET /v1/dead-letter` · `GET /v1/stats` · `GET /v1/stats/timeline` |
 | Definitions | `PUT /v1/workflow-definitions` (YAML or JSON body) · `GET /v1/workflow-definitions` · `GET /v1/workflow-definitions/{name}?version=&format=yaml` |
 | Runs | `POST /v1/workflows` · `GET /v1/workflows` · `GET /v1/workflows/{id}` · `POST /v1/workflows/{id}/cancel` |
 | Schedules | `POST /v1/schedules` · `GET /v1/schedules` · `GET`/`DELETE /v1/schedules/{name}` · `POST /v1/schedules/{name}/{pause,resume,trigger}` |
 | Queues | `GET /v1/queues` · `PUT`/`DELETE /v1/queues/{name}` |
-| Admin | `GET /v1/workers` · `POST`/`GET /v1/namespaces` · `PUT /v1/namespaces/{name}` · `POST`/`GET /v1/api-keys` · `DELETE /v1/api-keys/{id}` |
+| Admin | `GET /v1/workers` · `GET /v1/cluster` · `POST`/`GET /v1/namespaces` · `PUT /v1/namespaces/{name}` · `POST`/`GET /v1/api-keys` · `DELETE /v1/api-keys/{id}` |
 | Health | `GET /health` (no auth) |
 
 The Go SDK in [`pkg/client`](pkg/client) covers all of it:
@@ -196,6 +201,28 @@ c := client.New("http://localhost:8081", os.Getenv("CONDUCTOR_API_KEY"))
 wf, _ := c.StartWorkflow(ctx, client.WorkflowRequest{Workflow: "order_pipeline", Input: map[string]any{"order_id": "A1"}})
 wf, _ = c.WaitForWorkflow(ctx, wf.ID)
 ```
+
+## Dashboard and observability
+
+**Dashboard** at `/ui` (`/` redirects there), built into the binary. Sign in with an API key; it acts with that key's permissions. It shows what is running and waiting, every task with its attempts and live output, workflow runs drawn as a live diagram of which step failed and what was undone, and workers, schedules and the dead-letter queue. You can cancel, requeue, pause or resume queues and schedules, and run schedules now. Design notes: [ADR 0002](docs/adr/0002-dashboard-stack.md).
+
+**Live output** from the CLI or HTTP:
+
+```bash
+conductorctl task logs <id> -f      # follows a running task, across retries
+conductorctl task attempts <id>     # every attempt, and why each one failed
+```
+
+**Metrics:** every process serves Prometheus metrics on `:9090` (`CONDUCTOR_METRICS_LISTEN`). **Tracing:** set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OpenTelemetry traces; a task's trace runs from the HTTP request through the queue into the task, which gets `TRACEPARENT`. To run all of it locally:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 docker compose --profile observability up -d --build --scale worker=3
+# Grafana http://localhost:3000 · Prometheus http://localhost:9091 · Jaeger http://localhost:16686
+```
+
+If a port is taken, set `GRAFANA_PORT`, `PROMETHEUS_PORT` or `JAEGER_PORT`.
+
+The profile provisions a Grafana dashboard and [example alerts](observability/alerts.yml): no leader, no healthy workers, a queue backing up, a failure-rate spike, lost tasks.
 
 ## Security
 
@@ -219,6 +246,8 @@ All settings are environment variables; [.env.example](.env.example) lists them.
 | `CONDUCTOR_WORKER_PASS_ENV` | | Worker variables tasks may see, e.g. `AWS_REGION` |
 | `CONDUCTOR_PRIORITY_AGING` | `60s` | Waiting tasks gain one priority level per interval (`0` disables it) |
 | `CONDUCTOR_SHUTDOWN_TIMEOUT` | `25s` | How long a stopping worker lets running tasks finish |
+| `CONDUCTOR_METRICS_LISTEN` | `:9090` | Prometheus metrics (`off` disables them) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | | Send traces over OTLP/gRPC; standard `OTEL_*` variables apply |
 
 ## Development
 
@@ -239,7 +268,7 @@ Database tests need a Postgres server; they create and drop a throwaway database
 CONDUCTOR_TEST_DATABASE_URL='postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable' go test ./pkg/db/
 ```
 
-CI runs lint, unit and database tests with the race detector, and the 31-test end-to-end suite over both plaintext and mutual TLS. The chaos suite runs nightly.
+CI runs lint, unit and database tests with the race detector, and the end-to-end suite over plaintext (with tracing and the observability stack on) and mutual TLS. The chaos suite runs nightly.
 
 ## Reliability and performance
 

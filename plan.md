@@ -178,32 +178,33 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 
 ---
 
-## Phase 4: Observability and UI ⬜
+## Phase 4: Observability and UI ✅ (done, PR #5)
 
 **Goal:** operators can see what is happening and why, without reading container logs.
 
 ### 4.1 Metrics
-- ⬜ Prometheus `/metrics` on every service: queue depth per queue, dispatch latency, task duration histograms, retries, failures, worker count and slots used
-- ⬜ Grafana dashboards provisioned automatically in Docker Compose
-- ⬜ Alerting examples: queue backing up, failure-rate spike, no healthy workers
+- ✅ Prometheus `/metrics` on every service: queue depth per queue (ready, delayed, paused, running, oldest wait), dispatch latency, turnaround and run-time histograms, results by outcome (completed, failed, retried, stale), lost tasks, workers and slots, leadership, workflow outcomes and compensations, API requests by route
+- ✅ Grafana with a provisioned 21-panel dashboard: `docker compose --profile observability up`
+- ✅ Alert rules: no leader, no healthy workers, a queue backing up, a failure-rate spike, lost tasks
 
 ### 4.2 Tracing and logs
-- ⬜ OpenTelemetry tracing across scheduler → coordinator → worker, with trace context passed through gRPC
-- ⬜ Pass `TRACEPARENT` into task environments, so user code can join the trace
-- ⬜ Stream task output: workers stream output chunks over gRPC, so users can tail logs live and retrieve them later
+- ✅ OpenTelemetry tracing from the HTTP request through the coordinator and worker into the task. The traceparent is stored on the task row, so a trace survives the task's wait in the queue; workflow steps share their run's trace. Jaeger is in the observability profile.
+- ✅ `TRACEPARENT` in task environments, so user code can join the trace
+- ✅ Live task output: `GET /v1/tasks/{id}/logs?follow=true` and `conductorctl task logs -f` tail a running task, across retries. Changed from the plan: output is read from the worker only while someone watches, instead of workers pushing chunks to Postgres, which would add writes to every task (Postgres writes are the throughput limit, see Phase 3)
+- ✅ Attempt history: each failed attempt's worker, timing, error and output are kept when the task retries (`GET /v1/tasks/{id}/attempts`)
 
 ### 4.3 Web dashboard
-- ⬜ Pick a stack. Recommended: React with Vite, or Go `templ` with htmx to stay single-binary. Record the decision.
-- ⬜ Pages:
-  - Overview: throughput and failure rate
-  - Tasks: search and filter
-  - Task detail: attempts and logs
-  - **Workflow run graph:** live DAG with step states and compensation shown
+- ✅ Stack: a static app of plain JavaScript modules on the JSON API, embedded in the binary. See [ADR 0002](docs/adr/0002-dashboard-stack.md)
+- ✅ Pages:
+  - Overview: waiting and running work, last hour's outcomes as a strip chart, queues, recent failures, active workflows
+  - Tasks: search, filter and page
+  - Task detail: attempts, live output, error, outputs
+  - **Workflow run graph:** a live "mimic diagram" with step states, the failed step, and compensation running back along the route
   - Workers, schedules and dead-letter queue
-- ⬜ Actions: cancel, retry, requeue from the DLQ, pause or resume a queue
-- ⬜ Login backed by the Phase 1 API keys or namespaces
+- ✅ Actions: cancel, requeue from the DLQ, pause or resume a queue, pause, resume or run a schedule
+- ✅ Sign-in with an API key; admin keys switch namespaces
 
-**Exit criteria:** a failed workflow can be diagnosed from the dashboard alone (which step failed, why, and what was compensated).
+**Exit criteria:** a failed workflow can be diagnosed from the dashboard alone (which step failed, why, and what was compensated). ✅ The run page states all three in one banner, opens the failed step with its output, and draws the undo.
 
 ---
 
@@ -349,7 +350,7 @@ Phases describe *areas*. The order below gets the most value soonest and front-l
 | 1 | Production basics (CI, e2e, migrations, auth, TLS, cancellation) | ✅ Done |
 | 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | ✅ Done |
 | 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ✅ Done |
-| 4 | Observability and UI (metrics, tracing, dashboard) | ⬜ |
+| 4 | Observability and UI (metrics, tracing, dashboard) | ✅ Done |
 | 5 | AI-native durable execution (LLM steps, agents, explainer) | ⬜ |
 | 6 | Kubernetes and cloud-native (Helm, KEDA, operator) | ⬜ |
 | 🚦 | Open-source launch gate | ⬜ |

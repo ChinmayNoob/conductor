@@ -10,6 +10,7 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/task"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/google/uuid"
 )
 
@@ -48,6 +49,7 @@ type taskJSON struct {
 	WorkflowID     *uuid.UUID        `json:"workflow_id,omitempty"`
 	WorkerID       *int64            `json:"worker_id,omitempty"`
 	Attempt        int               `json:"attempt"`
+	TraceID        string            `json:"trace_id,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 }
 
@@ -66,7 +68,7 @@ func toTaskJSON(t *db.Task) taskJSON {
 		PickedAt: t.PickedAt, StartedAt: t.StartedAt, CompletedAt: t.CompletedAt, FailedAt: t.FailedAt,
 		CancelledAt: t.CancelledAt, Output: t.Output, Outputs: t.Outputs, ErrorMessage: t.ErrorMessage,
 		IdempotencyKey: userKey(t.IdempotencyKey), WorkflowID: t.WorkflowID, WorkerID: t.WorkerID,
-		Attempt: t.Attempt, CreatedAt: t.CreatedAt,
+		Attempt: t.Attempt, TraceID: tracing.TraceID(t.TraceParent), CreatedAt: t.CreatedAt,
 	}
 }
 
@@ -151,7 +153,16 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown status "+strconv.Quote(string(st)))
 		return
 	}
-	f := db.TaskFilter{Namespace: namespace(r), Status: st, Queue: q.Get("queue")}
+	f := db.TaskFilter{Namespace: namespace(r), Status: st, Queue: q.Get("queue"), Search: q.Get("q")}
+	if b := q.Get("before"); b != "" {
+		before, err := time.Parse(time.RFC3339Nano, b)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "before must be an RFC 3339 time")
+			return
+		}
+		before = before.UTC()
+		f.Before = &before
+	}
 	if wf := q.Get("workflow_id"); wf != "" {
 		id, err := uuid.Parse(wf)
 		if err != nil {
@@ -161,6 +172,35 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		f.WorkflowID = &id
 	}
 	s.listTasks(w, r, f)
+}
+
+// handleTimeline counts tasks created per minute over the last hour (or
+// ?minutes=N, up to a day), by their current status.
+func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	minutes := 60
+	if m := r.URL.Query().Get("minutes"); m != "" {
+		n, err := strconv.Atoi(m)
+		if err != nil || n < 1 || n > 1440 {
+			writeError(w, http.StatusBadRequest, "minutes must be between 1 and 1440")
+			return
+		}
+		minutes = n
+	}
+	points, err := s.db.Timeline(r.Context(), namespace(r), minutes)
+	if err != nil {
+		s.internalError(w, "Failed to build timeline", err)
+		return
+	}
+	type point struct {
+		Minute time.Time     `json:"minute"`
+		Status db.TaskStatus `json:"status"`
+		Count  int           `json:"count"`
+	}
+	out := make([]point, 0, len(points))
+	for _, p := range points {
+		out = append(out, point{p.Minute, p.Status, p.Count})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleDeadLetter lists tasks that failed permanently and aren't part of a

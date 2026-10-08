@@ -25,7 +25,7 @@ func TestShellOutputsAndEnv(t *testing.T) {
 	env := taskEnv(baseEnv(nil), map[string]string{"GREETING": "hi there"})
 	out, outputs, err := runShell(context.Background(),
 		`echo "$GREETING"; echo "answer=42" >> "$CONDUCTOR_OUTPUT"; echo "ignored line" >> "$CONDUCTOR_OUTPUT"`,
-		env, 10*time.Second, 1<<20)
+		env, 10*time.Second, newCappedBuffer(1<<20))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestTasksDoNotInheritWorkerSecrets(t *testing.T) {
 	t.Setenv("ALLOWED_VAR", "visible")
 
 	env := taskEnv(baseEnv([]string{"ALLOWED_VAR"}), nil)
-	out, _, err := runShell(context.Background(), `env`, env, 10*time.Second, 1<<20)
+	out, _, err := runShell(context.Background(), `env`, env, 10*time.Second, newCappedBuffer(1<<20))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestTasksDoNotInheritWorkerSecrets(t *testing.T) {
 func TestShellTimeoutKillsChildren(t *testing.T) {
 	skipOnWindows(t)
 	start := time.Now()
-	_, _, err := runShell(context.Background(), `sleep 30; echo done`, baseEnv(nil), 500*time.Millisecond, 1<<20)
+	_, _, err := runShell(context.Background(), `sleep 30; echo done`, baseEnv(nil), 500*time.Millisecond, newCappedBuffer(1<<20))
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("err = %v, want a timeout", err)
 	}

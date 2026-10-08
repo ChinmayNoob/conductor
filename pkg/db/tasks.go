@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,6 +59,7 @@ type Task struct {
 	// Attempt numbers dispatches: it goes up every time the task is handed
 	// to a worker, and status reports must quote the current one.
 	Attempt        int
+	TraceParent    string
 	dispatchKey    *time.Time
 	Output         string
 	Outputs        StringMap // key=value pairs a step wrote to $CONDUCTOR_OUTPUT
@@ -85,6 +87,7 @@ type NewTask struct {
 	ScheduledAt       time.Time
 	IdempotencyKey    string
 	WorkflowID        *uuid.UUID
+	TraceParent       string // W3C traceparent of the submitter, if traced
 }
 
 // DefaultTask returns a shell task in the default namespace and queue.
@@ -104,18 +107,18 @@ func DefaultTask(data string) NewTask {
 const taskColumns = `id, namespace, queue, type, data, spec, env, requirements, status, scheduled_at,
 	picked_at, started_at, completed_at, failed_at, cancelled_at, priority, max_retries, retry_count,
 	retry_delay_seconds, timeout_seconds, output, outputs, error_message, idempotency_key,
-	workflow_id, worker_id, attempt, dispatch_key, created_at`
+	workflow_id, worker_id, attempt, dispatch_key, trace_parent, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanTask(row scanner) (*Task, error) {
 	t := &Task{}
 	var spec nullJSON
-	var output, errMsg, idemKey sql.NullString
+	var output, errMsg, idemKey, traceParent sql.NullString
 	err := row.Scan(&t.ID, &t.Namespace, &t.Queue, &t.Type, &t.Data, &spec, &t.Env, &t.Requirements,
 		&t.Status, &t.ScheduledAt, &t.PickedAt, &t.StartedAt, &t.CompletedAt, &t.FailedAt, &t.CancelledAt,
 		&t.Priority, &t.MaxRetries, &t.RetryCount, &t.RetryDelaySeconds, &t.TimeoutSeconds, &output,
-		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &t.CreatedAt)
+		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &traceParent, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +126,7 @@ func scanTask(row scanner) (*Task, error) {
 	t.Output = output.String
 	t.ErrorMessage = errMsg.String
 	t.IdempotencyKey = idemKey.String
+	t.TraceParent = traceParent.String
 	return t, nil
 }
 
@@ -142,12 +146,12 @@ func (db *DB) CreateTask(ctx context.Context, n NewTask) (task *Task, created bo
 	t, err := scanTask(db.q.QueryRowContext(ctx,
 		`INSERT INTO tasks (namespace, queue, type, data, spec, env, requirements, status, priority,
 		                    max_retries, retry_delay_seconds, timeout_seconds, scheduled_at,
-		                    idempotency_key, workflow_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14)
+		                    idempotency_key, workflow_id, trace_parent)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, NULLIF($15, ''))
 		 ON CONFLICT (namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		 RETURNING `+taskColumns,
 		n.Namespace, n.Queue, n.Type, n.Data, jsonValue(n.Spec), n.Env, n.Requirements, n.Priority,
-		n.MaxRetries, n.RetryDelaySeconds, n.TimeoutSeconds, n.ScheduledAt, idemKey, n.WorkflowID,
+		n.MaxRetries, n.RetryDelaySeconds, n.TimeoutSeconds, n.ScheduledAt, idemKey, n.WorkflowID, n.TraceParent,
 	))
 	if errors.Is(err, sql.ErrNoRows) && n.IdempotencyKey != "" {
 		t, err = scanTask(db.q.QueryRowContext(ctx,
@@ -183,7 +187,11 @@ type TaskFilter struct {
 	WorkflowID *uuid.UUID // optional
 	// DeadLetter selects permanently failed tasks that aren't workflow steps.
 	DeadLetter bool
-	Limit      int
+	// Search matches a task ID prefix or part of the command (optional).
+	Search string
+	// Before pages backwards: only tasks created before this (optional).
+	Before *time.Time
+	Limit  int
 }
 
 // ListTasks returns the most recent tasks matching the filter.
@@ -195,9 +203,12 @@ func (db *DB) ListTasks(ctx context.Context, f TaskFilter) ([]*Task, error) {
 		   AND ($3 = '' OR queue = $3)
 		   AND ($4::uuid IS NULL OR workflow_id = $4)
 		   AND (NOT $5 OR (status = 'FAILED' AND workflow_id IS NULL))
+		   AND ($7 = '' OR id::text LIKE $7 || '%' OR data ILIKE '%' || $7 || '%')
+		   AND ($8::timestamp IS NULL OR created_at < $8)
 		 ORDER BY created_at DESC
 		 LIMIT $6`,
 		f.Namespace, string(f.Status), f.Queue, f.WorkflowID, f.DeadLetter, f.Limit,
+		strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(f.Search), f.Before,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tasks: %w", err)
@@ -234,6 +245,36 @@ func (db *DB) TaskCounts(ctx context.Context, namespace string) (map[TaskStatus]
 		counts[s] = n
 	}
 	return counts, rows.Err()
+}
+
+// TimelinePoint counts the tasks created in one minute, by current status.
+type TimelinePoint struct {
+	Minute time.Time
+	Status TaskStatus
+	Count  int
+}
+
+// Timeline counts tasks created per minute over the last `minutes`, by
+// their status now. It reads through the (namespace, created_at) index.
+func (db *DB) Timeline(ctx context.Context, namespace string, minutes int) ([]TimelinePoint, error) {
+	rows, err := db.q.QueryContext(ctx,
+		`SELECT date_trunc('minute', created_at) AS minute, status, count(*)
+		 FROM tasks
+		 WHERE namespace = $1 AND created_at > NOW() - make_interval(mins => $2)
+		 GROUP BY 1, 2 ORDER BY 1`, namespace, minutes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build timeline: %w", err)
+	}
+	defer rows.Close()
+	var out []TimelinePoint
+	for rows.Next() {
+		var p TimelinePoint
+		if err := rows.Scan(&p.Minute, &p.Status, &p.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // CountPendingTasks counts tasks waiting to run in a namespace.
@@ -402,26 +443,43 @@ const maxRetryDelay = time.Hour
 // left, keeping the failed attempt's output for debugging. It returns false
 // when the retries are used up.
 func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, errorMessage string) (bool, error) {
-	result, err := db.q.ExecContext(ctx,
-		`UPDATE tasks
-		 SET retry_count = retry_count + 1,
-		     status = 'QUEUED',
-		     picked_at = NULL,
-		     started_at = NULL,
-		     failed_at = NULL,
-		     error_message = $2,
-		     output = $4,
-		     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
-		 WHERE id = $1
-		   AND `+dispatchedCondition+`
-		   AND attempt = $5
-		   AND retry_count < max_retries`,
+	// One statement: lock the attempt, record it in task_attempts, and
+	// requeue the task.
+	var n int
+	err := db.q.QueryRowContext(ctx,
+		`WITH failed AS (
+			 SELECT id, attempt, worker_id, COALESCE(started_at, picked_at) AS started
+			 FROM tasks
+			 WHERE id = $1
+			   AND `+dispatchedCondition+`
+			   AND attempt = $5
+			   AND retry_count < max_retries
+			 FOR UPDATE
+		 ), retried AS (
+			 UPDATE tasks t
+			 SET retry_count = retry_count + 1,
+			     status = 'QUEUED',
+			     picked_at = NULL,
+			     started_at = NULL,
+			     failed_at = NULL,
+			     error_message = $2,
+			     output = $4,
+			     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
+			 FROM failed WHERE t.id = failed.id
+			 RETURNING t.id
+		 ), kept AS (
+			 INSERT INTO task_attempts (task_id, attempt, worker_id, started_at, finished_at, status, error_message, output)
+			 SELECT f.id, f.attempt, f.worker_id, f.started, NOW(), 'FAILED', NULLIF($2, ''), NULLIF($4, '')
+			 FROM failed f JOIN retried USING (id)
+			 ON CONFLICT DO NOTHING
+		 )
+		 SELECT count(*) FROM retried`,
 		id, errorMessage, maxRetryDelay.Seconds(), output, attempt,
-	)
+	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("failed to retry task: %w", err)
 	}
-	return rowsChanged(result)
+	return n > 0, nil
 }
 
 func (db *DB) MarkTaskStarted(ctx context.Context, id uuid.UUID, attempt int, workerID int64) (bool, error) {
@@ -525,12 +583,23 @@ func (db *DB) CancelTask(ctx context.Context, id uuid.UUID) (*Task, error) {
 // their workflow has already moved on. It returns nil if the task isn't
 // eligible.
 func (db *DB) RequeueFailedTask(ctx context.Context, id uuid.UUID) (*Task, error) {
+	// The failed attempt is kept in task_attempts before the reset.
 	t, err := scanTask(db.q.QueryRowContext(ctx,
-		`UPDATE tasks
+		`WITH failed AS (
+			 SELECT id, attempt, worker_id, COALESCE(started_at, picked_at) AS started, failed_at, error_message, output
+			 FROM tasks WHERE id = $1 AND status = 'FAILED' AND workflow_id IS NULL
+			 FOR UPDATE
+		 ), kept AS (
+			 INSERT INTO task_attempts (task_id, attempt, worker_id, started_at, finished_at, status, error_message, output)
+			 SELECT id, attempt, worker_id, started, COALESCE(failed_at, NOW()), 'FAILED', error_message, output
+			 FROM failed WHERE attempt > 0
+			 ON CONFLICT DO NOTHING
+		 )
+		 UPDATE tasks t
 		 SET status = 'QUEUED', retry_count = 0, picked_at = NULL, started_at = NULL,
 		     failed_at = NULL, error_message = NULL, scheduled_at = NOW()
-		 WHERE id = $1 AND status = 'FAILED' AND workflow_id IS NULL
-		 RETURNING `+taskColumns,
+		 FROM failed WHERE t.id = failed.id
+		 RETURNING `+prefixColumns("t", taskColumns),
 		id,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -540,6 +609,38 @@ func (db *DB) RequeueFailedTask(ctx context.Context, id uuid.UUID) (*Task, error
 		return nil, fmt.Errorf("failed to requeue task: %w", err)
 	}
 	return t, nil
+}
+
+// AttemptRecord is an earlier attempt of a task, kept when it failed.
+type AttemptRecord struct {
+	Attempt      int
+	WorkerID     *int64
+	StartedAt    *time.Time
+	FinishedAt   time.Time
+	Status       string
+	ErrorMessage string
+	Output       string
+}
+
+// ListAttempts returns a task's earlier attempts, oldest first. The latest
+// attempt is the task row itself.
+func (db *DB) ListAttempts(ctx context.Context, id uuid.UUID) ([]AttemptRecord, error) {
+	rows, err := db.q.QueryContext(ctx,
+		`SELECT attempt, worker_id, started_at, finished_at, status, COALESCE(error_message, ''), COALESCE(output, '')
+		 FROM task_attempts WHERE task_id = $1 ORDER BY attempt`, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list attempts: %w", err)
+	}
+	defer rows.Close()
+	var out []AttemptRecord
+	for rows.Next() {
+		var a AttemptRecord
+		if err := rows.Scan(&a.Attempt, &a.WorkerID, &a.StartedAt, &a.FinishedAt, &a.Status, &a.ErrorMessage, &a.Output); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // TaskAttempt identifies one dispatch of a task.
@@ -577,6 +678,8 @@ func (db *DB) ListOverdueTasks(ctx context.Context, grace time.Duration) ([]Task
 // sees it when it takes over.
 type DispatchedTask struct {
 	ID             uuid.UUID
+	Namespace      string
+	Queue          string
 	Attempt        int
 	WorkerID       *int64
 	StartedAt      *time.Time
@@ -586,7 +689,7 @@ type DispatchedTask struct {
 // ListDispatchedTasks returns every task that is picked and unfinished.
 func (db *DB) ListDispatchedTasks(ctx context.Context) ([]DispatchedTask, error) {
 	rows, err := db.q.QueryContext(ctx,
-		`SELECT id, attempt, worker_id, started_at, timeout_seconds FROM tasks
+		`SELECT id, namespace, queue, attempt, worker_id, started_at, timeout_seconds FROM tasks
 		 WHERE picked_at IS NOT NULL AND status IN ('QUEUED', 'STARTED')`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list dispatched tasks: %w", err)
@@ -596,7 +699,7 @@ func (db *DB) ListDispatchedTasks(ctx context.Context) ([]DispatchedTask, error)
 	var out []DispatchedTask
 	for rows.Next() {
 		var d DispatchedTask
-		if err := rows.Scan(&d.ID, &d.Attempt, &d.WorkerID, &d.StartedAt, &d.TimeoutSeconds); err != nil {
+		if err := rows.Scan(&d.ID, &d.Namespace, &d.Queue, &d.Attempt, &d.WorkerID, &d.StartedAt, &d.TimeoutSeconds); err != nil {
 			return nil, err
 		}
 		out = append(out, d)

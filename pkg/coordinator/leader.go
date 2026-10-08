@@ -9,6 +9,7 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/coordclient"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"google.golang.org/grpc"
@@ -63,6 +64,7 @@ func (s *Server) campaign(ctx context.Context) {
 			continue
 		}
 		s.log.Info("Became leader", "epoch", epoch)
+		metrics.LeaderElections.Inc()
 		s.lead(ctx, sess, epoch)
 		sess.Release()
 		s.log.Warn("Stepped down", "epoch", epoch)
@@ -259,9 +261,11 @@ func (s *Server) rebuild(ctx context.Context) {
 			start = *t.StartedAt
 		}
 		s.inFlight[t.ID] = dispatchedTask{
-			workerID: w.ID,
-			attempt:  t.Attempt,
-			deadline: start.Add(time.Duration(t.TimeoutSeconds)*time.Second + lostTaskGrace),
+			workerID:  w.ID,
+			attempt:   t.Attempt,
+			deadline:  start.Add(time.Duration(t.TimeoutSeconds)*time.Second + lostTaskGrace),
+			namespace: t.Namespace,
+			queue:     t.Queue,
 		}
 		w.inFlight++
 		restored++

@@ -190,6 +190,12 @@ func (c *Client) CancelTask(ctx context.Context, in *grpcapi.CancelTaskRequest, 
 	})
 }
 
+func (c *Client) GetTaskOutput(ctx context.Context, in *grpcapi.TaskOutputRequest, opts ...grpc.CallOption) (*grpcapi.TaskOutputResponse, error) {
+	return call(ctx, c, func(ctx context.Context, cl grpcapi.CoordinatorServiceClient) (*grpcapi.TaskOutputResponse, error) {
+		return cl.GetTaskOutput(ctx, in, opts...)
+	})
+}
+
 func (c *Client) SendHeartbeat(ctx context.Context, in *grpcapi.HeartbeatRequest, opts ...grpc.CallOption) (*grpcapi.HeartbeatResponse, error) {
 	return call(ctx, c, func(ctx context.Context, cl grpcapi.CoordinatorServiceClient) (*grpcapi.HeartbeatResponse, error) {
 		return cl.SendHeartbeat(ctx, in, opts...)

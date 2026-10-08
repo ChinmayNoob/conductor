@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/api"
@@ -18,13 +19,19 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/coordinator"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/security"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/ChinmayNoob/conductor/pkg/worker"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/stats"
 )
 
 // RunCoordinator serves the coordinator's gRPC API and dispatches tasks.
 func RunCoordinator(ctx context.Context, cfg *config.Config) error {
+	defer startTracing(ctx, "conductor-coordinator")()
 	database, err := openDB(ctx, db.WithLocalWake(cfg.DB.DSN()))
 	if err != nil {
 		return err
@@ -53,6 +60,8 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		DialOptions:   dialOpts,
 		PriorityAging: cfg.PriorityAging,
 	})
+	prometheus.MustRegister(srv.Collector())
+	metrics.Serve(ctx, cfg.MetricsListen)
 	// Standbys turn every call away, pointing at the leader.
 	grpcServer := grpc.NewServer(append(serverOpts, grpc.ChainUnaryInterceptor(srv.LeaderOnly))...)
 	grpcapi.RegisterCoordinatorServiceServer(grpcServer, srv)
@@ -81,6 +90,7 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 
 // RunAPI serves the HTTP API.
 func RunAPI(ctx context.Context, cfg *config.Config) error {
+	defer startTracing(ctx, "conductor-api")()
 	database, err := openDB(ctx, cfg.DB.DSN())
 	if err != nil {
 		return err
@@ -102,6 +112,7 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 	defer coord.Close()
 
 	srv := api.NewServer(database, coord, cfg.MaxRequestBytes)
+	metrics.Serve(ctx, cfg.MetricsListen)
 	httpServer := &http.Server{
 		Addr:              cfg.APIListen,
 		Handler:           srv.Handler(),
@@ -128,6 +139,7 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 // RunWorker executes tasks for the coordinator. On shutdown it stops taking
 // tasks and lets running ones finish, up to the shutdown timeout.
 func RunWorker(ctx context.Context, cfg *config.Config) error {
+	defer startTracing(ctx, "conductor-worker")()
 	serverOpts, dialOpts, err := grpcOptions(cfg)
 	if err != nil {
 		return err
@@ -163,6 +175,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		DockerSocket: cfg.Worker.DockerSocket,
 		Coordinator:  coord,
 	})
+	prometheus.MustRegister(w.Collector())
+	metrics.Serve(ctx, cfg.MetricsListen)
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterWorkerServiceServer(grpcServer, w)
 
@@ -274,7 +288,27 @@ func grpcOptions(cfg *config.Config) ([]grpc.ServerOption, []grpc.DialOption, er
 	if err != nil {
 		return nil, nil, err
 	}
+	// Trace every RPC except the steady heartbeat traffic.
+	notHeartbeat := otelgrpc.WithFilter(func(info *stats.RPCTagInfo) bool {
+		return !strings.HasSuffix(info.FullMethodName, "/SendHeartbeat")
+	})
+	serverOpts = append(serverOpts, grpc.StatsHandler(otelgrpc.NewServerHandler(notHeartbeat)))
+	dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler(notHeartbeat)))
 	return serverOpts, dialOpts, nil
+}
+
+// startTracing sets up tracing for a component and returns a function that
+// flushes it on shutdown.
+func startTracing(ctx context.Context, service string) func() {
+	shutdown, err := tracing.Setup(ctx, service)
+	if err != nil {
+		slog.Warn("Tracing disabled", "error", err)
+	}
+	return func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdown(flushCtx)
+	}
 }
 
 // serveUntilDone runs serve until it fails or ctx is cancelled.

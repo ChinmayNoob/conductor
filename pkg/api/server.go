@@ -17,6 +17,8 @@ import (
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -44,6 +46,8 @@ func NewServer(database *db.DB, coordinator grpcapi.CoordinatorServiceClient, ma
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.Handle("GET /ui/", uiHandler())
+	mux.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
 
 	authed := func(pattern string, h http.HandlerFunc) {
 		mux.Handle(pattern, s.authenticate(h))
@@ -57,8 +61,11 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /v1/tasks/{id}", s.handleGetTask)
 	authed("POST /v1/tasks/{id}/cancel", s.handleCancelTask)
 	authed("POST /v1/tasks/{id}/requeue", s.handleRequeueTask)
+	authed("GET /v1/tasks/{id}/attempts", s.handleTaskAttempts)
+	authed("GET /v1/tasks/{id}/logs", s.handleTaskLogs)
 	authed("GET /v1/dead-letter", s.handleDeadLetter)
 	authed("GET /v1/stats", s.handleStats)
+	authed("GET /v1/stats/timeline", s.handleTimeline)
 
 	authed("PUT /v1/workflow-definitions", s.handleSaveDefinition)
 	authed("POST /v1/workflow-definitions", s.handleSaveDefinition)
@@ -93,7 +100,16 @@ func (s *Server) Handler() http.Handler {
 	admin("GET /v1/api-keys", s.handleListAPIKeys)
 	admin("DELETE /v1/api-keys/{id}", s.handleRevokeAPIKey)
 
-	return s.logRequests(cors(mux))
+	// Tracing wraps everything but health checks. otelhttp names each span
+	// once the mux has matched a route.
+	return otelhttp.NewHandler(s.logRequests(cors(mux)), "http",
+		otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/health" }),
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			if r.Pattern != "" {
+				return r.Pattern
+			}
+			return r.Method
+		}))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -237,11 +253,23 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the real writer (to flush).
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		next.ServeHTTP(rec, r)
+
+		// The mux records the matched pattern on the request: a bounded
+		// label, unlike the path.
+		route := r.Pattern
+		if route == "" {
+			route = "unmatched"
+		}
+		metrics.HTTPRequests.WithLabelValues(route, strconv.Itoa(rec.code)).Inc()
+		metrics.HTTPDuration.WithLabelValues(route).Observe(time.Since(start).Seconds())
 
 		level := slog.LevelInfo
 		if r.Method == http.MethodGet && rec.code < 500 {

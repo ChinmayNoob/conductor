@@ -47,6 +47,32 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// ReadFrom returns the output from stream position offset onwards, and the
+// position to continue from. Bytes dropped from the middle of a large output
+// are replaced by a marker.
+func (b *cappedBuffer) ReadFrom(offset int64) ([]byte, int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var out []byte
+	head := int64(len(b.head))
+	if offset < head {
+		out = append(out, b.head[offset:]...)
+		offset = head
+	}
+	tailStart := b.total - int64(len(b.tail)) // stream position of the oldest kept tail byte
+	if offset < tailStart {
+		out = append(out, fmt.Sprintf("\n... [%d bytes truncated] ...\n", tailStart-offset)...)
+		offset = tailStart
+	}
+	if offset < b.total {
+		tail := append(append([]byte{}, b.tail[b.tailPos:]...), b.tail[:b.tailPos]...)
+		out = append(out, tail[offset-tailStart:]...)
+		offset = b.total
+	}
+	return out, offset
+}
+
 func (b *cappedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -191,6 +191,7 @@ type Task struct {
 	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 	WorkflowID     string            `json:"workflow_id,omitempty"`
 	WorkerID       *int64            `json:"worker_id,omitempty"`
+	Attempt        int               `json:"attempt"`
 	CreatedAt      time.Time         `json:"created_at"`
 
 	// Created is false when SubmitTask matched an existing idempotency key.
@@ -574,6 +575,36 @@ func (c *Client) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	var list []Namespace
 	_, err := c.do(ctx, http.MethodGet, "/v1/namespaces", nil, &list)
 	return list, err
+}
+
+// --- Cluster ---
+
+type ClusterLeader struct {
+	ID          string     `json:"id"`
+	Address     string     `json:"address"`
+	Epoch       int64      `json:"epoch"`
+	ElectedAt   *time.Time `json:"elected_at,omitempty"`
+	HeartbeatAt *time.Time `json:"heartbeat_at,omitempty"`
+}
+
+type ClusterCoordinator struct {
+	ID        string    `json:"id"`
+	Address   string    `json:"address"`
+	Leader    bool      `json:"leader"`
+	StartedAt time.Time `json:"started_at"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+type Cluster struct {
+	Leader       *ClusterLeader       `json:"leader"`
+	Coordinators []ClusterCoordinator `json:"coordinators"`
+}
+
+// Cluster returns the elected leader and the live coordinators (admin).
+func (c *Client) Cluster(ctx context.Context) (*Cluster, error) {
+	var out Cluster
+	_, err := c.do(ctx, http.MethodGet, "/v1/cluster", nil, &out)
+	return &out, err
 }
 
 // --- API keys (admin only) ---

@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"math"
@@ -119,7 +120,7 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 	var toKill []uuid.UUID
 	createdTasks := false
 
-	err := s.db.WithTx(ctx, func(tx *db.DB) error {
+	err := s.fenced(ctx, func(tx *db.DB) error {
 		wf, err := tx.LockWorkflow(ctx, wfID)
 		if err != nil || wf == nil || wf.Status.Terminal() {
 			return err
@@ -257,7 +258,9 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 		return fmt.Errorf("workflow did not settle after 50 passes")
 	})
 	if err != nil {
-		log.Error("Failed to advance workflow", "error", err)
+		if !errors.Is(err, errNotLeader) && ctx.Err() == nil {
+			log.Error("Failed to advance workflow", "error", err)
+		}
 		return
 	}
 

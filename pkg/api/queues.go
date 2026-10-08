@@ -107,3 +107,48 @@ func (s *Server) handleListWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, out)
 }
+
+type clusterJSON struct {
+	Leader       *leaderJSON       `json:"leader"`
+	Coordinators []coordinatorJSON `json:"coordinators"`
+}
+
+type leaderJSON struct {
+	ID          string     `json:"id"`
+	Address     string     `json:"address"`
+	Epoch       int64      `json:"epoch"`
+	ElectedAt   *time.Time `json:"elected_at,omitempty"`
+	HeartbeatAt *time.Time `json:"heartbeat_at,omitempty"`
+}
+
+type coordinatorJSON struct {
+	ID        string    `json:"id"`
+	Address   string    `json:"address"`
+	Leader    bool      `json:"leader"`
+	StartedAt time.Time `json:"started_at"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+// handleCluster shows the elected leader and every live coordinator.
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
+	l, err := s.db.GetLeader(r.Context())
+	if err != nil {
+		s.internalError(w, "Failed to get leader", err)
+		return
+	}
+	coords, err := s.db.ListCoordinators(r.Context(), 30*time.Second)
+	if err != nil {
+		s.internalError(w, "Failed to list coordinators", err)
+		return
+	}
+	out := clusterJSON{Coordinators: []coordinatorJSON{}}
+	if l.CoordinatorID != "" {
+		out.Leader = &leaderJSON{ID: l.CoordinatorID, Address: l.Address, Epoch: l.Epoch, ElectedAt: l.ElectedAt, HeartbeatAt: l.HeartbeatAt}
+	}
+	for _, c := range coords {
+		out.Coordinators = append(out.Coordinators, coordinatorJSON{
+			ID: c.ID, Address: c.Address, Leader: c.ID == l.CoordinatorID, StartedAt: c.StartedAt, LastSeen: c.LastSeen,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}

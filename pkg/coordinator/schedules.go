@@ -11,17 +11,31 @@ import (
 	"github.com/google/uuid"
 )
 
-// scheduleLoop fires due cron schedules once a second.
+// scheduleLoop fires due cron schedules, sleeping until the next one is due
+// (or a notification says schedules changed).
 func (s *Server) scheduleLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.fireDueSchedules(ctx)
+		case <-timer.C:
+		case <-s.wakeSched:
 		}
+		s.fireDueSchedules(ctx)
+
+		wait := 10 * time.Second
+		if next, err := s.db.NextScheduleAt(ctx); err == nil && next != nil {
+			wait = min(max(time.Until(*next), 10*time.Millisecond), wait)
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
 	}
 }
 
@@ -32,7 +46,7 @@ func (s *Server) fireDueSchedules(ctx context.Context) {
 	var started []uuid.UUID // workflow runs to reconcile after commit
 	fired := 0
 
-	err := s.db.WithTx(ctx, func(tx *db.DB) error {
+	err := s.fenced(ctx, func(tx *db.DB) error {
 		due, err := tx.ClaimDueSchedules(ctx, 50)
 		if err != nil {
 			return err
@@ -77,7 +91,9 @@ func (s *Server) fireDueSchedules(ctx context.Context) {
 		return nil
 	})
 	if err != nil {
-		s.log.Error("Failed to fire schedules", "error", err)
+		if ctx.Err() == nil {
+			s.log.Error("Failed to fire schedules", "error", err)
+		}
 		return
 	}
 

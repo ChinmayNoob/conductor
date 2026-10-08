@@ -22,7 +22,12 @@ var (
 	errShutdown  = errors.New("worker shutting down")
 )
 
-const heartbeatInterval = 10 * time.Second
+const (
+	heartbeatInterval = 10 * time.Second
+	// How long a worker keeps trying to report a result, e.g. while a new
+	// coordinator is being elected.
+	reportTimeout = 30 * time.Second
+)
 
 // Label keys a worker sets automatically to advertise the task types it can
 // run. Tasks require the label for their type.
@@ -166,15 +171,20 @@ func (s *Server) CancelTask(_ context.Context, req *grpcapi.CancelTaskRequest) (
 
 func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	defer s.wg.Done()
-	defer func() {
+	// Free the slot before reporting the result: the coordinator counts the
+	// slot free as soon as the report arrives and may send the next task
+	// right away.
+	release := func() {
 		s.mu.Lock()
 		delete(s.running, task.TaskId)
 		s.mu.Unlock()
-	}()
+	}
+	defer release()
 
-	log := s.log.With("task_id", task.TaskId, "type", task.Type, "attempt", task.RetryCount)
+	log := s.log.With("task_id", task.TaskId, "type", task.Type, "attempt", task.Attempt)
+	// No STARTED report: the coordinator records the start when this worker
+	// accepts the task, which keeps a round trip off every task's path.
 	log.Info("Task started")
-	s.report(task.TaskId, grpcapi.TaskStatus_STARTED, "", "", nil)
 
 	timeout := time.Duration(task.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -185,7 +195,10 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 		env = make(map[string]string)
 	}
 	env["CONDUCTOR_TASK_ID"] = task.TaskId
-	env["CONDUCTOR_ATTEMPT"] = strconv.Itoa(int(task.RetryCount))
+	// A unique number per dispatch: use TASK_ID + ATTEMPT to de-duplicate
+	// side effects, since a task can run more than once.
+	env["CONDUCTOR_ATTEMPT"] = strconv.Itoa(int(task.Attempt))
+	env["CONDUCTOR_RETRY"] = strconv.Itoa(int(task.RetryCount))
 
 	start := time.Now()
 	var (
@@ -209,16 +222,20 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 			err = cause
 		}
 		log.Warn("Task failed", "error", err, "duration", time.Since(start))
-		s.report(task.TaskId, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
+		release()
+		s.report(task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
 		return
 	}
 	log.Info("Task completed", "duration", time.Since(start))
-	s.report(task.TaskId, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
+	release()
+	s.report(task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
 }
 
-func (s *Server) report(taskID string, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
-	// Use a fresh context: results must be reported even while shutting down.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+func (s *Server) report(task *grpcapi.TaskRequest, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
+	taskID := task.TaskId
+	// Use a fresh context: results must be reported even while shutting
+	// down. Allow long enough to ride out a coordinator failover.
+	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
 	defer cancel()
 
 	resp, err := s.coordinator.UpdateTaskStatus(ctx, &grpcapi.UpdateTaskStatusRequest{
@@ -227,6 +244,7 @@ func (s *Server) report(taskID string, status grpcapi.TaskStatus, output, errMsg
 		Output:       output,
 		ErrorMessage: errMsg,
 		Outputs:      outputs,
+		Attempt:      task.Attempt,
 	})
 	if err != nil {
 		s.log.Error("Failed to report task status", "task_id", taskID, "status", status, "error", err)

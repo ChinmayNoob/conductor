@@ -30,7 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
-docs/
 
 # Locally built client binary (go build -o client ./cmd/client)
 /client
@@ -39,3 +38,4 @@ docs/
 /certs/
 # Build output
 /bin/
+bench-results.jsonl

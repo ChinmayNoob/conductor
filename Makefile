@@ -6,7 +6,7 @@ PROTOC_IMAGE        ?= conductor-protoc
 COMPOSE             ?= docker compose
 WORKERS             ?= 3
 
-.PHONY: help build test test-db lint fmt proto up down logs e2e clean
+.PHONY: help build test test-db lint fmt proto up down logs e2e chaos bench clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
@@ -44,6 +44,15 @@ logs: ## Follow logs from all services
 
 e2e: up ## Run the end-to-end suite against the running stack
 	go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/...
+
+CHAOS_FILES := -f docker-compose.yml -f docker-compose.chaos.yml
+
+chaos: ## Run the chaos suite (Toxiproxy in front of Postgres; restarts the stack)
+	$(COMPOSE) $(CHAOS_FILES) --profile containers up -d --build --wait --scale worker=$(WORKERS)
+	E2E_COMPOSE_FILES=docker-compose.yml,docker-compose.chaos.yml go test -tags 'e2e chaos' -count=1 -v -timeout 30m -run TestChaos ./test/e2e/
+
+bench: ## Benchmark the stack at 1, 10 and 50 workers (see BENCHMARKS.md)
+	./scripts/bench.sh
 
 clean: ## Remove build output
 	rm -rf bin

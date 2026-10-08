@@ -1,0 +1,44 @@
+name: chaos
+
+# Nightly: run a steady workload while killing workers and coordinators,
+# partitioning a worker, slowing and cutting Postgres, and restarting it,
+# then check that no task or workflow was lost, stuck or wrongly finished.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  # Also when the suite itself changes.
+  pull_request:
+    paths:
+      - docker-compose.chaos.yml
+      - test/e2e/chaos_test.go
+      - test/e2e/toxiproxy.json
+      - .github/workflows/chaos.yml
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.chaos.yml
+      E2E_COMPOSE_FILES: docker-compose.yml,docker-compose.chaos.yml
+      E2E_WORKERS: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start the stack
+        run: docker compose --profile containers up -d --build --wait --scale worker=$E2E_WORKERS
+
+      - name: Run the chaos suite
+        run: go test -tags 'e2e chaos' -count=1 -v -timeout 30m -run TestChaos ./test/e2e/
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose --profile containers logs --no-color --timestamps
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose --profile containers down -v

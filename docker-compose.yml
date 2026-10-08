@@ -29,6 +29,7 @@ x-db-env: &db-env
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-taskscheduler}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -43,16 +44,19 @@ services:
       timeout: 5s
       retries: 15
 
+  # Two coordinators: one is elected leader, the other is a hot standby that
+  # takes over within seconds if the leader dies. Callers reach either through
+  # the service name and get redirected to the leader.
   coordinator:
     <<: *conductor
     command: ["coordinator"]
     environment:
       <<: *db-env
-    ports:
-      - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+    deploy:
+      replicas: 2
 
   api:
     <<: *conductor

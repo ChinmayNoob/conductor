@@ -55,13 +55,17 @@ type Task struct {
 	RetryCount        int
 	RetryDelaySeconds int
 	TimeoutSeconds    int
-	Output            string
-	Outputs           StringMap // key=value pairs a step wrote to $CONDUCTOR_OUTPUT
-	ErrorMessage      string
-	IdempotencyKey    string
-	WorkflowID        *uuid.UUID
-	WorkerID          *int64
-	CreatedAt         time.Time
+	// Attempt numbers dispatches: it goes up every time the task is handed
+	// to a worker, and status reports must quote the current one.
+	Attempt        int
+	dispatchKey    *time.Time
+	Output         string
+	Outputs        StringMap // key=value pairs a step wrote to $CONDUCTOR_OUTPUT
+	ErrorMessage   string
+	IdempotencyKey string
+	WorkflowID     *uuid.UUID
+	WorkerID       *int64
+	CreatedAt      time.Time
 }
 
 // NewTask describes a task to create. Zero values are stored as given, so
@@ -100,7 +104,7 @@ func DefaultTask(data string) NewTask {
 const taskColumns = `id, namespace, queue, type, data, spec, env, requirements, status, scheduled_at,
 	picked_at, started_at, completed_at, failed_at, cancelled_at, priority, max_retries, retry_count,
 	retry_delay_seconds, timeout_seconds, output, outputs, error_message, idempotency_key,
-	workflow_id, worker_id, created_at`
+	workflow_id, worker_id, attempt, dispatch_key, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -111,7 +115,7 @@ func scanTask(row scanner) (*Task, error) {
 	err := row.Scan(&t.ID, &t.Namespace, &t.Queue, &t.Type, &t.Data, &spec, &t.Env, &t.Requirements,
 		&t.Status, &t.ScheduledAt, &t.PickedAt, &t.StartedAt, &t.CompletedAt, &t.FailedAt, &t.CancelledAt,
 		&t.Priority, &t.MaxRetries, &t.RetryCount, &t.RetryDelaySeconds, &t.TimeoutSeconds, &output,
-		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.CreatedAt)
+		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -240,23 +244,33 @@ func (db *DB) CountPendingTasks(ctx context.Context, namespace string) (int, err
 	return n, err
 }
 
-// PickOptions constrain which task PickNextTask may claim.
+// PickOptions constrain which tasks PickTasks may claim.
 type PickOptions struct {
-	// WorkerLabels holds the label set of every worker with a free slot. The
+	// WorkerLabels holds the label set of every worker with a free slot. A
 	// task's requirements must be a subset of at least one of them.
 	WorkerLabels []map[string]string
-	// AgingInterval raises a waiting task's priority by one level per
-	// interval, so low-priority work can't starve. Zero disables aging.
-	AgingInterval time.Duration
 }
 
-// PickNextTask claims the most urgent runnable task, or returns nil if there
-// is none. A task is runnable when it is due, its queue isn't paused or at its
-// concurrency or rate limit, its namespace is under its concurrency limit,
-// and some free worker has the labels it requires. SKIP LOCKED lets
-// concurrent pickers claim different tasks.
+// PickNextTask claims the most urgent runnable task, or returns nil.
 func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error) {
-	if len(opts.WorkerLabels) == 0 {
+	tasks, err := db.PickTasks(ctx, opts, 1)
+	if err != nil || len(tasks) == 0 {
+		return nil, err
+	}
+	return tasks[0], nil
+}
+
+// PickTasks claims up to limit runnable tasks, most urgent first (by
+// dispatch_key, which folds in priority aging). A task is runnable when it
+// is due, its queue isn't paused or at its concurrency or rate limit, its
+// namespace is under its concurrency limit, and some free worker has the
+// labels it requires. SKIP LOCKED lets concurrent pickers claim different
+// tasks.
+//
+// Limits hold within a batch too: candidates are ranked per queue and per
+// namespace, and only as many as each limit still allows are claimed.
+func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Task, error) {
+	if len(opts.WorkerLabels) == 0 || limit < 1 {
 		return nil, nil
 	}
 	labels, err := json.Marshal(opts.WorkerLabels)
@@ -264,11 +278,10 @@ func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error)
 		return nil, err
 	}
 
-	t, err := scanTask(db.q.QueryRowContext(ctx,
-		`UPDATE tasks
-		 SET picked_at = NOW(), last_dispatched_at = NOW()
-		 WHERE id = (
-			 SELECT t.id FROM tasks t
+	query, args := db.fence(
+		`WITH candidates AS (
+			 SELECT t.id, t.namespace, t.queue, t.dispatch_key
+			 FROM tasks t
 			 LEFT JOIN queues q ON q.namespace = t.namespace AND q.name = t.queue
 			 LEFT JOIN namespaces n ON n.name = t.namespace
 			 WHERE t.status = 'QUEUED'
@@ -276,36 +289,93 @@ func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error)
 			   AND t.scheduled_at <= NOW()
 			   AND NOT COALESCE(q.paused, false)
 			   AND EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb) w WHERE w @> t.requirements)
-			   AND (q.concurrency_limit IS NULL OR q.concurrency_limit > (
-			         SELECT count(*) FROM tasks r
-			         WHERE r.namespace = t.namespace AND r.queue = t.queue
-			           AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')))
-			   AND (q.rate_limit IS NULL OR q.rate_limit > (
-			         SELECT count(*) FROM tasks r
-			         WHERE r.namespace = t.namespace AND r.queue = t.queue
-			           AND r.last_dispatched_at > NOW() - make_interval(secs => q.rate_period_seconds)))
-			   AND (n.max_concurrency IS NULL OR n.max_concurrency > (
-			         SELECT count(*) FROM tasks r
-			         WHERE r.namespace = t.namespace
-			           AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')))
-			 ORDER BY CASE WHEN $2 > 0
-			               THEN t.priority - LEAST(t.priority - 1,
-			                    floor(extract(epoch FROM NOW() - t.scheduled_at) / $2)::int)
-			               ELSE t.priority END,
-			          t.scheduled_at
-			 LIMIT 1
+			   AND (q.concurrency_limit IS NULL OR q.concurrency_limit > (`+queueRunning+`))
+			   AND (q.rate_limit IS NULL OR q.rate_limit > (`+queueRecent+`))
+			   AND (n.max_concurrency IS NULL OR n.max_concurrency > (`+namespaceRunning+`))
+			 ORDER BY t.dispatch_key
+			 LIMIT $2 * 4
 			 FOR UPDATE OF t SKIP LOCKED
+		 ),
+		 ranked AS (
+			 SELECT c.*,
+			        row_number() OVER (PARTITION BY c.namespace, c.queue ORDER BY c.dispatch_key) AS in_queue,
+			        row_number() OVER (PARTITION BY c.namespace ORDER BY c.dispatch_key) AS in_namespace
+			 FROM candidates c
+		 ),
+		 allowed AS (
+			 SELECT t.id
+			 FROM ranked t
+			 LEFT JOIN queues q ON q.namespace = t.namespace AND q.name = t.queue
+			 LEFT JOIN namespaces n ON n.name = t.namespace
+			 WHERE (q.concurrency_limit IS NULL OR t.in_queue <= q.concurrency_limit - (`+queueRunning+`))
+			   AND (q.rate_limit IS NULL OR t.in_queue <= q.rate_limit - (`+queueRecent+`))
+			   AND (n.max_concurrency IS NULL OR t.in_namespace <= n.max_concurrency - (`+namespaceRunning+`))
+			 ORDER BY t.dispatch_key
+			 LIMIT $2
 		 )
+		 UPDATE tasks
+		 SET picked_at = NOW(), last_dispatched_at = NOW(), attempt = attempt + 1
+		 WHERE id IN (SELECT id FROM allowed) `+fenceMarker+`
 		 RETURNING `+taskColumns,
-		labels, opts.AgingInterval.Seconds(),
-	))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+		labels, limit,
+	)
+	rows, err := db.q.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pick task: %w", err)
+		return nil, fmt.Errorf("failed to pick tasks: %w", err)
 	}
-	return t, nil
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan task: %w", err)
+		}
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to pick tasks: %w", err)
+	}
+	if len(tasks) == 0 {
+		return nil, db.unchanged(ctx)
+	}
+	// RETURNING has no order; restore dispatch order.
+	slices.SortFunc(tasks, func(a, b *Task) int {
+		if a.dispatchKey == nil || b.dispatchKey == nil {
+			return 0
+		}
+		return a.dispatchKey.Compare(*b.dispatchKey)
+	})
+	return tasks, nil
+}
+
+// Counts used by the pick query, correlated on the candidate row t.
+const (
+	queueRunning = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace AND r.queue = t.queue
+		AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')`
+	queueRecent = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace AND r.queue = t.queue
+		AND r.last_dispatched_at > NOW() - make_interval(secs => q.rate_period_seconds)`
+	namespaceRunning = `SELECT count(*) FROM tasks r WHERE r.namespace = t.namespace
+		AND r.picked_at IS NOT NULL AND r.status IN ('QUEUED', 'STARTED')`
+)
+
+// SetPriorityAging stores the aging interval used for dispatch order and,
+// if it changed, re-keys every queued task.
+func (db *DB) SetPriorityAging(ctx context.Context, interval time.Duration) error {
+	return db.WithTx(ctx, func(tx *DB) error {
+		result, err := tx.q.ExecContext(ctx,
+			`UPDATE scheduler_settings SET priority_aging_seconds = $1
+			 WHERE id = 1 AND priority_aging_seconds IS DISTINCT FROM $1`, interval.Seconds())
+		if err != nil {
+			return fmt.Errorf("failed to save priority aging: %w", err)
+		}
+		if changed, _ := rowsChanged(result); !changed {
+			return nil
+		}
+		_, err = tx.q.ExecContext(ctx,
+			`UPDATE tasks SET dispatch_key = conductor_dispatch_key(priority, scheduled_at) WHERE status = 'QUEUED'`)
+		return err
+	})
 }
 
 // RequeueTask puts a task that was picked but never started back in the queue,
@@ -319,9 +389,10 @@ func (db *DB) RequeueTask(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// The transitions below only apply to a task that is currently dispatched
-// (picked and not yet finished). A late or duplicate report from a worker
-// therefore changes nothing, and each returns whether the task was updated.
+// The transitions below only apply to the current dispatch of a task: it must
+// be picked and unfinished, and the report must quote the current attempt.
+// A late or duplicate report, or one from an earlier dispatch of the same
+// task, therefore changes nothing. Each returns whether the task was updated.
 const dispatchedCondition = `status IN ('QUEUED', 'STARTED') AND picked_at IS NOT NULL`
 
 // maxRetryDelay caps the exponential back-off between retries.
@@ -330,7 +401,7 @@ const maxRetryDelay = time.Hour
 // RetryTask requeues a failed task with exponential back-off if it has retries
 // left, keeping the failed attempt's output for debugging. It returns false
 // when the retries are used up.
-func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, output, errorMessage string) (bool, error) {
+func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, errorMessage string) (bool, error) {
 	result, err := db.q.ExecContext(ctx,
 		`UPDATE tasks
 		 SET retry_count = retry_count + 1,
@@ -343,8 +414,9 @@ func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, output, errorMessage 
 		     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
 		 WHERE id = $1
 		   AND `+dispatchedCondition+`
+		   AND attempt = $5
 		   AND retry_count < max_retries`,
-		id, errorMessage, maxRetryDelay.Seconds(), output,
+		id, errorMessage, maxRetryDelay.Seconds(), output, attempt,
 	)
 	if err != nil {
 		return false, fmt.Errorf("failed to retry task: %w", err)
@@ -352,16 +424,21 @@ func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, output, errorMessage 
 	return rowsChanged(result)
 }
 
-func (db *DB) MarkTaskStarted(ctx context.Context, id uuid.UUID, workerID int64) (bool, error) {
-	result, err := db.q.ExecContext(ctx,
+func (db *DB) MarkTaskStarted(ctx context.Context, id uuid.UUID, attempt int, workerID int64) (bool, error) {
+	query, args := db.fence(
 		`UPDATE tasks SET status = 'STARTED', started_at = NOW(), worker_id = $2
-		 WHERE id = $1 AND status = 'QUEUED' AND picked_at IS NOT NULL`,
-		id, workerID,
+		 WHERE id = $1 AND status = 'QUEUED' AND picked_at IS NOT NULL AND attempt = $3 `+fenceMarker,
+		id, workerID, attempt,
 	)
+	result, err := db.q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, fmt.Errorf("failed to mark task started: %w", err)
 	}
-	return rowsChanged(result)
+	changed, err := rowsChanged(result)
+	if err == nil && !changed {
+		err = db.unchanged(ctx)
+	}
+	return changed, err
 }
 
 // TaskResult is returned by the terminal transitions: whether the task was
@@ -384,25 +461,36 @@ func (db *DB) finish(ctx context.Context, query string, args ...any) (TaskResult
 	return r, nil
 }
 
-func (db *DB) MarkTaskCompleted(ctx context.Context, id uuid.UUID, output string, outputs StringMap) (TaskResult, error) {
-	r, err := db.finish(ctx,
-		`UPDATE tasks SET status = 'COMPLETED', completed_at = NOW(), output = $2, outputs = $3, error_message = NULL
-		 WHERE id = $1 AND `+dispatchedCondition+`
+// finishColumns fill in what the STARTED transition records, for a task
+// whose result arrived before the coordinator marked it started. $5 is the
+// worker ID (0 when unknown).
+const finishColumns = `started_at = COALESCE(started_at, picked_at), worker_id = COALESCE(NULLIF($5::bigint, 0), worker_id)`
+
+func (db *DB) MarkTaskCompleted(ctx context.Context, id uuid.UUID, attempt int, workerID int64, output string, outputs StringMap) (TaskResult, error) {
+	query, args := db.fence(
+		`UPDATE tasks SET status = 'COMPLETED', completed_at = NOW(), output = $2, outputs = $3, error_message = NULL,
+		     `+finishColumns+`
+		 WHERE id = $1 AND `+dispatchedCondition+` AND attempt = $4 `+fenceMarker+`
 		 RETURNING workflow_id`,
-		id, output, outputs,
+		id, output, outputs, attempt, workerID,
 	)
+	r, err := db.finish(ctx, query, args...)
+	if err == nil && !r.Updated {
+		err = db.unchanged(ctx)
+	}
 	if err != nil {
 		return r, fmt.Errorf("failed to mark task completed: %w", err)
 	}
 	return r, nil
 }
 
-func (db *DB) MarkTaskFailed(ctx context.Context, id uuid.UUID, output, errorMessage string) (TaskResult, error) {
+func (db *DB) MarkTaskFailed(ctx context.Context, id uuid.UUID, attempt int, workerID int64, output, errorMessage string) (TaskResult, error) {
 	r, err := db.finish(ctx,
-		`UPDATE tasks SET status = 'FAILED', failed_at = NOW(), output = $2, error_message = $3
-		 WHERE id = $1 AND `+dispatchedCondition+`
+		`UPDATE tasks SET status = 'FAILED', failed_at = NOW(), output = $2, error_message = $3,
+		     `+finishColumns+`
+		 WHERE id = $1 AND `+dispatchedCondition+` AND attempt = $4
 		 RETURNING workflow_id`,
-		id, output, errorMessage,
+		id, output, errorMessage, attempt, workerID,
 	)
 	if err != nil {
 		return r, fmt.Errorf("failed to mark task failed: %w", err)
@@ -454,11 +542,17 @@ func (db *DB) RequeueFailedTask(ctx context.Context, id uuid.UUID) (*Task, error
 	return t, nil
 }
 
+// TaskAttempt identifies one dispatch of a task.
+type TaskAttempt struct {
+	ID      uuid.UUID
+	Attempt int
+}
+
 // ListOverdueTasks returns STARTED tasks that have run past their timeout plus
 // grace without the worker reporting a result, i.e. the worker was lost.
-func (db *DB) ListOverdueTasks(ctx context.Context, grace time.Duration) ([]uuid.UUID, error) {
+func (db *DB) ListOverdueTasks(ctx context.Context, grace time.Duration) ([]TaskAttempt, error) {
 	rows, err := db.q.QueryContext(ctx,
-		`SELECT id FROM tasks
+		`SELECT id, attempt FROM tasks
 		 WHERE status = 'STARTED'
 		   AND started_at + make_interval(secs => timeout_seconds + $1::float8) < NOW()`,
 		grace.Seconds(),
@@ -468,15 +562,64 @@ func (db *DB) ListOverdueTasks(ctx context.Context, grace time.Duration) ([]uuid
 	}
 	defer rows.Close()
 
-	var ids []uuid.UUID
+	var out []TaskAttempt
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan task id: %w", err)
+		var a TaskAttempt
+		if err := rows.Scan(&a.ID, &a.Attempt); err != nil {
+			return nil, fmt.Errorf("failed to scan task: %w", err)
 		}
-		ids = append(ids, id)
+		out = append(out, a)
 	}
-	return ids, rows.Err()
+	return out, rows.Err()
+}
+
+// DispatchedTask is a task currently handed to a worker, as a new leader
+// sees it when it takes over.
+type DispatchedTask struct {
+	ID             uuid.UUID
+	Attempt        int
+	WorkerID       *int64
+	StartedAt      *time.Time
+	TimeoutSeconds int
+}
+
+// ListDispatchedTasks returns every task that is picked and unfinished.
+func (db *DB) ListDispatchedTasks(ctx context.Context) ([]DispatchedTask, error) {
+	rows, err := db.q.QueryContext(ctx,
+		`SELECT id, attempt, worker_id, started_at, timeout_seconds FROM tasks
+		 WHERE picked_at IS NOT NULL AND status IN ('QUEUED', 'STARTED')`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list dispatched tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DispatchedTask
+	for rows.Next() {
+		var d DispatchedTask
+		if err := rows.Scan(&d.ID, &d.Attempt, &d.WorkerID, &d.StartedAt, &d.TimeoutSeconds); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// NextDueAt returns when the earliest waiting task becomes due, or nil if
+// none is waiting for a future time. The dispatcher sleeps until then.
+func (db *DB) NextDueAt(ctx context.Context) (*time.Time, error) {
+	var t *time.Time
+	err := db.q.QueryRowContext(ctx,
+		`SELECT min(scheduled_at) FROM tasks
+		 WHERE status = 'QUEUED' AND picked_at IS NULL AND scheduled_at > NOW()`).Scan(&t)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find next due task: %w", err)
+	}
+	if t != nil {
+		// scheduled_at has no time zone and holds UTC.
+		u := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+		t = &u
+	}
+	return t, nil
 }
 
 // ResetStaleTasks requeues tasks that were picked but never started within

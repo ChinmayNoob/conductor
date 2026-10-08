@@ -49,7 +49,7 @@ func TestChooseWorkerSkipsBusyUnhealthyAndDraining(t *testing.T) {
 	s := newTestServer(1, 2, 3, 4)
 	s.workers[2].IsHealthy = false
 	s.workers[4].Draining = true
-	s.trackTask(uuid.New(), s.workers[1], time.Minute)
+	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
 
 	for range 3 {
 		if w := s.chooseWorker(shell); w.ID != 3 {
@@ -67,11 +67,11 @@ func TestChooseWorkerUsesSlots(t *testing.T) {
 	s := newTestServer(1)
 	s.workers[1].Slots = 2
 
-	s.trackTask(uuid.New(), s.workers[1], time.Minute)
+	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
 	if s.chooseWorker(shell) == nil {
 		t.Fatal("worker with a free slot was not chosen")
 	}
-	s.trackTask(uuid.New(), s.workers[1], time.Minute)
+	s.trackTask(uuid.New(), 1, s.workers[1], time.Minute)
 	if s.chooseWorker(shell) != nil {
 		t.Fatal("worker with no free slot was chosen")
 	}
@@ -91,11 +91,12 @@ func TestChooseWorkerMatchesLabels(t *testing.T) {
 	}
 }
 
-func TestFreeWorkerLabelsAreDistinct(t *testing.T) {
+func TestFreeCapacity(t *testing.T) {
 	s := newTestServer(1, 2, 3)
 	s.workers[3].Labels = map[string]string{"type.shell": "true", "region": "eu"}
-	if got := len(s.freeWorkerLabels()); got != 2 {
-		t.Fatalf("got %d label sets, want 2", got)
+	labels, free := s.freeCapacity()
+	if len(labels) != 2 || free != 3 {
+		t.Fatalf("got %d label sets and %d free slots, want 2 and 3", len(labels), free)
 	}
 }
 
@@ -103,7 +104,7 @@ func TestReleaseTaskFreesWorkerSlot(t *testing.T) {
 	s := newTestServer(1)
 	taskID := uuid.New()
 
-	s.trackTask(taskID, s.workers[1], time.Minute)
+	s.trackTask(taskID, 1, s.workers[1], time.Minute)
 	if w := s.chooseWorker(shell); w != nil {
 		t.Fatal("worker should be busy while its task is in flight")
 	}

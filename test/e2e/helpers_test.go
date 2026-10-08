@@ -238,3 +238,36 @@ func wantSteps(t *testing.T, wf *client.Workflow, want map[string]string) {
 		}
 	}
 }
+
+// containerByIP returns the container in the list whose IP is ip.
+func containerByIP(t *testing.T, ids []string, ip string) string {
+	t.Helper()
+	for _, id := range ids {
+		got := strings.TrimSpace(docker(t, "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", id))
+		if got == ip {
+			return id
+		}
+	}
+	t.Fatalf("no container has IP %s", ip)
+	return ""
+}
+
+// leader returns the elected leader's epoch and container.
+func leader(t *testing.T, c *client.Client) (epoch int64, container string) {
+	t.Helper()
+	cl, err := c.Cluster(ctxTimeout(t, 10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cl.Leader == nil {
+		t.Fatal("no leader elected")
+	}
+	ip, _, _ := strings.Cut(cl.Leader.Address, ":")
+	return cl.Leader.Epoch, containerByIP(t, strings.Fields(compose(t, "ps", "-q", "coordinator")), ip)
+}
+
+// networkOf returns the compose network a container is attached to.
+func networkOf(t *testing.T, container string) string {
+	t.Helper()
+	return strings.TrimSpace(docker(t, "inspect", "-f", "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}", container))
+}

@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/api"
 	"github.com/ChinmayNoob/conductor/pkg/config"
+	"github.com/ChinmayNoob/conductor/pkg/coordclient"
 	"github.com/ChinmayNoob/conductor/pkg/coordinator"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
@@ -23,7 +25,7 @@ import (
 
 // RunCoordinator serves the coordinator's gRPC API and dispatches tasks.
 func RunCoordinator(ctx context.Context, cfg *config.Config) error {
-	database, err := openDB(ctx, cfg)
+	database, err := openDB(ctx, db.WithLocalWake(cfg.DB.DSN()))
 	if err != nil {
 		return err
 	}
@@ -34,11 +36,25 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
+	_, port, err := net.SplitHostPort(cfg.CoordinatorListen)
+	if err != nil {
+		return fmt.Errorf("invalid CONDUCTOR_COORDINATOR_LISTEN: %w", err)
+	}
+	address := cfg.CoordinatorAdvertiseAddr
+	if address == "" {
+		address = net.JoinHostPort(worker.LocalIP(net.JoinHostPort(cfg.DB.Host, cfg.DB.Port)), port)
+	}
+	hostname, _ := os.Hostname()
+
 	srv := coordinator.NewServer(database, coordinator.Options{
+		ID:            hostname + "/" + address,
+		Address:       address,
+		DSN:           db.WithUTC(cfg.DB.DSN()),
 		DialOptions:   dialOpts,
 		PriorityAging: cfg.PriorityAging,
 	})
-	grpcServer := grpc.NewServer(serverOpts...)
+	// Standbys turn every call away, pointing at the leader.
+	grpcServer := grpc.NewServer(append(serverOpts, grpc.ChainUnaryInterceptor(srv.LeaderOnly))...)
 	grpcapi.RegisterCoordinatorServiceServer(grpcServer, srv)
 
 	lis, err := net.Listen("tcp", cfg.CoordinatorListen)
@@ -53,7 +69,7 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		close(runDone)
 	}()
 
-	slog.Info("Coordinator listening", "addr", lis.Addr().String())
+	slog.Info("Coordinator listening", "addr", lis.Addr().String(), "advertise", address)
 	err = serveUntilDone(ctx, func() error { return grpcServer.Serve(lis) })
 
 	slog.Info("Shutting down")
@@ -65,7 +81,7 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 
 // RunAPI serves the HTTP API.
 func RunAPI(ctx context.Context, cfg *config.Config) error {
-	database, err := openDB(ctx, cfg)
+	database, err := openDB(ctx, cfg.DB.DSN())
 	if err != nil {
 		return err
 	}
@@ -79,13 +95,13 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	conn, err := grpc.NewClient(cfg.CoordinatorAddr, dialOpts...)
+	coord, err := coordclient.New(coordclient.Seeds(cfg.CoordinatorAddr), dialOpts...)
 	if err != nil {
-		return fmt.Errorf("failed to create coordinator client: %w", err)
+		return err
 	}
-	defer conn.Close()
+	defer coord.Close()
 
-	srv := api.NewServer(database, grpcapi.NewCoordinatorServiceClient(conn), cfg.MaxRequestBytes)
+	srv := api.NewServer(database, coord, cfg.MaxRequestBytes)
 	httpServer := &http.Server{
 		Addr:              cfg.APIListen,
 		Handler:           srv.Handler(),
@@ -116,11 +132,12 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	conn, err := grpc.NewClient(cfg.CoordinatorAddr, dialOpts...)
+	seeds := coordclient.Seeds(cfg.CoordinatorAddr)
+	coord, err := coordclient.New(seeds, dialOpts...)
 	if err != nil {
-		return fmt.Errorf("failed to create coordinator client: %w", err)
+		return err
 	}
-	defer conn.Close()
+	defer coord.Close()
 
 	address := cfg.Worker.AdvertiseAddr
 	if address == "" {
@@ -128,7 +145,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		if err != nil {
 			return fmt.Errorf("invalid CONDUCTOR_WORKER_LISTEN: %w", err)
 		}
-		address = net.JoinHostPort(worker.LocalIP(cfg.CoordinatorAddr), port)
+		address = net.JoinHostPort(worker.LocalIP(seeds[0]), port)
 	}
 	id := cfg.Worker.ID
 	if id == 0 {
@@ -144,7 +161,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		MaxOutput:    cfg.MaxOutputBytes,
 		PassEnv:      cfg.Worker.PassEnv,
 		DockerSocket: cfg.Worker.DockerSocket,
-		Coordinator:  grpcapi.NewCoordinatorServiceClient(conn),
+		Coordinator:  coord,
 	})
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterWorkerServiceServer(grpcServer, w)
@@ -184,6 +201,7 @@ func RunDev(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("invalid CONDUCTOR_COORDINATOR_LISTEN: %w", err)
 	}
 	cfg.CoordinatorAddr = net.JoinHostPort("127.0.0.1", coordPort)
+	cfg.CoordinatorAdvertiseAddr = cfg.CoordinatorAddr
 	if cfg.Worker.AdvertiseAddr == "" {
 		_, workerPort, err := net.SplitHostPort(cfg.WorkerListen)
 		if err != nil {
@@ -193,7 +211,7 @@ func RunDev(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// Migrate once up front so the components don't race to do it.
-	database, err := openDB(ctx, cfg)
+	database, err := openDB(ctx, cfg.DB.DSN())
 	if err != nil {
 		return err
 	}
@@ -223,10 +241,10 @@ func RunDev(ctx context.Context, cfg *config.Config) error {
 	return firstErr
 }
 
-func openDB(ctx context.Context, cfg *config.Config) (*db.DB, error) {
+func openDB(ctx context.Context, dsn string) (*db.DB, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	database, err := db.Open(connectCtx, cfg.DB.DSN())
+	database, err := db.Open(connectCtx, dsn)
 	if err != nil {
 		return nil, err
 	}

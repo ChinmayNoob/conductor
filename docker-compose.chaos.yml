@@ -1,0 +1,35 @@
+# Chaos overlay: puts Toxiproxy between Postgres and everything that talks to
+# it, so tests can add latency or cut the connection.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.chaos.yml \
+#     --profile containers up -d --build --scale worker=3
+#   make chaos
+#
+# Toxiproxy's API is on localhost:8474; the proxy is named "postgres".
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes:
+      - ./test/e2e/toxiproxy.json:/config/toxiproxy.json:ro
+    ports:
+      - "8474:8474"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  coordinator:
+    environment:
+      POSTGRES_HOST: toxiproxy
+      POSTGRES_PORT: 15432
+    depends_on:
+      toxiproxy:
+        condition: service_started
+
+  api:
+    environment:
+      POSTGRES_HOST: toxiproxy
+      POSTGRES_PORT: 15432
+    depends_on:
+      toxiproxy:
+        condition: service_started

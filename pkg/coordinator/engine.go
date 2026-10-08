@@ -190,11 +190,14 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 			}
 			if plan.SetStatus != "" {
 				errMsg := wf.ErrorMessage
-				switch plan.SetStatus {
-				case workflow.StatusCompensating:
-					errMsg = plan.Error
-				case workflow.StatusCompleted:
+				switch {
+				case plan.SetStatus == workflow.StatusCompleted:
 					errMsg = ""
+				case plan.Error != "":
+					// Set when the run starts failing. With nothing to undo it
+					// goes straight to FAILED in the same plan, so take the
+					// error whatever the new status is.
+					errMsg = plan.Error
 				}
 				if err := tx.UpdateWorkflowStatus(ctx, wf.ID, db.WorkflowStatus(plan.SetStatus), errMsg); err != nil {
 					return err
@@ -221,6 +224,13 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					if err := tx.UpdateWorkflowStatus(ctx, wf.ID, wf.Status, wf.ErrorMessage); err != nil {
 						return err
 					}
+					continue
+				}
+				if spec.Wait != nil {
+					if err := s.startWait(ctx, tx, wf, step, spec.Wait); err != nil {
+						return err
+					}
+					log.Info("Workflow step waiting", "step", name, "for", spec.Wait.Kind)
 					continue
 				}
 				if spec.Type == workflow.TypeLLM {
@@ -275,6 +285,13 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 
 			for _, name := range plan.Cancel {
 				step := byName[name]
+				if step.WaitKind != "" {
+					// A waiting step has no task: just stop waiting.
+					if err := cancelWait(ctx, tx, step); err != nil {
+						return err
+					}
+					continue
+				}
 				if step.TaskID == nil {
 					continue
 				}

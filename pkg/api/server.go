@@ -76,6 +76,10 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /v1/workflows", s.handleListWorkflows)
 	authed("GET /v1/workflows/{id}", s.handleGetWorkflow)
 	authed("POST /v1/workflows/{id}/cancel", s.handleCancelWorkflow)
+	authed("POST /v1/workflows/{id}/steps/{step}/approve", s.handleDecideStep(true))
+	authed("POST /v1/workflows/{id}/steps/{step}/reject", s.handleDecideStep(false))
+	authed("POST /v1/workflows/{id}/signals/{name}", s.handleSignal)
+	authed("GET /v1/approvals", s.handleListApprovals)
 
 	authed("POST /v1/schedules", s.handleCreateSchedule)
 	authed("GET /v1/schedules", s.handleListSchedules)

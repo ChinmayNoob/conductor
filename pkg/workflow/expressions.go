@@ -152,6 +152,7 @@ type TaskSpec struct {
 	HTTP       *HTTPSpec
 	Container  *ContainerSpec
 	LLM        *LLMSpec
+	Wait       *WaitSpec // approval and signal steps: no task
 	Env        map[string]string
 	Retries    int
 	RetryDelay time.Duration
@@ -286,6 +287,24 @@ func (d *Definition) resolve(s *Step, a Action, ownOutputs map[string]string, c 
 		}
 		spec.LLM = &l
 		spec.Command = LLMSummary(&l)
+	case TypeApproval:
+		w := &WaitSpec{Kind: TypeApproval, OnTimeout: "reject", Message: "Approve step " + s.Name + "?"}
+		if a.Approval != nil {
+			if a.Approval.Message != "" {
+				if w.Message, err = c.Resolve(a.Approval.Message); err != nil {
+					return nil, fmt.Errorf("approval.message: %w", err)
+				}
+			}
+			w.Timeout = time.Duration(a.Approval.Timeout)
+			if a.Approval.OnTimeout != "" {
+				w.OnTimeout = a.Approval.OnTimeout
+			}
+		}
+		spec.Wait = w
+		spec.Command = "approval: " + w.Message
+	case TypeSignal:
+		spec.Wait = &WaitSpec{Kind: TypeSignal, Signal: a.Signal.Name, Timeout: time.Duration(a.Signal.Timeout), OnTimeout: "fail"}
+		spec.Command = "signal: " + a.Signal.Name
 	}
 	return spec, nil
 }
@@ -301,4 +320,13 @@ func LLMSummary(l *LLMSpec) string {
 		model = "default model"
 	}
 	return "llm " + model + ": " + p
+}
+
+// WaitSpec is what a waiting step waits for.
+type WaitSpec struct {
+	Kind      string // approval or signal
+	Message   string // approval: what a person is asked
+	Signal    string // signal: its name
+	Timeout   time.Duration
+	OnTimeout string // approval: approve or reject; signal: fail
 }

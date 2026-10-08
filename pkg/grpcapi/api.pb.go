@@ -1148,6 +1148,246 @@ func (x *TaskOutputResponse) GetNextOffset() int64 {
 	return 0
 }
 
+type DecideStepRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Step          string                 `protobuf:"bytes,3,opt,name=step,proto3" json:"step,omitempty"`
+	Approve       bool                   `protobuf:"varint,4,opt,name=approve,proto3" json:"approve,omitempty"`
+	Comment       string                 `protobuf:"bytes,5,opt,name=comment,proto3" json:"comment,omitempty"`
+	DecidedBy     string                 `protobuf:"bytes,6,opt,name=decided_by,json=decidedBy,proto3" json:"decided_by,omitempty"` // the API key's name, for the record
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DecideStepRequest) Reset() {
+	*x = DecideStepRequest{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DecideStepRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DecideStepRequest) ProtoMessage() {}
+
+func (x *DecideStepRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DecideStepRequest.ProtoReflect.Descriptor instead.
+func (*DecideStepRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *DecideStepRequest) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetStep() string {
+	if x != nil {
+		return x.Step
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetApprove() bool {
+	if x != nil {
+		return x.Approve
+	}
+	return false
+}
+
+func (x *DecideStepRequest) GetComment() string {
+	if x != nil {
+		return x.Comment
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetDecidedBy() string {
+	if x != nil {
+		return x.DecidedBy
+	}
+	return ""
+}
+
+type DecideStepResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DecideStepResponse) Reset() {
+	*x = DecideStepResponse{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DecideStepResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DecideStepResponse) ProtoMessage() {}
+
+func (x *DecideStepResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DecideStepResponse.ProtoReflect.Descriptor instead.
+func (*DecideStepResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{18}
+}
+
+type SignalRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	PayloadJson   []byte                 `protobuf:"bytes,4,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"` // a JSON object; its fields become the step's outputs
+	SentBy        string                 `protobuf:"bytes,5,opt,name=sent_by,json=sentBy,proto3" json:"sent_by,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SignalRequest) Reset() {
+	*x = SignalRequest{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SignalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SignalRequest) ProtoMessage() {}
+
+func (x *SignalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SignalRequest.ProtoReflect.Descriptor instead.
+func (*SignalRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *SignalRequest) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *SignalRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
+	}
+	return ""
+}
+
+func (x *SignalRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SignalRequest) GetPayloadJson() []byte {
+	if x != nil {
+		return x.PayloadJson
+	}
+	return nil
+}
+
+func (x *SignalRequest) GetSentBy() string {
+	if x != nil {
+		return x.SentBy
+	}
+	return ""
+}
+
+type SignalResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Delivered     bool                   `protobuf:"varint,1,opt,name=delivered,proto3" json:"delivered,omitempty"` // false: no step waits for it yet; it is kept
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SignalResponse) Reset() {
+	*x = SignalResponse{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SignalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SignalResponse) ProtoMessage() {}
+
+func (x *SignalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SignalResponse.ProtoReflect.Descriptor instead.
+func (*SignalResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SignalResponse) GetDelivered() bool {
+	if x != nil {
+		return x.Delivered
+	}
+	return false
+}
+
 var File_pkg_grpcapi_api_proto protoreflect.FileDescriptor
 
 const file_pkg_grpcapi_api_proto_rawDesc = "" +
@@ -1240,7 +1480,26 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\arunning\x18\x01 \x01(\bR\arunning\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\x12\x1f\n" +
 	"\vnext_offset\x18\x03 \x01(\x03R\n" +
-	"nextOffset*?\n" +
+	"nextOffset\"\xb9\x01\n" +
+	"\x11DecideStepRequest\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\x12\x1c\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04step\x18\x03 \x01(\tR\x04step\x12\x18\n" +
+	"\aapprove\x18\x04 \x01(\bR\aapprove\x12\x18\n" +
+	"\acomment\x18\x05 \x01(\tR\acomment\x12\x1d\n" +
+	"\n" +
+	"decided_by\x18\x06 \x01(\tR\tdecidedBy\"\x14\n" +
+	"\x12DecideStepResponse\"\x9e\x01\n" +
+	"\rSignalRequest\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\x12\x1c\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12!\n" +
+	"\fpayload_json\x18\x04 \x01(\fR\vpayloadJson\x12\x17\n" +
+	"\asent_by\x18\x05 \x01(\tR\x06sentBy\".\n" +
+	"\x0eSignalResponse\x12\x1c\n" +
+	"\tdelivered\x18\x01 \x01(\bR\tdelivered*?\n" +
 	"\n" +
 	"TaskStatus\x12\n" +
 	"\n" +
@@ -1254,7 +1513,7 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"SubmitTask\x12\x14.grpcapi.TaskRequest\x1a\x15.grpcapi.TaskResponse\"\x00\x12G\n" +
 	"\n" +
 	"CancelTask\x12\x1a.grpcapi.CancelTaskRequest\x1a\x1b.grpcapi.CancelTaskResponse\"\x00\x12J\n" +
-	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x002\xb5\x04\n" +
+	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x002\xc3\x05\n" +
 	"\x12CoordinatorService\x12G\n" +
 	"\n" +
 	"SubmitTask\x12\x1a.grpcapi.ClientTaskRequest\x1a\x1b.grpcapi.ClientTaskResponse\"\x00\x12G\n" +
@@ -1264,7 +1523,10 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\x10UpdateTaskStatus\x12 .grpcapi.UpdateTaskStatusRequest\x1a!.grpcapi.UpdateTaskStatusResponse\"\x00\x12G\n" +
 	"\x0eSubmitWorkflow\x12\x18.grpcapi.WorkflowRequest\x1a\x19.grpcapi.WorkflowResponse\"\x00\x12S\n" +
 	"\x0eCancelWorkflow\x12\x1e.grpcapi.CancelWorkflowRequest\x1a\x1f.grpcapi.CancelWorkflowResponse\"\x00\x12J\n" +
-	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x00B.Z,github.com/ChinmayNoob/conductor/pkg/grpcapib\x06proto3"
+	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x00\x12G\n" +
+	"\n" +
+	"DecideStep\x12\x1a.grpcapi.DecideStepRequest\x1a\x1b.grpcapi.DecideStepResponse\"\x00\x12C\n" +
+	"\x0eSignalWorkflow\x12\x16.grpcapi.SignalRequest\x1a\x17.grpcapi.SignalResponse\"\x00B.Z,github.com/ChinmayNoob/conductor/pkg/grpcapib\x06proto3"
 
 var (
 	file_pkg_grpcapi_api_proto_rawDescOnce sync.Once
@@ -1279,7 +1541,7 @@ func file_pkg_grpcapi_api_proto_rawDescGZIP() []byte {
 }
 
 var file_pkg_grpcapi_api_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(TaskStatus)(0),                  // 0: grpcapi.TaskStatus
 	(*TaskRequest)(nil),              // 1: grpcapi.TaskRequest
@@ -1299,15 +1561,19 @@ var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(*CancelWorkflowResponse)(nil),   // 15: grpcapi.CancelWorkflowResponse
 	(*TaskOutputRequest)(nil),        // 16: grpcapi.TaskOutputRequest
 	(*TaskOutputResponse)(nil),       // 17: grpcapi.TaskOutputResponse
-	nil,                              // 18: grpcapi.TaskRequest.EnvEntry
-	nil,                              // 19: grpcapi.HeartbeatRequest.LabelsEntry
-	nil,                              // 20: grpcapi.UpdateTaskStatusRequest.OutputsEntry
+	(*DecideStepRequest)(nil),        // 18: grpcapi.DecideStepRequest
+	(*DecideStepResponse)(nil),       // 19: grpcapi.DecideStepResponse
+	(*SignalRequest)(nil),            // 20: grpcapi.SignalRequest
+	(*SignalResponse)(nil),           // 21: grpcapi.SignalResponse
+	nil,                              // 22: grpcapi.TaskRequest.EnvEntry
+	nil,                              // 23: grpcapi.HeartbeatRequest.LabelsEntry
+	nil,                              // 24: grpcapi.UpdateTaskStatusRequest.OutputsEntry
 }
 var file_pkg_grpcapi_api_proto_depIdxs = []int32{
-	18, // 0: grpcapi.TaskRequest.env:type_name -> grpcapi.TaskRequest.EnvEntry
-	19, // 1: grpcapi.HeartbeatRequest.labels:type_name -> grpcapi.HeartbeatRequest.LabelsEntry
+	22, // 0: grpcapi.TaskRequest.env:type_name -> grpcapi.TaskRequest.EnvEntry
+	23, // 1: grpcapi.HeartbeatRequest.labels:type_name -> grpcapi.HeartbeatRequest.LabelsEntry
 	0,  // 2: grpcapi.UpdateTaskStatusRequest.status:type_name -> grpcapi.TaskStatus
-	20, // 3: grpcapi.UpdateTaskStatusRequest.outputs:type_name -> grpcapi.UpdateTaskStatusRequest.OutputsEntry
+	24, // 3: grpcapi.UpdateTaskStatusRequest.outputs:type_name -> grpcapi.UpdateTaskStatusRequest.OutputsEntry
 	10, // 4: grpcapi.UpdateTaskStatusRequest.llm_usage:type_name -> grpcapi.LLMUsage
 	1,  // 5: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
 	5,  // 6: grpcapi.WorkerService.CancelTask:input_type -> grpcapi.CancelTaskRequest
@@ -1319,18 +1585,22 @@ var file_pkg_grpcapi_api_proto_depIdxs = []int32{
 	12, // 12: grpcapi.CoordinatorService.SubmitWorkflow:input_type -> grpcapi.WorkflowRequest
 	14, // 13: grpcapi.CoordinatorService.CancelWorkflow:input_type -> grpcapi.CancelWorkflowRequest
 	16, // 14: grpcapi.CoordinatorService.GetTaskOutput:input_type -> grpcapi.TaskOutputRequest
-	2,  // 15: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
-	6,  // 16: grpcapi.WorkerService.CancelTask:output_type -> grpcapi.CancelTaskResponse
-	17, // 17: grpcapi.WorkerService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
-	4,  // 18: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
-	6,  // 19: grpcapi.CoordinatorService.CancelTask:output_type -> grpcapi.CancelTaskResponse
-	8,  // 20: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
-	11, // 21: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
-	13, // 22: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
-	15, // 23: grpcapi.CoordinatorService.CancelWorkflow:output_type -> grpcapi.CancelWorkflowResponse
-	17, // 24: grpcapi.CoordinatorService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
-	15, // [15:25] is the sub-list for method output_type
-	5,  // [5:15] is the sub-list for method input_type
+	18, // 15: grpcapi.CoordinatorService.DecideStep:input_type -> grpcapi.DecideStepRequest
+	20, // 16: grpcapi.CoordinatorService.SignalWorkflow:input_type -> grpcapi.SignalRequest
+	2,  // 17: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
+	6,  // 18: grpcapi.WorkerService.CancelTask:output_type -> grpcapi.CancelTaskResponse
+	17, // 19: grpcapi.WorkerService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
+	4,  // 20: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
+	6,  // 21: grpcapi.CoordinatorService.CancelTask:output_type -> grpcapi.CancelTaskResponse
+	8,  // 22: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
+	11, // 23: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
+	13, // 24: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
+	15, // 25: grpcapi.CoordinatorService.CancelWorkflow:output_type -> grpcapi.CancelWorkflowResponse
+	17, // 26: grpcapi.CoordinatorService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
+	19, // 27: grpcapi.CoordinatorService.DecideStep:output_type -> grpcapi.DecideStepResponse
+	21, // 28: grpcapi.CoordinatorService.SignalWorkflow:output_type -> grpcapi.SignalResponse
+	17, // [17:29] is the sub-list for method output_type
+	5,  // [5:17] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
 	5,  // [5:5] is the sub-list for extension extendee
 	0,  // [0:5] is the sub-list for field type_name
@@ -1347,7 +1617,7 @@ func file_pkg_grpcapi_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_grpcapi_api_proto_rawDesc), len(file_pkg_grpcapi_api_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   20,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

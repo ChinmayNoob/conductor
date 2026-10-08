@@ -41,6 +41,9 @@ Workflows:
   workflow show <name> [-version N]
   workflow start <name> [-input JSON] [-version N] [-key K] [-wait]
   workflow get|watch|cancel <id>
+  workflow approve|reject <id> <step> [-comment C]
+  workflow signal <id> <name> [-data JSON]
+  approvals                    Approval steps waiting for a decision
   workflow list [-limit N]
 
 Schedules:
@@ -116,6 +119,8 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return a.workers(ctx)
 	case "cluster":
 		return a.cluster(ctx)
+	case "approvals":
+		return a.approvals(ctx)
 	}
 	if len(args) < 2 {
 		return fmt.Errorf("usage: conductorctl %s <subcommand>; run conductorctl -h for help", args[0])
@@ -158,6 +163,10 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return id(func(x string) error { return a.workflowWatch(ctx, x) })
 	case "workflow cancel":
 		return id(func(x string) error { return a.printWorkflow(a.c.CancelWorkflow(ctx, x)) })
+	case "workflow approve", "workflow reject":
+		return a.workflowDecide(ctx, sub == "approve", rest)
+	case "workflow signal":
+		return a.workflowSignal(ctx, rest)
 	case "workflow list":
 		return a.workflowList(ctx, rest)
 
@@ -1001,4 +1010,58 @@ func (a *cli) taskAttempts(ctx context.Context, id string) error {
 func firstLine(s string) string {
 	line, _, _ := strings.Cut(s, "\n")
 	return line
+}
+
+func (a *cli) workflowDecide(ctx context.Context, approve bool, args []string) error {
+	pos, rest, err := positional(args, 2, "workflow approve|reject <id> <step> [-comment C]")
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("workflow decide", flag.ExitOnError)
+	comment := fs.String("comment", "", "why")
+	_ = fs.Parse(rest)
+	if approve {
+		return a.printWorkflow(a.c.ApproveStep(ctx, pos[0], pos[1], *comment))
+	}
+	return a.printWorkflow(a.c.RejectStep(ctx, pos[0], pos[1], *comment))
+}
+
+func (a *cli) workflowSignal(ctx context.Context, args []string) error {
+	pos, rest, err := positional(args, 2, "workflow signal <id> <name> [-data JSON]")
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("workflow signal", flag.ExitOnError)
+	data := fs.String("data", "{}", "the signal's payload, a JSON object")
+	_ = fs.Parse(rest)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(*data), &payload); err != nil {
+		return fmt.Errorf("-data is not a JSON object: %w", err)
+	}
+	delivered, err := a.c.Signal(ctx, pos[0], pos[1], payload)
+	if err != nil {
+		return err
+	}
+	if delivered {
+		fmt.Println("Delivered to the step waiting for it.")
+	} else {
+		fmt.Println("No step waits for it yet; it is kept until one does.")
+	}
+	return nil
+}
+
+func (a *cli) approvals(ctx context.Context) error {
+	list, err := a.c.ListApprovals(ctx)
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(list)
+	}
+	tw := table("WORKFLOW RUN", "DEFINITION", "STEP", "WAITING", "QUESTION")
+	for _, ap := range list {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", ap.WorkflowID, ap.Workflow, ap.Step,
+			time.Since(ap.Since).Round(time.Second), truncate(ap.Message, 60))
+	}
+	return tw.Flush()
 }

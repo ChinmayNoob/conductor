@@ -800,3 +800,54 @@ func TestNamespaceModelLimits(t *testing.T) {
 		t.Fatalf("after clearing: %+v", n)
 	}
 }
+
+func TestWaitingSteps(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	wf, _, err := db.CreateWorkflow(ctx, NewWorkflow{Namespace: "default", Name: "x", Definition: json.RawMessage(`{}`),
+		Steps: []string{"approve", "paid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := must[[]*StepState](t)(db.GetStepStates(ctx, wf.ID))
+	approve, paid := steps[0], steps[1]
+
+	past := time.Now().Add(-time.Second)
+	if err := db.StartWait(ctx, approve.ID, Wait{Kind: WaitApproval, Message: "Refund $40?", Deadline: &past, OnTimeout: "reject"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.StartWait(ctx, paid.ID, Wait{Kind: WaitSignal, Signal: "payment"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := must[[]*WaitingStep](t)(db.ListWaiting(ctx, "default", WaitApproval)); len(got) != 1 || got[0].Message != "Refund $40?" {
+		t.Fatalf("waiting approvals = %+v", got)
+	}
+	if got := must[[]*WaitingStep](t)(db.ExpiredWaits(ctx, 10)); len(got) != 1 || got[0].Step != "approve" {
+		t.Fatalf("expired = %+v, want the approval past its deadline", got)
+	}
+
+	// A decision reads like a finished task; deciding twice does nothing.
+	if !must[bool](t)(db.Decide(ctx, approve.ID, Decision{Status: "FAILED", Error: "rejected by ops", By: "ops"})) {
+		t.Fatal("decision not recorded")
+	}
+	if must[bool](t)(db.Decide(ctx, approve.ID, Decision{Status: "COMPLETED"})) {
+		t.Fatal("a decided step was decided again")
+	}
+
+	// Signals queue until taken, oldest first.
+	must[int64](t)(db.AddSignal(ctx, wf.ID, "payment", json.RawMessage(`{"amount": 40}`), "stripe"))
+	must[int64](t)(db.AddSignal(ctx, wf.ID, "payment", json.RawMessage(`{"amount": 99}`), "stripe"))
+	sig := must[*Signal](t)(db.TakeSignal(ctx, wf.ID, "payment", paid.ID))
+	if sig == nil || string(sig.Payload) != `{"amount": 40}` || sig.SentBy != "stripe" {
+		t.Fatalf("took %+v, want the first signal", sig)
+	}
+	must[bool](t)(db.Decide(ctx, paid.ID, Decision{Status: "COMPLETED", Outputs: StringMap{"amount": "40"}}))
+
+	steps = must[[]*StepState](t)(db.GetStepStates(ctx, wf.ID))
+	if s := steps[0]; s.TaskStatus != "FAILED" || s.TaskError != "rejected by ops" || s.DecidedBy != "ops" || s.WaitKind != WaitApproval {
+		t.Fatalf("approval step = %+v", s)
+	}
+	if s := steps[1]; s.TaskStatus != "COMPLETED" || s.Outputs["amount"] != "40" || s.WaitMessage != "payment" {
+		t.Fatalf("signal step = %+v", s)
+	}
+}

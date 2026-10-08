@@ -53,6 +53,11 @@ service CoordinatorService {
   rpc CancelWorkflow (CancelWorkflowRequest) returns (CancelWorkflowResponse) {}
   // Returns a running task's live output from the worker running it.
   rpc GetTaskOutput (TaskOutputRequest) returns (TaskOutputResponse) {}
+  // Approves or rejects a run's waiting approval step.
+  rpc DecideStep (DecideStepRequest) returns (DecideStepResponse) {}
+  // Sends a signal to a run: delivered to a step waiting for it, or kept
+  // until one does.
+  rpc SignalWorkflow (SignalRequest) returns (SignalResponse) {}
 }
 
 message ClientTaskRequest {
@@ -151,4 +156,27 @@ message TaskOutputResponse {
   bool running = 1;
   bytes data = 2;
   int64 next_offset = 3;  // pass back as offset to continue
+}
+
+message DecideStepRequest {
+  string workflow_id = 1;
+  string namespace = 2;
+  string step = 3;
+  bool approve = 4;
+  string comment = 5;
+  string decided_by = 6;   // the API key's name, for the record
+}
+
+message DecideStepResponse {}
+
+message SignalRequest {
+  string workflow_id = 1;
+  string namespace = 2;
+  string name = 3;
+  bytes payload_json = 4;  // a JSON object; its fields become the step's outputs
+  string sent_by = 5;
+}
+
+message SignalResponse {
+  bool delivered = 1;      // false: no step waits for it yet; it is kept
 }

@@ -276,14 +276,23 @@ type StepState struct {
 	TaskError          string
 	Outputs            StringMap
 	CompensationStatus string
+	// Waiting steps (approval, signal): what they wait for and, once
+	// decided, who decided. Their decision is reported as TaskStatus.
+	WaitKind     string
+	WaitMessage  string
+	WaitDeadline *time.Time
+	DecidedBy    string
 }
 
 func (db *DB) GetStepStates(ctx context.Context, workflowID uuid.UUID) ([]*StepState, error) {
 	rows, err := db.q.QueryContext(ctx,
 		`SELECT s.id, s.workflow_id, s.step_number, s.name, s.task_id, s.compensation_task_id, s.status,
 		        s.created_at, s.updated_at,
-		        COALESCE(t.status::text, ''), COALESCE(t.error_message, ''), COALESCE(t.outputs, '{}'),
-		        COALESCE(c.status::text, '')
+		        CASE WHEN s.wait_kind IS NOT NULL THEN COALESCE(s.decision, '') ELSE COALESCE(t.status::text, '') END,
+		        COALESCE(t.error_message, s.decision_error, ''), COALESCE(t.outputs, s.step_outputs, '{}'),
+		        COALESCE(c.status::text, ''),
+		        COALESCE(s.wait_kind, ''), COALESCE(s.wait_message, s.wait_signal, ''), s.wait_deadline,
+		        COALESCE(s.decided_by, '')
 		 FROM workflow_steps s
 		 LEFT JOIN tasks t ON t.id = s.task_id
 		 LEFT JOIN tasks c ON c.id = s.compensation_task_id
@@ -299,7 +308,7 @@ func (db *DB) GetStepStates(ctx context.Context, workflowID uuid.UUID) ([]*StepS
 		s := &StepState{}
 		if err := rows.Scan(&s.ID, &s.WorkflowID, &s.StepNumber, &s.Name, &s.TaskID, &s.CompensationTaskID,
 			&s.Status, &s.CreatedAt, &s.UpdatedAt, &s.TaskStatus, &s.TaskError, &s.Outputs,
-			&s.CompensationStatus); err != nil {
+			&s.CompensationStatus, &s.WaitKind, &s.WaitMessage, &s.WaitDeadline, &s.DecidedBy); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

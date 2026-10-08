@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -154,6 +155,16 @@ type stepJSON struct {
 	Outputs                map[string]string `json:"outputs,omitempty"`
 	CompensationTaskID     *uuid.UUID        `json:"compensation_task_id,omitempty"`
 	CompensationTaskStatus string            `json:"compensation_task_status,omitempty"`
+	Wait                   *waitJSON         `json:"wait,omitempty"` // approval and signal steps
+}
+
+// waitJSON is what a waiting step waits for, and how it was decided.
+type waitJSON struct {
+	Kind      string     `json:"kind"`              // approval or signal
+	Message   string     `json:"message,omitempty"` // approval: the question; signal: its name
+	Deadline  *time.Time `json:"deadline,omitempty"`
+	Waiting   bool       `json:"waiting"`
+	DecidedBy string     `json:"decided_by,omitempty"`
 }
 
 func toWorkflowJSON(wf *db.Workflow, steps []*db.StepState) workflowJSON {
@@ -174,6 +185,7 @@ func toWorkflowJSON(wf *db.Workflow, steps []*db.StepState) workflowJSON {
 			Name: st.Name, Status: st.Status, DependsOn: deps[st.Name], TaskID: st.TaskID,
 			TaskStatus: st.TaskStatus, Error: st.TaskError, Outputs: st.Outputs,
 			CompensationTaskID: st.CompensationTaskID, CompensationTaskStatus: st.CompensationStatus,
+			Wait: waitOf(st),
 		})
 	}
 	return out
@@ -285,4 +297,92 @@ func (s *Server) handleCancelWorkflow(w http.ResponseWriter, r *http.Request) {
 type spendJSON struct {
 	Tokens  int64   `json:"tokens"`
 	CostUSD float64 `json:"cost_usd"`
+}
+
+func waitOf(st *db.StepState) *waitJSON {
+	if st.WaitKind == "" {
+		return nil
+	}
+	return &waitJSON{Kind: st.WaitKind, Message: st.WaitMessage, Deadline: st.WaitDeadline,
+		Waiting: st.Status == db.StepStatus("RUNNING") && st.TaskStatus == "", DecidedBy: st.DecidedBy}
+}
+
+// handleDecideStep approves or rejects a waiting approval step.
+func (s *Server) handleDecideStep(approve bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Comment string `json:"comment"`
+		}
+		if r.ContentLength != 0 && !s.decode(w, r, &req) {
+			return
+		}
+		_, err := s.coordinator.DecideStep(r.Context(), &grpcapi.DecideStepRequest{
+			WorkflowId: r.PathValue("id"), Namespace: namespace(r), Step: r.PathValue("step"),
+			Approve: approve, Comment: req.Comment, DecidedBy: keyName(r),
+		})
+		if err != nil {
+			s.writeRPCError(w, err)
+			return
+		}
+		s.respondWithWorkflow(w, r, r.PathValue("id"), http.StatusOK)
+	}
+}
+
+// handleSignal sends a signal (a JSON object) to a run.
+func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !signalNameRe.MatchString(name) {
+		writeError(w, http.StatusBadRequest, "signal names are letters, digits, '-' or '_'")
+		return
+	}
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	resp, err := s.coordinator.SignalWorkflow(r.Context(), &grpcapi.SignalRequest{
+		WorkflowId: r.PathValue("id"), Namespace: namespace(r), Name: name, PayloadJson: body, SentBy: keyName(r),
+	})
+	if err != nil {
+		s.writeRPCError(w, err)
+		return
+	}
+	code := http.StatusOK
+	if !resp.Delivered {
+		code = http.StatusAccepted // kept until a step waits for it
+	}
+	writeJSON(w, code, map[string]bool{"delivered": resp.Delivered})
+}
+
+// handleListApprovals lists approval steps waiting in the namespace.
+func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request) {
+	list, err := s.db.ListWaiting(r.Context(), namespace(r), db.WaitApproval)
+	if err != nil {
+		s.internalError(w, "Failed to list approvals", err)
+		return
+	}
+	type approvalJSON struct {
+		WorkflowID uuid.UUID  `json:"workflow_id"`
+		Workflow   string     `json:"workflow"`
+		Step       string     `json:"step"`
+		Message    string     `json:"message"`
+		Deadline   *time.Time `json:"deadline,omitempty"`
+		OnTimeout  string     `json:"on_timeout,omitempty"`
+		Since      time.Time  `json:"since"`
+	}
+	out := make([]approvalJSON, 0, len(list))
+	for _, a := range list {
+		out = append(out, approvalJSON{WorkflowID: a.WorkflowID, Workflow: a.Workflow, Step: a.Step,
+			Message: a.Message, Deadline: a.Deadline, OnTimeout: a.OnTimeout, Since: a.Since})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+var signalNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+
+// keyName names the API key that made a request, for the record.
+func keyName(r *http.Request) string {
+	if k, _ := r.Context().Value(apiKeyCtxKey).(*db.APIKey); k != nil {
+		return k.Name
+	}
+	return ""
 }

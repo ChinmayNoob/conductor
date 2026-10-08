@@ -36,6 +36,9 @@ const (
 	TypeHTTP      = "http"
 	TypeContainer = "container"
 	TypeLLM       = "llm"
+	// Waiting steps run no task: they wait for a person or a signal.
+	TypeApproval = "approval"
+	TypeSignal   = "signal"
 )
 
 var (
@@ -77,7 +80,29 @@ type Action struct {
 	HTTP      *HTTPSpec         `yaml:"http,omitempty" json:"http,omitempty"`
 	Container *ContainerSpec    `yaml:"container,omitempty" json:"container,omitempty"`
 	LLM       *LLMSpec          `yaml:"llm,omitempty" json:"llm,omitempty"`
+	Approval  *ApprovalSpec     `yaml:"approval,omitempty" json:"approval,omitempty"`
+	Signal    *SignalSpec       `yaml:"signal,omitempty" json:"signal,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+}
+
+// ApprovalSpec pauses the run until a person approves (the step completes)
+// or rejects (it fails, and completed steps are compensated). Message may
+// use ${{ }} expressions. With a timeout, OnTimeout decides: reject
+// (default) or approve.
+// An approved step's outputs are comment and decided_by (the API key's
+// name, or "timeout").
+type ApprovalSpec struct {
+	Message   string   `yaml:"message,omitempty" json:"message,omitempty"`
+	Timeout   Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	OnTimeout string   `yaml:"on_timeout,omitempty" json:"on_timeout,omitempty"`
+}
+
+// SignalSpec pauses the run until a signal of this name is sent to it; the
+// signal's JSON fields become the step's outputs. A signal sent before the
+// step starts is kept for it. With a timeout the step fails.
+type SignalSpec struct {
+	Name    string   `yaml:"name" json:"name"`
+	Timeout Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 }
 
 // LLMSpec asks a language model for a completion. Prompt and System may use
@@ -403,8 +428,32 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 		}
 		checkExpr("llm.prompt", a.LLM.Prompt)
 		checkExpr("llm.system", a.LLM.System)
+	case TypeApproval:
+		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Signal != nil {
+			add("approval steps run nothing: no 'run', 'http', 'container', 'llm' or 'signal'")
+		}
+		if a.Approval != nil {
+			if o := a.Approval.OnTimeout; o != "" && o != "approve" && o != "reject" {
+				add("approval.on_timeout must be approve or reject")
+			}
+			if a.Approval.Timeout < 0 {
+				add("approval.timeout must not be negative")
+			}
+			checkExpr("approval.message", a.Approval.Message)
+		}
+	case TypeSignal:
+		if a.Signal == nil || !signalNameRe.MatchString(a.Signal.Name) {
+			add("signal steps need 'signal.name' (letters, digits, '-' or '_')")
+			break
+		}
+		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Approval != nil {
+			add("signal steps run nothing: no 'run', 'http', 'container', 'llm' or 'approval'")
+		}
+		if a.Signal.Timeout < 0 {
+			add("signal.timeout must not be negative")
+		}
 	default:
-		add("unknown type %q (want shell, http, container or llm)", a.Type)
+		add("unknown type %q (want shell, http, container, llm, approval or signal)", a.Type)
 	}
 
 	for k, v := range a.Env {
@@ -516,3 +565,8 @@ func ValidateLLM(l *LLMSpec) error {
 	}
 	return joinErrors(errs)
 }
+
+var signalNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+
+// IsWait reports whether a step type waits instead of running a task.
+func IsWait(stepType string) bool { return stepType == TypeApproval || stepType == TypeSignal }

@@ -447,6 +447,7 @@ type WorkflowStep struct {
 	Outputs                map[string]string `json:"outputs,omitempty"`
 	CompensationTaskID     string            `json:"compensation_task_id,omitempty"`
 	CompensationTaskStatus string            `json:"compensation_task_status,omitempty"`
+	Wait                   *StepWait         `json:"wait,omitempty"` // approval and signal steps
 }
 
 // Step returns the step with this name, or nil.
@@ -498,6 +499,65 @@ func (c *Client) CancelWorkflow(ctx context.Context, id string) (*Workflow, erro
 	var wf Workflow
 	_, err := c.do(ctx, http.MethodPost, "/v1/workflows/"+url.PathEscape(id)+"/cancel", nil, &wf)
 	return &wf, err
+}
+
+// StepWait is what an approval or signal step waits for.
+type StepWait struct {
+	Kind      string     `json:"kind"`              // approval or signal
+	Message   string     `json:"message,omitempty"` // the question, or the signal's name
+	Deadline  *time.Time `json:"deadline,omitempty"`
+	Waiting   bool       `json:"waiting"`
+	DecidedBy string     `json:"decided_by,omitempty"`
+}
+
+// ApproveStep approves a run's waiting approval step.
+func (c *Client) ApproveStep(ctx context.Context, workflowID, step, comment string) (*Workflow, error) {
+	return c.decide(ctx, workflowID, step, "approve", comment)
+}
+
+// RejectStep rejects a run's waiting approval step: it fails, and the run
+// compensates.
+func (c *Client) RejectStep(ctx context.Context, workflowID, step, comment string) (*Workflow, error) {
+	return c.decide(ctx, workflowID, step, "reject", comment)
+}
+
+func (c *Client) decide(ctx context.Context, workflowID, step, verb, comment string) (*Workflow, error) {
+	var wf Workflow
+	_, err := c.do(ctx, http.MethodPost, "/v1/workflows/"+url.PathEscape(workflowID)+"/steps/"+url.PathEscape(step)+"/"+verb,
+		map[string]string{"comment": comment}, &wf)
+	return &wf, err
+}
+
+// Signal sends a signal to a run; payload (a struct or map) becomes the
+// waiting step's outputs. delivered is false when no step waits for it yet:
+// it is kept until one does.
+func (c *Client) Signal(ctx context.Context, workflowID, name string, payload any) (delivered bool, err error) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	var out struct {
+		Delivered bool `json:"delivered"`
+	}
+	_, err = c.do(ctx, http.MethodPost, "/v1/workflows/"+url.PathEscape(workflowID)+"/signals/"+url.PathEscape(name), payload, &out)
+	return out.Delivered, err
+}
+
+// Approval is an approval step waiting for a decision.
+type Approval struct {
+	WorkflowID string     `json:"workflow_id"`
+	Workflow   string     `json:"workflow"`
+	Step       string     `json:"step"`
+	Message    string     `json:"message"`
+	Deadline   *time.Time `json:"deadline,omitempty"`
+	OnTimeout  string     `json:"on_timeout,omitempty"`
+	Since      time.Time  `json:"since"`
+}
+
+// ListApprovals lists approval steps waiting in the namespace.
+func (c *Client) ListApprovals(ctx context.Context) ([]Approval, error) {
+	var list []Approval
+	_, err := c.do(ctx, http.MethodGet, "/v1/approvals", nil, &list)
+	return list, err
 }
 
 // WaitForWorkflow polls until the workflow finishes or ctx is done.

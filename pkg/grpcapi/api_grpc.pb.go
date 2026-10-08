@@ -212,6 +212,8 @@ const (
 	CoordinatorService_SubmitWorkflow_FullMethodName   = "/grpcapi.CoordinatorService/SubmitWorkflow"
 	CoordinatorService_CancelWorkflow_FullMethodName   = "/grpcapi.CoordinatorService/CancelWorkflow"
 	CoordinatorService_GetTaskOutput_FullMethodName    = "/grpcapi.CoordinatorService/GetTaskOutput"
+	CoordinatorService_DecideStep_FullMethodName       = "/grpcapi.CoordinatorService/DecideStep"
+	CoordinatorService_SignalWorkflow_FullMethodName   = "/grpcapi.CoordinatorService/SignalWorkflow"
 )
 
 // CoordinatorServiceClient is the client API for CoordinatorService service.
@@ -228,6 +230,11 @@ type CoordinatorServiceClient interface {
 	CancelWorkflow(ctx context.Context, in *CancelWorkflowRequest, opts ...grpc.CallOption) (*CancelWorkflowResponse, error)
 	// Returns a running task's live output from the worker running it.
 	GetTaskOutput(ctx context.Context, in *TaskOutputRequest, opts ...grpc.CallOption) (*TaskOutputResponse, error)
+	// Approves or rejects a run's waiting approval step.
+	DecideStep(ctx context.Context, in *DecideStepRequest, opts ...grpc.CallOption) (*DecideStepResponse, error)
+	// Sends a signal to a run: delivered to a step waiting for it, or kept
+	// until one does.
+	SignalWorkflow(ctx context.Context, in *SignalRequest, opts ...grpc.CallOption) (*SignalResponse, error)
 }
 
 type coordinatorServiceClient struct {
@@ -308,6 +315,26 @@ func (c *coordinatorServiceClient) GetTaskOutput(ctx context.Context, in *TaskOu
 	return out, nil
 }
 
+func (c *coordinatorServiceClient) DecideStep(ctx context.Context, in *DecideStepRequest, opts ...grpc.CallOption) (*DecideStepResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DecideStepResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_DecideStep_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *coordinatorServiceClient) SignalWorkflow(ctx context.Context, in *SignalRequest, opts ...grpc.CallOption) (*SignalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SignalResponse)
+	err := c.cc.Invoke(ctx, CoordinatorService_SignalWorkflow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CoordinatorServiceServer is the server API for CoordinatorService service.
 // All implementations must embed UnimplementedCoordinatorServiceServer
 // for forward compatibility.
@@ -322,6 +349,11 @@ type CoordinatorServiceServer interface {
 	CancelWorkflow(context.Context, *CancelWorkflowRequest) (*CancelWorkflowResponse, error)
 	// Returns a running task's live output from the worker running it.
 	GetTaskOutput(context.Context, *TaskOutputRequest) (*TaskOutputResponse, error)
+	// Approves or rejects a run's waiting approval step.
+	DecideStep(context.Context, *DecideStepRequest) (*DecideStepResponse, error)
+	// Sends a signal to a run: delivered to a step waiting for it, or kept
+	// until one does.
+	SignalWorkflow(context.Context, *SignalRequest) (*SignalResponse, error)
 	mustEmbedUnimplementedCoordinatorServiceServer()
 }
 
@@ -352,6 +384,12 @@ func (UnimplementedCoordinatorServiceServer) CancelWorkflow(context.Context, *Ca
 }
 func (UnimplementedCoordinatorServiceServer) GetTaskOutput(context.Context, *TaskOutputRequest) (*TaskOutputResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTaskOutput not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) DecideStep(context.Context, *DecideStepRequest) (*DecideStepResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DecideStep not implemented")
+}
+func (UnimplementedCoordinatorServiceServer) SignalWorkflow(context.Context, *SignalRequest) (*SignalResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SignalWorkflow not implemented")
 }
 func (UnimplementedCoordinatorServiceServer) mustEmbedUnimplementedCoordinatorServiceServer() {}
 func (UnimplementedCoordinatorServiceServer) testEmbeddedByValue()                            {}
@@ -500,6 +538,42 @@ func _CoordinatorService_GetTaskOutput_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CoordinatorService_DecideStep_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DecideStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).DecideStep(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_DecideStep_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).DecideStep(ctx, req.(*DecideStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CoordinatorService_SignalWorkflow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SignalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CoordinatorServiceServer).SignalWorkflow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CoordinatorService_SignalWorkflow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CoordinatorServiceServer).SignalWorkflow(ctx, req.(*SignalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CoordinatorService_ServiceDesc is the grpc.ServiceDesc for CoordinatorService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -534,6 +608,14 @@ var CoordinatorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTaskOutput",
 			Handler:    _CoordinatorService_GetTaskOutput_Handler,
+		},
+		{
+			MethodName: "DecideStep",
+			Handler:    _CoordinatorService_DecideStep_Handler,
+		},
+		{
+			MethodName: "SignalWorkflow",
+			Handler:    _CoordinatorService_SignalWorkflow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

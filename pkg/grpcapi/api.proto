@@ -20,6 +20,8 @@ service WorkerService {
   rpc SubmitTask (TaskRequest) returns (TaskResponse) {}
   // Kills the task if it is running on this worker.
   rpc CancelTask (CancelTaskRequest) returns (CancelTaskResponse) {}
+  // Returns a running task's output so far, from an offset.
+  rpc GetTaskOutput (TaskOutputRequest) returns (TaskOutputResponse) {}
 }
 
 message TaskRequest {
@@ -49,6 +51,8 @@ service CoordinatorService {
 
   rpc SubmitWorkflow (WorkflowRequest) returns (WorkflowResponse) {}
   rpc CancelWorkflow (CancelWorkflowRequest) returns (CancelWorkflowResponse) {}
+  // Returns a running task's live output from the worker running it.
+  rpc GetTaskOutput (TaskOutputRequest) returns (TaskOutputResponse) {}
 }
 
 message ClientTaskRequest {
@@ -121,4 +125,17 @@ message CancelWorkflowRequest {
 message CancelWorkflowResponse {
   // False if the workflow had already finished.
   bool cancelled = 1;
+}
+
+message TaskOutputRequest {
+  string task_id = 1;
+  int32 attempt = 2;    // the attempt to read; others report not running
+  int64 offset = 3;     // position in the output stream to read from
+}
+
+message TaskOutputResponse {
+  // False if the attempt isn't running (anymore): read the stored output.
+  bool running = 1;
+  bytes data = 2;
+  int64 next_offset = 3;  // pass back as offset to continue
 }

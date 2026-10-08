@@ -62,7 +62,7 @@ type Server struct {
 	killTasks context.CancelCauseFunc
 
 	mu       sync.Mutex
-	running  map[string]context.CancelCauseFunc
+	running  map[string]*runningTask
 	draining bool
 	wg       sync.WaitGroup
 }
@@ -93,7 +93,7 @@ func NewServer(opts Options) *Server {
 		log:         slog.Default(),
 		tasksCtx:    ctx,
 		killTasks:   kill,
-		running:     make(map[string]context.CancelCauseFunc),
+		running:     make(map[string]*runningTask),
 	}
 
 	s.labels = maps.Clone(opts.Labels)
@@ -157,7 +157,7 @@ func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*
 	}
 
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)
-	s.running[req.TaskId] = cancel
+	s.running[req.TaskId] = &runningTask{cancel: cancel, attempt: req.Attempt, out: newCappedBuffer(s.maxOutput)}
 	s.wg.Add(1)
 	// The task outlives this call; keep its trace.
 	go s.run(trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(rpcCtx)), req)
@@ -167,13 +167,33 @@ func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*
 
 func (s *Server) CancelTask(_ context.Context, req *grpcapi.CancelTaskRequest) (*grpcapi.CancelTaskResponse, error) {
 	s.mu.Lock()
-	cancel, ok := s.running[req.TaskId]
+	rt, ok := s.running[req.TaskId]
 	s.mu.Unlock()
 	if ok {
 		s.log.Info("Cancelling task", "task_id", req.TaskId)
-		cancel(errCancelled)
+		rt.cancel(errCancelled)
 	}
 	return &grpcapi.CancelTaskResponse{Cancelled: ok}, nil
+}
+
+// runningTask is a task this worker is running.
+type runningTask struct {
+	cancel  context.CancelCauseFunc
+	attempt int32
+	out     *cappedBuffer // shell output, readable while it runs
+}
+
+// GetTaskOutput returns a running task's output so far. Only shell tasks
+// produce output while running; the others report it when they finish.
+func (s *Server) GetTaskOutput(_ context.Context, req *grpcapi.TaskOutputRequest) (*grpcapi.TaskOutputResponse, error) {
+	s.mu.Lock()
+	rt, ok := s.running[req.TaskId]
+	s.mu.Unlock()
+	if !ok || rt.attempt != req.Attempt {
+		return &grpcapi.TaskOutputResponse{Running: false, NextOffset: req.Offset}, nil
+	}
+	data, next := rt.out.ReadFrom(req.Offset)
+	return &grpcapi.TaskOutputResponse{Running: true, Data: data, NextOffset: next}, nil
 }
 
 func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
@@ -223,7 +243,7 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	)
 	switch task.Type {
 	case "", "shell":
-		output, outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.maxOutput)
+		output, outputs, err = runShell(ctx, task.Data, taskEnv(s.env, env), timeout, s.outputOf(task.TaskId))
 	case "http":
 		output, outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
 	case "container":
@@ -296,6 +316,16 @@ func taskType(t string) string {
 		return "shell"
 	}
 	return t
+}
+
+// outputOf returns the live output buffer of a running task.
+func (s *Server) outputOf(taskID string) *cappedBuffer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rt, ok := s.running[taskID]; ok {
+		return rt.out
+	}
+	return newCappedBuffer(s.maxOutput)
 }
 
 // Collector reports this worker's slots and running tasks when scraped.

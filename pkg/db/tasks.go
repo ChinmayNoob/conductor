@@ -405,26 +405,43 @@ const maxRetryDelay = time.Hour
 // left, keeping the failed attempt's output for debugging. It returns false
 // when the retries are used up.
 func (db *DB) RetryTask(ctx context.Context, id uuid.UUID, attempt int, output, errorMessage string) (bool, error) {
-	result, err := db.q.ExecContext(ctx,
-		`UPDATE tasks
-		 SET retry_count = retry_count + 1,
-		     status = 'QUEUED',
-		     picked_at = NULL,
-		     started_at = NULL,
-		     failed_at = NULL,
-		     error_message = $2,
-		     output = $4,
-		     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
-		 WHERE id = $1
-		   AND `+dispatchedCondition+`
-		   AND attempt = $5
-		   AND retry_count < max_retries`,
+	// One statement: lock the attempt, record it in task_attempts, and
+	// requeue the task.
+	var n int
+	err := db.q.QueryRowContext(ctx,
+		`WITH failed AS (
+			 SELECT id, attempt, worker_id, COALESCE(started_at, picked_at) AS started
+			 FROM tasks
+			 WHERE id = $1
+			   AND `+dispatchedCondition+`
+			   AND attempt = $5
+			   AND retry_count < max_retries
+			 FOR UPDATE
+		 ), retried AS (
+			 UPDATE tasks t
+			 SET retry_count = retry_count + 1,
+			     status = 'QUEUED',
+			     picked_at = NULL,
+			     started_at = NULL,
+			     failed_at = NULL,
+			     error_message = $2,
+			     output = $4,
+			     scheduled_at = NOW() + make_interval(secs => LEAST(retry_delay_seconds * POWER(2, retry_count), $3))
+			 FROM failed WHERE t.id = failed.id
+			 RETURNING t.id
+		 ), kept AS (
+			 INSERT INTO task_attempts (task_id, attempt, worker_id, started_at, finished_at, status, error_message, output)
+			 SELECT f.id, f.attempt, f.worker_id, f.started, NOW(), 'FAILED', NULLIF($2, ''), NULLIF($4, '')
+			 FROM failed f JOIN retried USING (id)
+			 ON CONFLICT DO NOTHING
+		 )
+		 SELECT count(*) FROM retried`,
 		id, errorMessage, maxRetryDelay.Seconds(), output, attempt,
-	)
+	).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("failed to retry task: %w", err)
 	}
-	return rowsChanged(result)
+	return n > 0, nil
 }
 
 func (db *DB) MarkTaskStarted(ctx context.Context, id uuid.UUID, attempt int, workerID int64) (bool, error) {
@@ -528,12 +545,23 @@ func (db *DB) CancelTask(ctx context.Context, id uuid.UUID) (*Task, error) {
 // their workflow has already moved on. It returns nil if the task isn't
 // eligible.
 func (db *DB) RequeueFailedTask(ctx context.Context, id uuid.UUID) (*Task, error) {
+	// The failed attempt is kept in task_attempts before the reset.
 	t, err := scanTask(db.q.QueryRowContext(ctx,
-		`UPDATE tasks
+		`WITH failed AS (
+			 SELECT id, attempt, worker_id, COALESCE(started_at, picked_at) AS started, failed_at, error_message, output
+			 FROM tasks WHERE id = $1 AND status = 'FAILED' AND workflow_id IS NULL
+			 FOR UPDATE
+		 ), kept AS (
+			 INSERT INTO task_attempts (task_id, attempt, worker_id, started_at, finished_at, status, error_message, output)
+			 SELECT id, attempt, worker_id, started, COALESCE(failed_at, NOW()), 'FAILED', error_message, output
+			 FROM failed WHERE attempt > 0
+			 ON CONFLICT DO NOTHING
+		 )
+		 UPDATE tasks t
 		 SET status = 'QUEUED', retry_count = 0, picked_at = NULL, started_at = NULL,
 		     failed_at = NULL, error_message = NULL, scheduled_at = NOW()
-		 WHERE id = $1 AND status = 'FAILED' AND workflow_id IS NULL
-		 RETURNING `+taskColumns,
+		 FROM failed WHERE t.id = failed.id
+		 RETURNING `+prefixColumns("t", taskColumns),
 		id,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -543,6 +571,38 @@ func (db *DB) RequeueFailedTask(ctx context.Context, id uuid.UUID) (*Task, error
 		return nil, fmt.Errorf("failed to requeue task: %w", err)
 	}
 	return t, nil
+}
+
+// AttemptRecord is an earlier attempt of a task, kept when it failed.
+type AttemptRecord struct {
+	Attempt      int
+	WorkerID     *int64
+	StartedAt    *time.Time
+	FinishedAt   time.Time
+	Status       string
+	ErrorMessage string
+	Output       string
+}
+
+// ListAttempts returns a task's earlier attempts, oldest first. The latest
+// attempt is the task row itself.
+func (db *DB) ListAttempts(ctx context.Context, id uuid.UUID) ([]AttemptRecord, error) {
+	rows, err := db.q.QueryContext(ctx,
+		`SELECT attempt, worker_id, started_at, finished_at, status, COALESCE(error_message, ''), COALESCE(output, '')
+		 FROM task_attempts WHERE task_id = $1 ORDER BY attempt`, id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list attempts: %w", err)
+	}
+	defer rows.Close()
+	var out []AttemptRecord
+	for rows.Next() {
+		var a AttemptRecord
+		if err := rows.Scan(&a.Attempt, &a.WorkerID, &a.StartedAt, &a.FinishedAt, &a.Status, &a.ErrorMessage, &a.Output); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // TaskAttempt identifies one dispatch of a task.

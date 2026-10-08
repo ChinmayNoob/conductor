@@ -4,8 +4,10 @@ package e2e
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -143,4 +145,81 @@ func jaegerSpans(t *testing.T, jaeger, traceID string) []string {
 		}
 	}
 	return out
+}
+
+// lockedBuffer collects streamed output from another goroutine.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestFollowLogsLive(t *testing.T) {
+	c := newClient(t)
+	task := submit(t, c, client.TaskRequest{Command: "for i in 1 2 3 4 5 6; do echo line-$i; sleep 1; done"})
+
+	var out lockedBuffer
+	done := make(chan error, 1)
+	go func() { done <- c.TaskLogs(ctxTimeout(t, time.Minute), task.ID, true, &out) }()
+
+	// The first line must arrive while the task is still running.
+	deadline := time.Now().Add(15 * time.Second)
+	for !strings.Contains(out.String(), "line-1") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no live output after 15s: %q", out.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got, err := c.GetTask(ctxTimeout(t, 5*time.Second), task.ID); err != nil || got.Status == "COMPLETED" {
+		t.Fatalf("output arrived only after the task finished (status %v, err %v)", got.Status, err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 6; i++ {
+		if n := strings.Count(out.String(), fmt.Sprintf("line-%d\n", i)); n != 1 {
+			t.Fatalf("line-%d appears %d times in the followed output:\n%s", i, n, out.String())
+		}
+	}
+}
+
+func TestAttemptsAndLogsAcrossRetries(t *testing.T) {
+	c := newClient(t)
+	task := submit(t, c, client.TaskRequest{
+		Command:           `echo "try $CONDUCTOR_ATTEMPT"; sleep 1; [ "$CONDUCTOR_RETRY" -ge 1 ] || { echo boom >&2; exit 3; }`,
+		MaxRetries:        client.Retries(1),
+		RetryDelaySeconds: 1,
+	})
+	var out lockedBuffer
+	if err := c.TaskLogs(ctxTimeout(t, time.Minute), task.ID, true, &out); err != nil {
+		t.Fatal(err)
+	}
+	if task = waitTask(t, c, task.ID, time.Minute); task.Status != "COMPLETED" {
+		t.Fatalf("task %s", task.Status)
+	}
+
+	attempts, err := c.TaskAttempts(ctxTimeout(t, 10*time.Second), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 || attempts[0].Status != "FAILED" || !strings.Contains(attempts[0].Error, "exit status 3") ||
+		!strings.Contains(attempts[0].Output, "boom") || attempts[1].Status != "COMPLETED" || !attempts[1].Current {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+	logs := out.String()
+	if !strings.Contains(logs, "try 1") || !strings.Contains(logs, "--- attempt 2 ---") || !strings.Contains(logs, "try 2") {
+		t.Fatalf("followed logs don't show both attempts:\n%s", logs)
+	}
 }

@@ -635,6 +635,32 @@ func (s *Server) killOnWorker(ctx context.Context, taskID uuid.UUID) {
 	}
 }
 
+// GetTaskOutput returns a running attempt's output so far, read from the
+// worker running it. It reports running=false when this leader doesn't know
+// the attempt as running; the caller then reads the stored output.
+func (s *Server) GetTaskOutput(ctx context.Context, req *grpcapi.TaskOutputRequest) (*grpcapi.TaskOutputResponse, error) {
+	taskID, err := uuid.Parse(req.TaskId)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid task ID")
+	}
+	s.mu.RLock()
+	var w *Worker
+	if d, ok := s.inFlight[taskID]; ok && d.attempt == int(req.Attempt) {
+		w = s.workers[d.workerID]
+	}
+	s.mu.RUnlock()
+	if w == nil {
+		return &grpcapi.TaskOutputResponse{NextOffset: req.Offset}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := w.client.GetTaskOutput(ctx, req)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, "the worker running the task is unreachable")
+	}
+	return resp, nil
+}
+
 // --- Worker-facing RPCs ---
 
 func (s *Server) SendHeartbeat(ctx context.Context, req *grpcapi.HeartbeatRequest) (*grpcapi.HeartbeatResponse, error) {

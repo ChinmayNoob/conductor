@@ -23,7 +23,7 @@ var outputKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,127}$`)
 // cancelled or the timeout hits. Output (stdout and stderr interleaved) is
 // capped at maxOutput bytes. key=value lines the command appends to the file
 // named by $CONDUCTOR_OUTPUT are returned as outputs.
-func runShell(ctx context.Context, command string, env []string, timeout time.Duration, maxOutput int) (string, map[string]string, error) {
+func runShell(ctx context.Context, command string, env []string, timeout time.Duration, out *cappedBuffer) (string, map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -36,7 +36,6 @@ func runShell(ctx context.Context, command string, env []string, timeout time.Du
 
 	cmd := shellCommand(ctx, command)
 	cmd.Env = append(env, "CONDUCTOR_OUTPUT="+outFile.Name())
-	out := newCappedBuffer(maxOutput)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	// If a killed process leaves children holding the output pipes, stop

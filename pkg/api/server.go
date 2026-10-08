@@ -59,6 +59,8 @@ func (s *Server) Handler() http.Handler {
 	authed("GET /v1/tasks/{id}", s.handleGetTask)
 	authed("POST /v1/tasks/{id}/cancel", s.handleCancelTask)
 	authed("POST /v1/tasks/{id}/requeue", s.handleRequeueTask)
+	authed("GET /v1/tasks/{id}/attempts", s.handleTaskAttempts)
+	authed("GET /v1/tasks/{id}/logs", s.handleTaskLogs)
 	authed("GET /v1/dead-letter", s.handleDeadLetter)
 	authed("GET /v1/stats", s.handleStats)
 

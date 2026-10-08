@@ -271,6 +271,65 @@ func (c *Client) Stats(ctx context.Context) (map[string]int, error) {
 	return stats, err
 }
 
+// Attempt is one dispatch of a task: the earlier, failed ones and the latest.
+type Attempt struct {
+	Attempt    int        `json:"attempt"`
+	Status     string     `json:"status"`
+	WorkerID   *int64     `json:"worker_id,omitempty"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	Output     string     `json:"output,omitempty"`
+	Current    bool       `json:"current"`
+}
+
+// TaskAttempts lists every attempt of a task, oldest first.
+func (c *Client) TaskAttempts(ctx context.Context, id string) ([]Attempt, error) {
+	var list []Attempt
+	_, err := c.do(ctx, http.MethodGet, "/v1/tasks/"+url.PathEscape(id)+"/attempts", nil, &list)
+	return list, err
+}
+
+// TaskLogs copies a task's output to w. With follow, it streams live output
+// until the task finishes (across retries) or ctx ends.
+func (c *Client) TaskLogs(ctx context.Context, id string, follow bool, w io.Writer) error {
+	path := "/v1/tasks/" + url.PathEscape(id) + "/logs"
+	if follow {
+		path += "?follow=true"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	if c.namespace != "" {
+		req.Header.Set("X-Conductor-Namespace", c.namespace)
+	}
+	// No client timeout: a followed task may run for a long time.
+	resp, err := (&http.Client{Transport: c.http.Transport}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(raw, &e) != nil || e.Error == "" {
+			e.Error = strings.TrimSpace(string(raw))
+		}
+		return &APIError{StatusCode: resp.StatusCode, Message: e.Error}
+	}
+	_, err = io.Copy(w, resp.Body)
+	if ctx.Err() != nil {
+		return nil // stopped following
+	}
+	return err
+}
+
 // WaitForTask polls until the task finishes or ctx is done.
 func (c *Client) WaitForTask(ctx context.Context, id string) (*Task, error) {
 	return poll(ctx, func() (*Task, bool, error) {

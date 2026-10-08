@@ -220,6 +220,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 docker compose --profile observab
 # Grafana http://localhost:3000 · Prometheus http://localhost:9091 · Jaeger http://localhost:16686
 ```
 
+If a port is taken, set `GRAFANA_PORT`, `PROMETHEUS_PORT` or `JAEGER_PORT`.
+
 The profile provisions a Grafana dashboard and [example alerts](observability/alerts.yml): no leader, no healthy workers, a queue backing up, a failure-rate spike, lost tasks.
 
 ## Security

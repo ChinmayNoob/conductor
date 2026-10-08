@@ -4,7 +4,8 @@
 #   docker compose up -d --build --scale worker=3
 #   docker compose --profile containers up -d   # also run container tasks
 #   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d   # with mTLS
-#   # Prometheus :9091, Grafana :3000 and, with tracing on, Jaeger :16686:
+#   # Prometheus :9091, Grafana :3000 and, with tracing on, Jaeger :16686
+#   # (PROMETHEUS_PORT, GRAFANA_PORT and JAEGER_PORT change them):
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 docker compose --profile observability up -d
 
 x-conductor: &conductor
@@ -122,7 +123,7 @@ services:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
-      - "9091:9090"
+      - "${PROMETHEUS_PORT:-9091}:9090"
 
   grafana:
     image: grafana/grafana:12.1.0
@@ -135,7 +136,7 @@ services:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus
 
@@ -143,7 +144,7 @@ services:
     image: jaegertracing/jaeger:2.9.0
     profiles: ["observability"]
     ports:
-      - "16686:16686"
+      - "${JAEGER_PORT:-16686}:16686"
 
 volumes:
   postgres_data:

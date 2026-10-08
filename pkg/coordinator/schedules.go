@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/schedule"
 	"github.com/google/uuid"
 )
@@ -101,6 +102,7 @@ func (s *Server) fireDueSchedules(ctx context.Context) {
 		s.reconcile(ctx, id)
 	}
 	if fired > 0 {
+		metrics.SchedulesFired.Add(float64(fired))
 		s.wakeDispatcher()
 	}
 }

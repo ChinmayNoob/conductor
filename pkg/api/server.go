@@ -17,6 +17,7 @@ import (
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -237,11 +238,23 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the real writer (to flush).
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		next.ServeHTTP(rec, r)
+
+		// The mux records the matched pattern on the request: a bounded
+		// label, unlike the path.
+		route := r.Pattern
+		if route == "" {
+			route = "unmatched"
+		}
+		metrics.HTTPRequests.WithLabelValues(route, strconv.Itoa(rec.code)).Inc()
+		metrics.HTTPDuration.WithLabelValues(route).Observe(time.Since(start).Seconds())
 
 		level := slog.LevelInfo
 		if r.Method == http.MethodGet && rec.code < 500 {

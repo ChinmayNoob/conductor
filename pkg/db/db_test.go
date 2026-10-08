@@ -660,3 +660,26 @@ func TestAPIKeys(t *testing.T) {
 		t.Fatal("a revoked key still authenticates")
 	}
 }
+
+func TestQueueDepths(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "held", Paused: true}))
+	create(t, db, "ready")
+	create(t, db, "ready too")
+	create(t, db, "later", func(n *NewTask) { n.ScheduledAt = time.Now().Add(time.Hour) })
+	create(t, db, "held", func(n *NewTask) { n.Queue = "held" })
+	pick(t, db) // one ready task starts running
+
+	got := map[string]QueueDepth{}
+	for _, d := range must[[]QueueDepth](t)(db.QueueDepths(ctx)) {
+		got[d.Queue] = d
+	}
+	def, held := got["default"], got["held"]
+	if def.Ready != 1 || def.Delayed != 1 || def.Running != 1 || def.Paused != 0 || def.OldestReady == nil {
+		t.Errorf("default queue = %+v, want 1 ready (with an age), 1 delayed, 1 running", def)
+	}
+	if held.Paused != 1 || held.Ready != 0 || held.OldestReady != nil {
+		t.Errorf("paused queue = %+v, want its task counted as paused, not ready", held)
+	}
+}

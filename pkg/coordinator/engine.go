@@ -12,6 +12,7 @@ import (
 	"github.com/ChinmayNoob/conductor/examples"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/task"
 	"github.com/ChinmayNoob/conductor/pkg/workflow"
 	"github.com/google/uuid"
@@ -119,12 +120,17 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 	log := s.log.With("workflow_id", wfID)
 	var toKill []uuid.UUID
 	createdTasks := false
+	var finished db.WorkflowStatus // set when this pass ends the run
+	compensations := 0
+	namespace := ""
 
 	err := s.fenced(ctx, func(tx *db.DB) error {
 		wf, err := tx.LockWorkflow(ctx, wfID)
 		if err != nil || wf == nil || wf.Status.Terminal() {
 			return err
 		}
+		namespace = wf.Namespace
+		finished, compensations = "", 0 // a retried transaction starts over
 		if wf.Definition == nil {
 			log.Warn("Workflow predates workflow definitions and cannot continue")
 			return tx.UpdateWorkflowStatus(ctx, wf.ID, db.WorkflowFailed, "created by an older version without a definition")
@@ -180,6 +186,9 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					return err
 				}
 				wf.Status, wf.ErrorMessage = db.WorkflowStatus(plan.SetStatus), errMsg
+				if wf.Status.Terminal() {
+					finished = wf.Status
+				}
 				log.Info("Workflow status changed", "status", plan.SetStatus, "error", errMsg)
 			}
 
@@ -229,6 +238,7 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 					return err
 				}
 				createdTasks = true
+				compensations++
 				log.Info("Compensating workflow step", "step", name, "task_id", t.ID)
 			}
 
@@ -264,6 +274,10 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 		return
 	}
 
+	if finished != "" {
+		metrics.WorkflowsFinished.WithLabelValues(namespace, string(finished)).Inc()
+	}
+	metrics.StepsCompensated.Add(float64(compensations))
 	for _, id := range toKill {
 		s.killOnWorker(ctx, id)
 	}

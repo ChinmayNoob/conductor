@@ -577,6 +577,8 @@ func (db *DB) ListOverdueTasks(ctx context.Context, grace time.Duration) ([]Task
 // sees it when it takes over.
 type DispatchedTask struct {
 	ID             uuid.UUID
+	Namespace      string
+	Queue          string
 	Attempt        int
 	WorkerID       *int64
 	StartedAt      *time.Time
@@ -586,7 +588,7 @@ type DispatchedTask struct {
 // ListDispatchedTasks returns every task that is picked and unfinished.
 func (db *DB) ListDispatchedTasks(ctx context.Context) ([]DispatchedTask, error) {
 	rows, err := db.q.QueryContext(ctx,
-		`SELECT id, attempt, worker_id, started_at, timeout_seconds FROM tasks
+		`SELECT id, namespace, queue, attempt, worker_id, started_at, timeout_seconds FROM tasks
 		 WHERE picked_at IS NOT NULL AND status IN ('QUEUED', 'STARTED')`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list dispatched tasks: %w", err)
@@ -596,7 +598,7 @@ func (db *DB) ListDispatchedTasks(ctx context.Context) ([]DispatchedTask, error)
 	var out []DispatchedTask
 	for rows.Next() {
 		var d DispatchedTask
-		if err := rows.Scan(&d.ID, &d.Attempt, &d.WorkerID, &d.StartedAt, &d.TimeoutSeconds); err != nil {
+		if err := rows.Scan(&d.ID, &d.Namespace, &d.Queue, &d.Attempt, &d.WorkerID, &d.StartedAt, &d.TimeoutSeconds); err != nil {
 			return nil, err
 		}
 		out = append(out, d)

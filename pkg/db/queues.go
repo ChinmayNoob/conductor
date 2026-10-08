@@ -103,3 +103,50 @@ func (db *DB) DeleteQueue(ctx context.Context, namespace, name string) (bool, er
 	}
 	return rowsChanged(result)
 }
+
+// QueueDepth is what a queue holds right now.
+type QueueDepth struct {
+	Namespace, Queue string
+	Ready            int // due and waiting for a worker
+	Delayed          int // waiting for their scheduled time (or a retry)
+	Paused           int // waiting in a paused queue
+	Running          int // claimed and not finished
+	OldestReady      *time.Time
+}
+
+// QueueDepths counts waiting and running tasks per queue. Each half matches a
+// partial index's predicate, so it reads only unfinished tasks.
+func (db *DB) QueueDepths(ctx context.Context) ([]QueueDepth, error) {
+	rows, err := db.q.QueryContext(ctx,
+		`WITH waiting AS (
+			 SELECT t.namespace, t.queue,
+			        count(*) FILTER (WHERE t.scheduled_at <= NOW() AND NOT COALESCE(q.paused, false)) AS ready,
+			        count(*) FILTER (WHERE t.scheduled_at > NOW() AND NOT COALESCE(q.paused, false)) AS delayed,
+			        count(*) FILTER (WHERE COALESCE(q.paused, false)) AS paused,
+			        min(t.scheduled_at) FILTER (WHERE t.scheduled_at <= NOW() AND NOT COALESCE(q.paused, false)) AS oldest
+			 FROM tasks t
+			 LEFT JOIN queues q ON q.namespace = t.namespace AND q.name = t.queue
+			 WHERE t.status = 'QUEUED' AND t.picked_at IS NULL
+			 GROUP BY 1, 2
+		 ), running AS (
+			 SELECT namespace, queue, count(*) AS running
+			 FROM tasks WHERE picked_at IS NOT NULL AND status IN ('QUEUED', 'STARTED')
+			 GROUP BY 1, 2
+		 )
+		 SELECT namespace, queue, COALESCE(w.ready, 0), COALESCE(w.delayed, 0), COALESCE(w.paused, 0),
+		        COALESCE(r.running, 0), w.oldest
+		 FROM waiting w FULL JOIN running r USING (namespace, queue)`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count queued tasks: %w", err)
+	}
+	defer rows.Close()
+	var out []QueueDepth
+	for rows.Next() {
+		var d QueueDepth
+		if err := rows.Scan(&d.Namespace, &d.Queue, &d.Ready, &d.Delayed, &d.Paused, &d.Running, &d.OldestReady); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}

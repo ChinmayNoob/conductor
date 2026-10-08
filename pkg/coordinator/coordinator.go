@@ -18,6 +18,7 @@ import (
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/task"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -84,6 +85,9 @@ type dispatchedTask struct {
 	workerID uint32
 	attempt  int
 	deadline time.Time
+	// For metrics.
+	namespace, queue string
+	dispatchedAt     time.Time
 }
 
 type Options struct {
@@ -217,8 +221,9 @@ func (s *Server) recoverLostTasks(ctx context.Context) {
 
 	for taskID, l := range lost {
 		s.log.Warn("Task lost", "task_id", taskID, "attempt", l.attempt, "reason", l.reason)
-		workerID := s.releaseTask(taskID)
-		if _, err := s.failTask(ctx, taskID, l.attempt, workerID, "", "task lost: "+l.reason); err != nil {
+		d := s.releaseTask(taskID)
+		metrics.TasksLost.Inc()
+		if _, err := s.failTask(ctx, taskID, l.attempt, d, "", "task lost: "+l.reason); err != nil {
 			s.log.Error("Failed to recover lost task", "task_id", taskID, "error", err)
 		}
 	}
@@ -303,6 +308,9 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 		}
 
 		for _, t := range tasks {
+			if t.PickedAt != nil {
+				metrics.DispatchLatency.Observe(t.PickedAt.Sub(latest(t.CreatedAt, t.ScheduledAt)).Seconds())
+			}
 			worker := s.chooseWorker(t.Requirements)
 			if worker == nil {
 				// No free worker has its labels (another task in the batch
@@ -311,7 +319,7 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 				continue
 			}
 			// Reserve the slot now so the next task sees it taken.
-			s.trackTask(t.ID, t.Attempt, worker, time.Duration(t.TimeoutSeconds)*time.Second)
+			s.trackTask(t, worker)
 			go s.sendTask(ctx, worker, t)
 		}
 		if len(tasks) < want {
@@ -403,6 +411,7 @@ func (s *Server) sendTask(ctx context.Context, worker *Worker, t *db.Task) {
 
 	if err != nil {
 		log.Warn("Failed to dispatch task, marking worker unhealthy", "error", err)
+		metrics.DispatchRejected.Inc()
 		s.releaseTask(t.ID)
 		s.requeueTask(ctx, t.ID)
 		s.mu.Lock()
@@ -413,6 +422,7 @@ func (s *Server) sendTask(ctx context.Context, worker *Worker, t *db.Task) {
 	}
 	if !resp.Success {
 		log.Info("Worker rejected task", "reason", resp.Message)
+		metrics.DispatchRejected.Inc()
 		s.releaseTask(t.ID)
 		s.requeueTask(ctx, t.ID)
 		s.wakeDispatcher()
@@ -428,6 +438,7 @@ func (s *Server) sendTask(ctx context.Context, worker *Worker, t *db.Task) {
 	if err != nil && !errors.Is(err, errNotLeader) && !errors.Is(err, db.ErrFenced) {
 		log.Warn("Failed to mark task started", "error", err)
 	}
+	metrics.TasksDispatched.WithLabelValues(t.Namespace, t.Queue).Inc()
 	log.Info("Task dispatched")
 }
 
@@ -438,36 +449,56 @@ func (s *Server) requeueTask(ctx context.Context, taskID uuid.UUID) {
 	}
 }
 
-func (s *Server) trackTask(taskID uuid.UUID, attempt int, worker *Worker, timeout time.Duration) {
+func (s *Server) trackTask(t *db.Task, worker *Worker) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.inFlight[taskID] = dispatchedTask{
-		workerID: worker.ID,
-		attempt:  attempt,
-		deadline: time.Now().Add(timeout + lostTaskGrace),
+	now := time.Now()
+	s.inFlight[t.ID] = dispatchedTask{
+		workerID:     worker.ID,
+		attempt:      t.Attempt,
+		deadline:     now.Add(time.Duration(t.TimeoutSeconds)*time.Second + lostTaskGrace),
+		namespace:    t.Namespace,
+		queue:        t.Queue,
+		dispatchedAt: now,
 	}
 	worker.inFlight++
 }
 
-// releaseTask frees the worker slot held by a task and returns that worker's
-// ID. It is a no-op (returning 0) for tasks that aren't tracked.
-func (s *Server) releaseTask(taskID uuid.UUID) uint32 {
+func latest(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+// releaseTask frees the worker slot held by a task and returns what was
+// tracked about it. It is a no-op (returning the zero value) for tasks that
+// aren't tracked.
+func (s *Server) releaseTask(taskID uuid.UUID) dispatchedTask {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.releaseTaskLocked(taskID)
 }
 
-func (s *Server) releaseTaskLocked(taskID uuid.UUID) uint32 {
+func (s *Server) releaseTaskLocked(taskID uuid.UUID) dispatchedTask {
 	t, ok := s.inFlight[taskID]
 	if !ok {
-		return 0
+		return dispatchedTask{}
 	}
 	delete(s.inFlight, taskID)
 	if w, ok := s.workers[t.workerID]; ok && w.inFlight > 0 {
 		w.inFlight--
 	}
-	return t.workerID
+	return t
+}
+
+// observeResult records a task attempt's outcome.
+func observeResult(d dispatchedTask, result string) {
+	metrics.TaskResults.WithLabelValues(d.namespace, d.queue, result).Inc()
+	if !d.dispatchedAt.IsZero() {
+		metrics.TaskRunTime.Observe(time.Since(d.dispatchedAt).Seconds())
+	}
 }
 
 // --- Task submission and cancellation ---
@@ -665,14 +696,19 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 		// workers before Phase 3 also report it. Nothing to do.
 
 	case grpcapi.TaskStatus_COMPLETE:
-		workerID := int64(s.releaseTask(taskID))
+		d := s.releaseTask(taskID)
 		var r db.TaskResult
 		err = s.fencedStmt(ctx, func(q *db.DB) error {
 			var err error
-			r, err = q.MarkTaskCompleted(ctx, taskID, attempt, workerID, req.Output, req.Outputs)
+			r, err = q.MarkTaskCompleted(ctx, taskID, attempt, int64(d.workerID), req.Output, req.Outputs)
 			return err
 		})
 		if err == nil {
+			if r.Updated {
+				observeResult(d, "completed")
+			} else {
+				observeResult(d, "stale")
+			}
 			if r.Updated {
 				log.Info("Task completed")
 				if r.WorkflowID != nil {
@@ -685,8 +721,8 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 		s.wakeDispatcher()
 
 	case grpcapi.TaskStatus_FAILED:
-		workerID := s.releaseTask(taskID)
-		shouldRetry, err = s.failTask(ctx, taskID, attempt, workerID, req.Output, req.ErrorMessage)
+		d := s.releaseTask(taskID)
+		shouldRetry, err = s.failTask(ctx, taskID, attempt, d, req.Output, req.ErrorMessage)
 		s.wakeDispatcher()
 
 	default:
@@ -703,7 +739,7 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 // failTask records a failed attempt. The task is requeued if it has retries
 // left; otherwise it is marked FAILED and its workflow, if any, advances
 // (which starts compensation). It returns whether the task will be retried.
-func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, workerID uint32, output, errMsg string) (bool, error) {
+func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, d dispatchedTask, output, errMsg string) (bool, error) {
 	log := s.log.With("task_id", taskID, "attempt", attempt)
 
 	var retrying bool
@@ -713,20 +749,23 @@ func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, wo
 		if retrying, err = tx.RetryTask(ctx, taskID, attempt, output, errMsg); err != nil || retrying {
 			return err
 		}
-		r, err = tx.MarkTaskFailed(ctx, taskID, attempt, int64(workerID), output, errMsg)
+		r, err = tx.MarkTaskFailed(ctx, taskID, attempt, int64(d.workerID), output, errMsg)
 		return err
 	})
 	if err != nil {
 		return false, err
 	}
 	if retrying {
+		observeResult(d, "retried")
 		log.Warn("Task failed, will retry", "error", errMsg)
 		return true, nil
 	}
 	if !r.Updated {
+		observeResult(d, "stale")
 		log.Info("Ignoring failure: not the current attempt")
 		return false, nil
 	}
+	observeResult(d, "failed")
 	log.Error("Task failed permanently", "error", errMsg)
 	if r.WorkflowID != nil {
 		s.reconcile(ctx, *r.WorkflowID)

@@ -32,6 +32,8 @@ type Config struct {
 	CoordinatorAdvertiseAddr string
 	APIListen                string
 	WorkerListen             string
+	// MetricsListen serves Prometheus metrics; empty disables them.
+	MetricsListen string
 
 	Worker Worker
 
@@ -109,6 +111,7 @@ func Load() (*Config, error) {
 		CoordinatorAdvertiseAddr: os.Getenv("CONDUCTOR_COORDINATOR_ADVERTISE_ADDR"),
 		APIListen:                env("CONDUCTOR_API_LISTEN", ":8081"),
 		WorkerListen:             env("CONDUCTOR_WORKER_LISTEN", ":9000"),
+		MetricsListen:            metricsListen(env("CONDUCTOR_METRICS_LISTEN", ":9090")),
 		Worker: Worker{
 			AdvertiseAddr: os.Getenv("CONDUCTOR_WORKER_ADVERTISE_ADDR"),
 			DockerSocket:  env("CONDUCTOR_DOCKER_SOCKET", "/var/run/docker.sock"),
@@ -187,6 +190,14 @@ func (c *Config) WarnInsecure(log *slog.Logger) {
 	if !c.TLS.Enabled() {
 		log.Warn("gRPC traffic is not encrypted; set CONDUCTOR_TLS_CERT and CONDUCTOR_TLS_KEY in production")
 	}
+}
+
+// metricsListen turns "off" into "" (disabled).
+func metricsListen(v string) string {
+	if v == "off" {
+		return ""
+	}
+	return v
 }
 
 func env(key, fallback string) string {

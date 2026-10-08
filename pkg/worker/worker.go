@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
@@ -222,11 +224,13 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 			err = cause
 		}
 		log.Warn("Task failed", "error", err, "duration", time.Since(start))
+		metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "failed").Observe(time.Since(start).Seconds())
 		release()
 		s.report(task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
 		return
 	}
 	log.Info("Task completed", "duration", time.Since(start))
+	metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "completed").Observe(time.Since(start).Seconds())
 	release()
 	s.report(task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
 }
@@ -248,6 +252,7 @@ func (s *Server) report(task *grpcapi.TaskRequest, status grpcapi.TaskStatus, ou
 	})
 	if err != nil {
 		s.log.Error("Failed to report task status", "task_id", taskID, "status", status, "error", err)
+		metrics.WorkerReportFailures.Inc()
 		return
 	}
 	if resp.ShouldRetry {
@@ -269,6 +274,36 @@ func (s *Server) RunHeartbeats(ctx context.Context) {
 			s.sendHeartbeat(ctx)
 		}
 	}
+}
+
+func taskType(t string) string {
+	if t == "" {
+		return "shell"
+	}
+	return t
+}
+
+// Collector reports this worker's slots and running tasks when scraped.
+func (s *Server) Collector() prometheus.Collector { return workerCollector{s} }
+
+type workerCollector struct{ s *Server }
+
+var (
+	workerSlotsDesc   = prometheus.NewDesc("conductor_worker_slots", "Tasks this worker can run at once.", nil, nil)
+	workerRunningDesc = prometheus.NewDesc("conductor_worker_tasks_running", "Tasks running on this worker.", nil, nil)
+)
+
+func (c workerCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- workerSlotsDesc
+	ch <- workerRunningDesc
+}
+
+func (c workerCollector) Collect(ch chan<- prometheus.Metric) {
+	c.s.mu.Lock()
+	running := len(c.s.running)
+	c.s.mu.Unlock()
+	ch <- prometheus.MustNewConstMetric(workerSlotsDesc, prometheus.GaugeValue, float64(c.s.slots))
+	ch <- prometheus.MustNewConstMetric(workerRunningDesc, prometheus.GaugeValue, float64(running))
 }
 
 func (s *Server) sendHeartbeat(ctx context.Context) {

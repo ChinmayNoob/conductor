@@ -18,8 +18,10 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/coordinator"
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/security"
 	"github.com/ChinmayNoob/conductor/pkg/worker"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 )
 
@@ -53,6 +55,8 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		DialOptions:   dialOpts,
 		PriorityAging: cfg.PriorityAging,
 	})
+	prometheus.MustRegister(srv.Collector())
+	metrics.Serve(ctx, cfg.MetricsListen)
 	// Standbys turn every call away, pointing at the leader.
 	grpcServer := grpc.NewServer(append(serverOpts, grpc.ChainUnaryInterceptor(srv.LeaderOnly))...)
 	grpcapi.RegisterCoordinatorServiceServer(grpcServer, srv)
@@ -102,6 +106,7 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 	defer coord.Close()
 
 	srv := api.NewServer(database, coord, cfg.MaxRequestBytes)
+	metrics.Serve(ctx, cfg.MetricsListen)
 	httpServer := &http.Server{
 		Addr:              cfg.APIListen,
 		Handler:           srv.Handler(),
@@ -163,6 +168,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		DockerSocket: cfg.Worker.DockerSocket,
 		Coordinator:  coord,
 	})
+	prometheus.MustRegister(w.Collector())
+	metrics.Serve(ctx, cfg.MetricsListen)
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterWorkerServiceServer(grpcServer, w)
 

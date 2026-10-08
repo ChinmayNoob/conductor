@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
 
@@ -284,5 +285,31 @@ func TestLocalWakeSkipsNotify(t *testing.T) {
 	create(t, db, "from elsewhere")
 	if !notified() {
 		t.Fatal("an insert from another session sent no notification")
+	}
+}
+
+// Worker IDs use the full uint32 range, so they must survive the round trip
+// through the terminal transitions, which record the worker when the task
+// finished before it was marked started.
+func TestFinishRecordsLargeWorkerID(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	const worker = 3_000_000_000
+
+	done := create(t, db, "done")
+	pick(t, db)
+	if r := must[TaskResult](t)(db.MarkTaskCompleted(ctx, done.ID, 1, worker, "", nil)); !r.Updated {
+		t.Fatal("completion not applied")
+	}
+	failed := create(t, db, "failed", func(n *NewTask) { n.MaxRetries = 0 })
+	pick(t, db)
+	if r := must[TaskResult](t)(db.MarkTaskFailed(ctx, failed.ID, 1, worker, "", "boom")); !r.Updated {
+		t.Fatal("failure not applied")
+	}
+	for _, id := range []uuid.UUID{done.ID, failed.ID} {
+		got := must[*Task](t)(db.GetTask(ctx, id))
+		if got.WorkerID == nil || *got.WorkerID != worker || got.StartedAt == nil {
+			t.Fatalf("task %s: worker_id=%v started_at=%v, want %d and set", id, got.WorkerID, got.StartedAt, worker)
+		}
 	}
 }

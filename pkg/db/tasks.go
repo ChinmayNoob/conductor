@@ -464,7 +464,7 @@ func (db *DB) finish(ctx context.Context, query string, args ...any) (TaskResult
 // finishColumns fill in what the STARTED transition records, for a task
 // whose result arrived before the coordinator marked it started. $5 is the
 // worker ID (0 when unknown).
-const finishColumns = `started_at = COALESCE(started_at, picked_at), worker_id = COALESCE(NULLIF($5, 0), worker_id)`
+const finishColumns = `started_at = COALESCE(started_at, picked_at), worker_id = COALESCE(NULLIF($5::bigint, 0), worker_id)`
 
 func (db *DB) MarkTaskCompleted(ctx context.Context, id uuid.UUID, attempt int, workerID int64, output string, outputs StringMap) (TaskResult, error) {
 	query, args := db.fence(

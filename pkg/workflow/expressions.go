@@ -151,6 +151,9 @@ type TaskSpec struct {
 	Command    string // shell command, or a summary for other types
 	HTTP       *HTTPSpec
 	Container  *ContainerSpec
+	LLM        *LLMSpec
+	Wait       *WaitSpec  // approval and signal steps: no task
+	Agent      *AgentSpec // agent steps: a run of model and tool tasks
 	Env        map[string]string
 	Retries    int
 	RetryDelay time.Duration
@@ -275,6 +278,75 @@ func (d *Definition) resolve(s *Step, a Action, ownOutputs map[string]string, c 
 		}
 		spec.Container = &ct
 		spec.Command = strings.TrimSpace(ct.Image + " " + strings.Join(ct.Command, " "))
+	case TypeLLM:
+		l := *a.LLM
+		if l.Prompt, err = c.Resolve(l.Prompt); err != nil {
+			return nil, fmt.Errorf("llm.prompt: %w", err)
+		}
+		if l.System, err = c.Resolve(l.System); err != nil {
+			return nil, fmt.Errorf("llm.system: %w", err)
+		}
+		spec.LLM = &l
+		spec.Command = LLMSummary(&l)
+	case TypeApproval:
+		w := &WaitSpec{Kind: TypeApproval, OnTimeout: "reject", Message: "Approve step " + s.Name + "?"}
+		if a.Approval != nil {
+			if a.Approval.Message != "" {
+				if w.Message, err = c.Resolve(a.Approval.Message); err != nil {
+					return nil, fmt.Errorf("approval.message: %w", err)
+				}
+			}
+			w.Timeout = time.Duration(a.Approval.Timeout)
+			if a.Approval.OnTimeout != "" {
+				w.OnTimeout = a.Approval.OnTimeout
+			}
+		}
+		spec.Wait = w
+		spec.Command = "approval: " + w.Message
+	case TypeSignal:
+		spec.Wait = &WaitSpec{Kind: TypeSignal, Signal: a.Signal.Name, Timeout: time.Duration(a.Signal.Timeout), OnTimeout: "fail"}
+		spec.Command = "signal: " + a.Signal.Name
+	case TypeAgent:
+		ag := *a.Agent
+		if ag.Prompt, err = c.Resolve(ag.Prompt); err != nil {
+			return nil, fmt.Errorf("agent.prompt: %w", err)
+		}
+		if ag.System, err = c.Resolve(ag.System); err != nil {
+			return nil, fmt.Errorf("agent.system: %w", err)
+		}
+		if ag.MaxTurns == 0 {
+			ag.MaxTurns = DefaultAgentTurns
+		}
+		if ag.MaxToolCalls == 0 {
+			ag.MaxToolCalls = DefaultAgentToolCalls
+		}
+		if ag.MaxDuration == 0 {
+			ag.MaxDuration = Duration(DefaultAgentDuration)
+		}
+		spec.Agent = &ag
+		spec.Command = "agent: " + LLMSummary(&LLMSpec{Model: ag.Model, Prompt: ag.Prompt})[len("llm "):]
 	}
 	return spec, nil
+}
+
+// LLMSummary is a one-line description of an llm task, for lists.
+func LLMSummary(l *LLMSpec) string {
+	p := strings.Join(strings.Fields(l.Prompt), " ")
+	if len(p) > 80 {
+		p = p[:80] + "…"
+	}
+	model := l.Model
+	if model == "" {
+		model = "default model"
+	}
+	return "llm " + model + ": " + p
+}
+
+// WaitSpec is what a waiting step waits for.
+type WaitSpec struct {
+	Kind      string // approval or signal
+	Message   string // approval: what a person is asked
+	Signal    string // signal: its name
+	Timeout   time.Duration
+	OnTimeout string // approval: approve or reject; signal: fail
 }

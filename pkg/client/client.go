@@ -146,11 +146,30 @@ type ContainerSpec struct {
 	Network string   `json:"network,omitempty"`
 }
 
+// LLMSpec asks a language model for a completion (type llm).
+type LLMSpec struct {
+	Model       string         `json:"model,omitempty"`
+	System      string         `json:"system,omitempty"`
+	Prompt      string         `json:"prompt"`
+	Schema      map[string]any `json:"schema,omitempty"` // a JSON Schema object; fields become outputs
+	MaxTokens   int            `json:"max_tokens,omitempty"`
+	Temperature *float64       `json:"temperature,omitempty"`
+}
+
+// LLMUsage is what an llm task spent, over all its attempts.
+type LLMUsage struct {
+	Model        string  `json:"model,omitempty"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+}
+
 type TaskRequest struct {
-	Type              string            `json:"type,omitempty"` // shell (default), http, container
+	Type              string            `json:"type,omitempty"` // shell (default), http, container, llm
 	Command           string            `json:"command,omitempty"`
 	HTTP              *HTTPSpec         `json:"http,omitempty"`
 	Container         *ContainerSpec    `json:"container,omitempty"`
+	LLM               *LLMSpec          `json:"llm,omitempty"`
 	Env               map[string]string `json:"env,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
 	Queue             string            `json:"queue,omitempty"`
@@ -193,6 +212,7 @@ type Task struct {
 	WorkerID       *int64            `json:"worker_id,omitempty"`
 	Attempt        int               `json:"attempt"`
 	TraceID        string            `json:"trace_id,omitempty"` // set when tracing is on
+	LLMUsage       *LLMUsage         `json:"llm_usage,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 
 	// Created is false when SubmitTask matched an existing idempotency key.
@@ -407,6 +427,7 @@ type Workflow struct {
 	ErrorMessage    string          `json:"error_message,omitempty"`
 	CancelRequested bool            `json:"cancel_requested"`
 	TraceID         string          `json:"trace_id,omitempty"`
+	LLMSpend        *LLMSpend       `json:"llm_spend,omitempty"` // detail view only
 	IdempotencyKey  string          `json:"idempotency_key,omitempty"`
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`
@@ -426,6 +447,8 @@ type WorkflowStep struct {
 	Outputs                map[string]string `json:"outputs,omitempty"`
 	CompensationTaskID     string            `json:"compensation_task_id,omitempty"`
 	CompensationTaskStatus string            `json:"compensation_task_status,omitempty"`
+	Wait                   *StepWait         `json:"wait,omitempty"` // approval and signal steps
+	AgentRunID             string            `json:"agent_run_id,omitempty"`
 }
 
 // Step returns the step with this name, or nil.
@@ -477,6 +500,65 @@ func (c *Client) CancelWorkflow(ctx context.Context, id string) (*Workflow, erro
 	var wf Workflow
 	_, err := c.do(ctx, http.MethodPost, "/v1/workflows/"+url.PathEscape(id)+"/cancel", nil, &wf)
 	return &wf, err
+}
+
+// StepWait is what an approval or signal step waits for.
+type StepWait struct {
+	Kind      string     `json:"kind"`              // approval or signal
+	Message   string     `json:"message,omitempty"` // the question, or the signal's name
+	Deadline  *time.Time `json:"deadline,omitempty"`
+	Waiting   bool       `json:"waiting"`
+	DecidedBy string     `json:"decided_by,omitempty"`
+}
+
+// ApproveStep approves a run's waiting approval step.
+func (c *Client) ApproveStep(ctx context.Context, workflowID, step, comment string) (*Workflow, error) {
+	return c.decide(ctx, workflowID, step, "approve", comment)
+}
+
+// RejectStep rejects a run's waiting approval step: it fails, and the run
+// compensates.
+func (c *Client) RejectStep(ctx context.Context, workflowID, step, comment string) (*Workflow, error) {
+	return c.decide(ctx, workflowID, step, "reject", comment)
+}
+
+func (c *Client) decide(ctx context.Context, workflowID, step, verb, comment string) (*Workflow, error) {
+	var wf Workflow
+	_, err := c.do(ctx, http.MethodPost, "/v1/workflows/"+url.PathEscape(workflowID)+"/steps/"+url.PathEscape(step)+"/"+verb,
+		map[string]string{"comment": comment}, &wf)
+	return &wf, err
+}
+
+// Signal sends a signal to a run; payload (a struct or map) becomes the
+// waiting step's outputs. delivered is false when no step waits for it yet:
+// it is kept until one does.
+func (c *Client) Signal(ctx context.Context, workflowID, name string, payload any) (delivered bool, err error) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	var out struct {
+		Delivered bool `json:"delivered"`
+	}
+	_, err = c.do(ctx, http.MethodPost, "/v1/workflows/"+url.PathEscape(workflowID)+"/signals/"+url.PathEscape(name), payload, &out)
+	return out.Delivered, err
+}
+
+// Approval is an approval step waiting for a decision.
+type Approval struct {
+	WorkflowID string     `json:"workflow_id"`
+	Workflow   string     `json:"workflow"`
+	Step       string     `json:"step"`
+	Message    string     `json:"message"`
+	Deadline   *time.Time `json:"deadline,omitempty"`
+	OnTimeout  string     `json:"on_timeout,omitempty"`
+	Since      time.Time  `json:"since"`
+}
+
+// ListApprovals lists approval steps waiting in the namespace.
+func (c *Client) ListApprovals(ctx context.Context) ([]Approval, error) {
+	var list []Approval
+	_, err := c.do(ctx, http.MethodGet, "/v1/approvals", nil, &list)
+	return list, err
 }
 
 // WaitForWorkflow polls until the workflow finishes or ctx is done.
@@ -556,11 +638,18 @@ func (c *Client) ScheduleAction(ctx context.Context, name, action string) (*Sche
 
 // --- Queues, workers, namespaces ---
 
+// LLMSpend is model usage summed over a workflow run.
+type LLMSpend struct {
+	Tokens  int64   `json:"tokens"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
 type Queue struct {
 	Name              string    `json:"name"`
 	ConcurrencyLimit  *int      `json:"concurrency_limit"`
 	RateLimit         *int      `json:"rate_limit"`
 	RatePeriodSeconds int       `json:"rate_period_seconds"`
+	TokensPerMinute   *int64    `json:"tokens_per_minute"`
 	Paused            bool      `json:"paused"`
 	Queued            int       `json:"queued"`
 	Running           int       `json:"running"`
@@ -568,10 +657,11 @@ type Queue struct {
 }
 
 type QueueSettings struct {
-	ConcurrencyLimit  *int `json:"concurrency_limit"`
-	RateLimit         *int `json:"rate_limit"`
-	RatePeriodSeconds int  `json:"rate_period_seconds,omitempty"`
-	Paused            bool `json:"paused"`
+	ConcurrencyLimit  *int   `json:"concurrency_limit"`
+	RateLimit         *int   `json:"rate_limit"`
+	RatePeriodSeconds int    `json:"rate_period_seconds,omitempty"`
+	TokensPerMinute   *int64 `json:"tokens_per_minute"` // llm tasks' model tokens
+	Paused            bool   `json:"paused"`
 }
 
 func (c *Client) ListQueues(ctx context.Context) ([]Queue, error) {
@@ -610,14 +700,18 @@ func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
 }
 
 type Namespace struct {
-	Name            string    `json:"name"`
-	MaxPendingTasks *int      `json:"max_pending_tasks"`
-	MaxConcurrency  *int      `json:"max_concurrency"`
-	CreatedAt       time.Time `json:"created_at"`
+	Name               string    `json:"name"`
+	MaxPendingTasks    *int      `json:"max_pending_tasks"`
+	MaxConcurrency     *int      `json:"max_concurrency"`
+	MaxLLMTokensPerDay *int64    `json:"max_llm_tokens_per_day"`
+	MaxLLMCostPerDay   *float64  `json:"max_llm_cost_per_day"`
+	AIAssist           bool      `json:"ai_assist"` // send redacted failures to the model for explanations
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 func namespaceBody(n Namespace) map[string]any {
-	return map[string]any{"name": n.Name, "max_pending_tasks": n.MaxPendingTasks, "max_concurrency": n.MaxConcurrency}
+	return map[string]any{"name": n.Name, "max_pending_tasks": n.MaxPendingTasks, "max_concurrency": n.MaxConcurrency,
+		"max_llm_tokens_per_day": n.MaxLLMTokensPerDay, "max_llm_cost_per_day": n.MaxLLMCostPerDay, "ai_assist": n.AIAssist}
 }
 
 func (c *Client) CreateNamespace(ctx context.Context, n Namespace) (*Namespace, error) {
@@ -716,4 +810,108 @@ func poll[T any](ctx context.Context, check func() (T, bool, error)) (T, error) 
 		case <-ticker.C:
 		}
 	}
+}
+
+// AgentRun is a durable agent's progress, conversation and calls.
+type AgentRun struct {
+	ID         string          `json:"id"`
+	WorkflowID string          `json:"workflow_id"`
+	Status     string          `json:"status"`
+	Turn       int             `json:"turn"`
+	Phase      string          `json:"phase"`
+	ToolCalls  int             `json:"tool_calls"`
+	Answer     string          `json:"answer"`
+	Error      string          `json:"error"`
+	Messages   json.RawMessage `json:"messages"`
+	Tasks      []AgentCall     `json:"tasks"`
+	LLMSpend   LLMSpend        `json:"llm_spend"`
+}
+
+// AgentCall is one model call (role llm) or tool call (role tool).
+type AgentCall struct {
+	TaskID     string `json:"task_id"`
+	Turn       int    `json:"turn"`
+	Role       string `json:"role"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Command    string `json:"command"`
+	Status     string `json:"status"`
+	Attempt    int    `json:"attempt"`
+}
+
+// GetAgentRun returns an agent run.
+func (c *Client) GetAgentRun(ctx context.Context, id string) (*AgentRun, error) {
+	var run AgentRun
+	_, err := c.do(ctx, http.MethodGet, "/v1/agent-runs/"+url.PathEscape(id), nil, &run)
+	return &run, err
+}
+
+// Explanation is the assistant's reading of a failed task.
+type Explanation struct {
+	TaskID       string    `json:"task_id"`
+	Attempt      int       `json:"attempt"`
+	Class        string    `json:"class"` // transient, permanent, needs_attention, unknown
+	Confidence   float64   `json:"confidence"`
+	Source       string    `json:"source"` // rules or model
+	Cause        string    `json:"cause"`
+	Fix          string    `json:"fix"`
+	Model        string    `json:"model"`
+	InputTokens  int64     `json:"input_tokens"`
+	OutputTokens int64     `json:"output_tokens"`
+	CostUSD      float64   `json:"cost_usd"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// GetExplanation returns a task's stored explanation (404 if there is none).
+func (c *Client) GetExplanation(ctx context.Context, taskID string) (*Explanation, error) {
+	var e Explanation
+	_, err := c.do(ctx, http.MethodGet, "/v1/tasks/"+url.PathEscape(taskID)+"/explanation", nil, &e)
+	return &e, err
+}
+
+// ExplainTask asks the assistant to explain a failed task now. The namespace
+// must have ai_assist on.
+func (c *Client) ExplainTask(ctx context.Context, taskID string) (*Explanation, error) {
+	var e Explanation
+	_, err := c.do(ctx, http.MethodPost, "/v1/tasks/"+url.PathEscape(taskID)+"/explain", nil, &e)
+	return &e, err
+}
+
+// WorkflowDraft is a workflow the assistant wrote. It is not saved.
+type WorkflowDraft struct {
+	YAML     string   `json:"yaml"`
+	Valid    bool     `json:"valid"`
+	Errors   string   `json:"errors"`
+	Name     string   `json:"name"`
+	Warnings []string `json:"warnings"`
+	Plan     [][]struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		Summary string `json:"summary"`
+	} `json:"plan"`
+	Usage struct {
+		InputTokens  int64   `json:"input_tokens"`
+		OutputTokens int64   `json:"output_tokens"`
+		CostUSD      float64 `json:"cost_usd"`
+	} `json:"usage"`
+}
+
+// DraftWorkflow asks the assistant to write a workflow definition. Save it
+// with ApplyDefinition once a person has read it.
+func (c *Client) DraftWorkflow(ctx context.Context, description string) (*WorkflowDraft, error) {
+	var d WorkflowDraft
+	_, err := c.do(ctx, http.MethodPost, "/v1/ai/workflow", map[string]string{"description": description}, &d)
+	return &d, err
+}
+
+// Answer is the assistant's reply to a question about the cluster.
+type Answer struct {
+	Answer  string   `json:"answer"`
+	Lookups []string `json:"lookups"`
+}
+
+// Ask asks the assistant a question about the namespace.
+func (c *Client) Ask(ctx context.Context, question string) (*Answer, error) {
+	var a Answer
+	_, err := c.do(ctx, http.MethodPost, "/v1/ai/ask", map[string]string{"question": question}, &a)
+	return &a, err
 }

@@ -171,6 +171,13 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 				outputs[st.Name] = st.Outputs
 			}
 
+			if def.Budget != nil && wf.Status == db.WorkflowRunning {
+				spend, err := tx.WorkflowSpend(ctx, wf.ID)
+				if err != nil {
+					return err
+				}
+				run.Abort = def.Budget.Exceeded(spend.Tokens, spend.CostUSD)
+			}
 			plan := workflow.Reconcile(def, run)
 			if plan.Empty() {
 				return tx.TouchWorkflow(ctx, wf.ID)
@@ -183,11 +190,14 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 			}
 			if plan.SetStatus != "" {
 				errMsg := wf.ErrorMessage
-				switch plan.SetStatus {
-				case workflow.StatusCompensating:
-					errMsg = plan.Error
-				case workflow.StatusCompleted:
+				switch {
+				case plan.SetStatus == workflow.StatusCompleted:
 					errMsg = ""
+				case plan.Error != "":
+					// Set when the run starts failing. With nothing to undo it
+					// goes straight to FAILED in the same plan, so take the
+					// error whatever the new status is.
+					errMsg = plan.Error
 				}
 				if err := tx.UpdateWorkflowStatus(ctx, wf.ID, db.WorkflowStatus(plan.SetStatus), errMsg); err != nil {
 					return err
@@ -215,6 +225,38 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 						return err
 					}
 					continue
+				}
+				if spec.Agent != nil {
+					if err := s.startAgent(ctx, tx, wf, step, spec); err != nil {
+						return err
+					}
+					createdTasks = true
+					log.Info("Workflow step started an agent", "step", name)
+					continue
+				}
+				if spec.Wait != nil {
+					if err := s.startWait(ctx, tx, wf, step, spec.Wait); err != nil {
+						return err
+					}
+					log.Info("Workflow step waiting", "step", name, "for", spec.Wait.Kind)
+					continue
+				}
+				if spec.Type == workflow.TypeLLM {
+					msg, err := s.llmBudgetError(ctx, tx, wf.Namespace)
+					if err != nil {
+						return err
+					}
+					if msg != "" {
+						log.Warn("Cannot start step", "step", name, "error", msg)
+						if err := tx.UpdateStepStatus(ctx, step.ID, workflow.StepFailed); err != nil {
+							return err
+						}
+						wf.Status, wf.ErrorMessage = db.WorkflowCompensating, fmt.Sprintf("step %s: %s", name, msg)
+						if err := tx.UpdateWorkflowStatus(ctx, wf.ID, wf.Status, wf.ErrorMessage); err != nil {
+							return err
+						}
+						continue
+					}
 				}
 				t, err := s.createStepTask(ctx, tx, wf, spec)
 				if err != nil {
@@ -251,6 +293,21 @@ func (s *Server) reconcile(ctx context.Context, wfID uuid.UUID) {
 
 			for _, name := range plan.Cancel {
 				step := byName[name]
+				if step.WaitKind != "" {
+					// A waiting step has no task: just stop waiting.
+					if err := cancelWait(ctx, tx, step); err != nil {
+						return err
+					}
+					continue
+				}
+				if step.AgentRunID != nil {
+					kill, err := cancelAgent(ctx, tx, *step.AgentRunID)
+					if err != nil {
+						return err
+					}
+					toKill = append(toKill, kill...)
+					continue
+				}
 				if step.TaskID == nil {
 					continue
 				}
@@ -315,6 +372,8 @@ func (s *Server) createStepTask(ctx context.Context, tx *db.DB, wf *db.Workflow,
 		detail = spec.HTTP
 	case spec.Container != nil:
 		detail = spec.Container
+	case spec.LLM != nil:
+		detail = spec.LLM
 	}
 	if detail != nil {
 		b, err := json.Marshal(detail)
@@ -348,6 +407,19 @@ func (s *Server) workflowSweepLoop(ctx context.Context) {
 					return
 				}
 				s.reconcile(ctx, id)
+			}
+			// Agent runs too: one may have missed a task's completion
+			// across a failover. Advancing is idempotent.
+			runs, err := s.db.RunningAgentRuns(ctx, 500)
+			if err != nil {
+				s.log.Error("Failed to list agent runs", "error", err)
+				continue
+			}
+			for _, id := range runs {
+				if ctx.Err() != nil {
+					return
+				}
+				s.advanceAgent(ctx, id)
 			}
 		}
 	}

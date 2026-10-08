@@ -24,9 +24,11 @@ Tasks:
   task submit -cmd "echo hi" [task flags] [-wait]
   task submit -type http -url URL [-method POST] [-body JSON] [-header K=V]
   task submit -type container -image alpine:3.20 [-- command args...]
+  task submit -prompt "Summarize: ..." [-model M] [-system S] [-schema JSON]
   task get|cancel|requeue <id>
   task logs <id> [-f]          Output; -f follows a running task live
   task attempts <id>           Every attempt, with why each failed
+  task explain <id>            What went wrong and what to try (needs ai_assist)
   task list [-status S] [-queue Q] [-limit N]
   dlq                          Permanently failed tasks (dead-letter queue)
   stats
@@ -40,6 +42,9 @@ Workflows:
   workflow show <name> [-version N]
   workflow start <name> [-input JSON] [-version N] [-key K] [-wait]
   workflow get|watch|cancel <id>
+  workflow approve|reject <id> <step> [-comment C]
+  workflow signal <id> <name> [-data JSON]
+  approvals                    Approval steps waiting for a decision
   workflow list [-limit N]
 
 Schedules:
@@ -47,6 +52,10 @@ Schedules:
                   (-cmd "..." [task flags] | -workflow NAME [-input JSON])
   schedule list
   schedule get|delete|pause|resume|trigger <name>
+
+AI assistant (needs a model, and ai_assist on the namespace):
+  ai workflow "describe it" [-save]   Draft a workflow; -save asks before saving
+  ai ask "question"            Ask about tasks, workflows, workers, spend
 
 Queues and workers:
   queue list
@@ -57,6 +66,7 @@ Queues and workers:
 
 Admin:
   namespace create|set <name> [-max-pending N] [-max-concurrency N]
+                  [-max-llm-tokens N] [-max-llm-cost USD] [-ai-assist]
   namespace list
   apikey create <name> [-namespace NS] [-admin]
   apikey list
@@ -115,6 +125,8 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return a.workers(ctx)
 	case "cluster":
 		return a.cluster(ctx)
+	case "approvals":
+		return a.approvals(ctx)
 	}
 	if len(args) < 2 {
 		return fmt.Errorf("usage: conductorctl %s <subcommand>; run conductorctl -h for help", args[0])
@@ -142,6 +154,12 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return a.taskLogs(ctx, rest)
 	case "task attempts":
 		return id(func(x string) error { return a.taskAttempts(ctx, x) })
+	case "task explain":
+		return id(func(x string) error { return a.taskExplain(ctx, x) })
+	case "ai workflow":
+		return a.aiWorkflow(ctx, rest)
+	case "ai ask":
+		return a.aiAsk(ctx, rest)
 
 	case "workflow apply":
 		return a.workflowApply(ctx, rest)
@@ -157,6 +175,10 @@ func (a *cli) run(ctx context.Context, args []string) error {
 		return id(func(x string) error { return a.workflowWatch(ctx, x) })
 	case "workflow cancel":
 		return id(func(x string) error { return a.printWorkflow(a.c.CancelWorkflow(ctx, x)) })
+	case "workflow approve", "workflow reject":
+		return a.workflowDecide(ctx, sub == "approve", rest)
+	case "workflow signal":
+		return a.workflowSignal(ctx, rest)
 	case "workflow list":
 		return a.workflowList(ctx, rest)
 
@@ -232,15 +254,19 @@ func (m kv) Set(s string) error {
 func taskFlags(fs *flag.FlagSet) func() (client.TaskRequest, error) {
 	var req client.TaskRequest
 	env, labels, headers := kv{}, kv{}, kv{}
-	var url, method, body, image string
+	var url, method, body, image, prompt, model, system, schema string
 	retries := -1
-	fs.StringVar(&req.Type, "type", "", "shell (default), http or container")
+	fs.StringVar(&req.Type, "type", "", "shell (default), http, container or llm")
 	fs.StringVar(&req.Command, "cmd", "", "shell command")
 	fs.StringVar(&url, "url", "", "http: URL")
 	fs.StringVar(&method, "method", "", "http: method (default GET)")
 	fs.StringVar(&body, "body", "", "http: request body")
 	fs.Var(headers, "header", "http: header K=V (repeatable)")
 	fs.StringVar(&image, "image", "", "container: image")
+	fs.StringVar(&prompt, "prompt", "", "llm: the prompt")
+	fs.StringVar(&model, "model", "", "llm: model (default: the workers' CONDUCTOR_LLM_MODEL)")
+	fs.StringVar(&system, "system", "", "llm: system message")
+	fs.StringVar(&schema, "schema", "", "llm: JSON Schema (an object) the answer must match; its fields become outputs")
 	fs.Var(env, "env", "environment variable K=V (repeatable)")
 	fs.Var(labels, "label", "required worker label K=V (repeatable)")
 	fs.StringVar(&req.Queue, "queue", "", "queue name")
@@ -273,8 +299,18 @@ func taskFlags(fs *flag.FlagSet) func() (client.TaskRequest, error) {
 				req.Type = "container"
 			}
 			req.Container = &client.ContainerSpec{Image: image, Command: fs.Args()}
+		case prompt != "":
+			if req.Type == "" {
+				req.Type = "llm"
+			}
+			req.LLM = &client.LLMSpec{Prompt: prompt, Model: model, System: system}
+			if schema != "" {
+				if err := json.Unmarshal([]byte(schema), &req.LLM.Schema); err != nil {
+					return req, fmt.Errorf("-schema is not a JSON object: %w", err)
+				}
+			}
 		case req.Command == "":
-			return req, errors.New("one of -cmd, -url or -image is required")
+			return req, errors.New("one of -cmd, -url, -image or -prompt is required")
 		}
 		return req, nil
 	}
@@ -364,6 +400,13 @@ func (a *cli) printTask(t *client.Task, err error) error {
 	}
 	if len(t.Outputs) > 0 {
 		fmt.Printf("Outputs:  %s\n", formatMap(t.Outputs))
+	}
+	if u := t.LLMUsage; u != nil {
+		fmt.Printf("Model:    %s (%d tokens in, %d out", u.Model, u.InputTokens, u.OutputTokens)
+		if u.CostUSD > 0 {
+			fmt.Printf(", $%.6f", u.CostUSD)
+		}
+		fmt.Println(")")
 	}
 	if t.Output != "" {
 		fmt.Printf("Output:\n%s\n", indent(t.Output))
@@ -782,9 +825,18 @@ func (a *cli) namespaceSave(ctx context.Context, sub string, args []string) erro
 	fs := flag.NewFlagSet("namespace", flag.ExitOnError)
 	pending := fs.Int("max-pending", 0, "max queued tasks (0 = unlimited)")
 	concurrency := fs.Int("max-concurrency", 0, "max running tasks (0 = unlimited)")
+	maxTokens := fs.Int64("max-llm-tokens", 0, "max model tokens per day (0 = unlimited)")
+	maxCost := fs.Float64("max-llm-cost", 0, "max model spend per day in USD (0 = unlimited)")
+	aiAssist := fs.Bool("ai-assist", false, "let the AI assistant read redacted failures (explanations, ask)")
 	_ = fs.Parse(rest)
 
-	n := client.Namespace{Name: pos[0]}
+	n := client.Namespace{Name: pos[0], AIAssist: *aiAssist}
+	if *maxTokens > 0 {
+		n.MaxLLMTokensPerDay = maxTokens
+	}
+	if *maxCost > 0 {
+		n.MaxLLMCostPerDay = maxCost
+	}
 	if *pending > 0 {
 		n.MaxPendingTasks = pending
 	}
@@ -803,7 +855,7 @@ func (a *cli) namespaceSave(ctx context.Context, sub string, args []string) erro
 	if a.output == "json" {
 		return printJSON(out)
 	}
-	fmt.Printf("namespace %s: max pending %s, max concurrency %s\n", out.Name, intOrDash(out.MaxPendingTasks), intOrDash(out.MaxConcurrency))
+	fmt.Printf("namespace %s: max pending %s, max concurrency %s, ai assist %v\n", out.Name, intOrDash(out.MaxPendingTasks), intOrDash(out.MaxConcurrency), out.AIAssist)
 	return nil
 }
 
@@ -979,4 +1031,145 @@ func (a *cli) taskAttempts(ctx context.Context, id string) error {
 func firstLine(s string) string {
 	line, _, _ := strings.Cut(s, "\n")
 	return line
+}
+
+func (a *cli) workflowDecide(ctx context.Context, approve bool, args []string) error {
+	pos, rest, err := positional(args, 2, "workflow approve|reject <id> <step> [-comment C]")
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("workflow decide", flag.ExitOnError)
+	comment := fs.String("comment", "", "why")
+	_ = fs.Parse(rest)
+	if approve {
+		return a.printWorkflow(a.c.ApproveStep(ctx, pos[0], pos[1], *comment))
+	}
+	return a.printWorkflow(a.c.RejectStep(ctx, pos[0], pos[1], *comment))
+}
+
+func (a *cli) workflowSignal(ctx context.Context, args []string) error {
+	pos, rest, err := positional(args, 2, "workflow signal <id> <name> [-data JSON]")
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("workflow signal", flag.ExitOnError)
+	data := fs.String("data", "{}", "the signal's payload, a JSON object")
+	_ = fs.Parse(rest)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(*data), &payload); err != nil {
+		return fmt.Errorf("-data is not a JSON object: %w", err)
+	}
+	delivered, err := a.c.Signal(ctx, pos[0], pos[1], payload)
+	if err != nil {
+		return err
+	}
+	if delivered {
+		fmt.Println("Delivered to the step waiting for it.")
+	} else {
+		fmt.Println("No step waits for it yet; it is kept until one does.")
+	}
+	return nil
+}
+
+func (a *cli) approvals(ctx context.Context) error {
+	list, err := a.c.ListApprovals(ctx)
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(list)
+	}
+	tw := table("WORKFLOW RUN", "DEFINITION", "STEP", "WAITING", "QUESTION")
+	for _, ap := range list {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", ap.WorkflowID, ap.Workflow, ap.Step,
+			time.Since(ap.Since).Round(time.Second), truncate(ap.Message, 60))
+	}
+	return tw.Flush()
+}
+
+// --- AI assistant ---
+
+func (a *cli) taskExplain(ctx context.Context, id string) error {
+	e, err := a.c.ExplainTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(e)
+	}
+	fmt.Printf("%s (%.0f%% sure, from %s)\n", e.Class, e.Confidence*100, e.Source)
+	if e.Cause != "" {
+		fmt.Printf("\nLikely cause:\n  %s\n", e.Cause)
+	}
+	if e.Fix != "" {
+		fmt.Printf("\nWhat to try:\n  %s\n", e.Fix)
+	}
+	return nil
+}
+
+func (a *cli) aiWorkflow(ctx context.Context, args []string) error {
+	pos, rest, err := positional(args, 1, `ai workflow "describe the workflow" [-save]`)
+	if err != nil {
+		return err
+	}
+	fs := flag.NewFlagSet("ai workflow", flag.ExitOnError)
+	save := fs.Bool("save", false, "after showing the draft, ask whether to save it")
+	_ = fs.Parse(rest)
+
+	d, err := a.c.DraftWorkflow(ctx, pos[0])
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(d)
+	}
+	fmt.Print(d.YAML)
+	if !d.Valid {
+		fmt.Printf("\nThis draft is not valid, so it cannot be saved:\n%s\n", d.Errors)
+		return errors.New("the assistant's draft is not valid")
+	}
+	fmt.Println("\nDry run (steps on one line start together):")
+	for i, wave := range d.Plan {
+		var names []string
+		for _, s := range wave {
+			names = append(names, s.Name+" ("+s.Type+")")
+		}
+		fmt.Printf("  %d. %s\n", i+1, strings.Join(names, ", "))
+	}
+	for _, w := range d.Warnings {
+		fmt.Println("  warning:", w)
+	}
+	if !*save {
+		fmt.Printf("\nNot saved. Review it, then save with: conductorctl workflow apply -f <file>\n")
+		return nil
+	}
+	fmt.Printf("\nSave %q? [y/N] ", d.Name)
+	var reply string
+	_, _ = fmt.Scanln(&reply)
+	if r := strings.ToLower(strings.TrimSpace(reply)); r != "y" && r != "yes" {
+		fmt.Println("Not saved.")
+		return nil
+	}
+	saved, err := a.c.ApplyDefinition(ctx, []byte(d.YAML))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("workflow %s: saved as version %d\n", saved.Name, saved.Version)
+	return nil
+}
+
+func (a *cli) aiAsk(ctx context.Context, args []string) error {
+	pos, _, err := positional(args, 1, `ai ask "question"`)
+	if err != nil {
+		return err
+	}
+	ans, err := a.c.Ask(ctx, pos[0])
+	if err != nil {
+		return err
+	}
+	if a.output == "json" {
+		return printJSON(ans)
+	}
+	fmt.Println(ans.Answer)
+	return nil
 }

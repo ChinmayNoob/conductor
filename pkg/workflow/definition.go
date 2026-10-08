@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/ChinmayNoob/conductor/pkg/llm"
 	"regexp"
 	"slices"
 	"strings"
@@ -35,6 +36,12 @@ const (
 	TypeShell     = "shell"
 	TypeHTTP      = "http"
 	TypeContainer = "container"
+	TypeLLM       = "llm"
+	// Waiting steps run no task: they wait for a person or a signal.
+	TypeApproval = "approval"
+	TypeSignal   = "signal"
+	// An agent step runs a model with tools in a loop, each call a task.
+	TypeAgent = "agent"
 )
 
 var (
@@ -47,6 +54,7 @@ type Definition struct {
 	Description string           `yaml:"description,omitempty" json:"description,omitempty"`
 	Inputs      map[string]Input `yaml:"inputs,omitempty" json:"inputs,omitempty"`
 	Defaults    Options          `yaml:"defaults,omitempty" json:"defaults,omitempty"`
+	Budget      *Budget          `yaml:"budget,omitempty" json:"budget,omitempty"`
 	Steps       []Step           `yaml:"steps" json:"steps"`
 }
 
@@ -74,7 +82,107 @@ type Action struct {
 	Run       string            `yaml:"run,omitempty" json:"run,omitempty"`
 	HTTP      *HTTPSpec         `yaml:"http,omitempty" json:"http,omitempty"`
 	Container *ContainerSpec    `yaml:"container,omitempty" json:"container,omitempty"`
+	LLM       *LLMSpec          `yaml:"llm,omitempty" json:"llm,omitempty"`
+	Approval  *ApprovalSpec     `yaml:"approval,omitempty" json:"approval,omitempty"`
+	Signal    *SignalSpec       `yaml:"signal,omitempty" json:"signal,omitempty"`
+	Agent     *AgentSpec        `yaml:"agent,omitempty" json:"agent,omitempty"`
 	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+}
+
+// ApprovalSpec pauses the run until a person approves (the step completes)
+// or rejects (it fails, and completed steps are compensated). Message may
+// use ${{ }} expressions. With a timeout, OnTimeout decides: reject
+// (default) or approve.
+// An approved step's outputs are comment and decided_by (the API key's
+// name, or "timeout").
+type ApprovalSpec struct {
+	Message   string   `yaml:"message,omitempty" json:"message,omitempty"`
+	Timeout   Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	OnTimeout string   `yaml:"on_timeout,omitempty" json:"on_timeout,omitempty"`
+}
+
+// SignalSpec pauses the run until a signal of this name is sent to it; the
+// signal's JSON fields become the step's outputs. A signal sent before the
+// step starts is kept for it. With a timeout the step fails.
+type SignalSpec struct {
+	Name    string   `yaml:"name" json:"name"`
+	Timeout Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+}
+
+// LLMSpec asks a language model for a completion. Prompt and System may use
+// ${{ }} expressions (a prompt is not code). With a Schema the model must
+// answer with a JSON object matching it, and its top-level fields become
+// the step's outputs.
+type LLMSpec struct {
+	Model       string         `yaml:"model,omitempty" json:"model,omitempty"` // default CONDUCTOR_LLM_MODEL
+	System      string         `yaml:"system,omitempty" json:"system,omitempty"`
+	Prompt      string         `yaml:"prompt" json:"prompt"`
+	Schema      map[string]any `yaml:"schema,omitempty" json:"schema,omitempty"`
+	MaxTokens   int            `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+	Temperature *float64       `yaml:"temperature,omitempty" json:"temperature,omitempty"`
+
+	// Set by the agent engine, not by definitions: the whole conversation
+	// (instead of System and Prompt) and the tools the model may call.
+	Messages []llm.Message `yaml:"-" json:"messages,omitempty"`
+	Tools    []llm.Tool    `yaml:"-" json:"tools,omitempty"`
+}
+
+// AgentSpec is a model that calls tools in a loop until it answers. Every
+// model call and every tool call is its own task, so a crash resumes from
+// the last finished call instead of starting over. The answer is the step's
+// "answer" output.
+type AgentSpec struct {
+	Model       string      `yaml:"model,omitempty" json:"model,omitempty"`
+	System      string      `yaml:"system,omitempty" json:"system,omitempty"`
+	Prompt      string      `yaml:"prompt" json:"prompt"`
+	Tools       []AgentTool `yaml:"tools,omitempty" json:"tools,omitempty"`
+	MaxTokens   int         `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"` // per model call
+	Temperature *float64    `yaml:"temperature,omitempty" json:"temperature,omitempty"`
+	// Limits on the whole run.
+	MaxTurns     int      `yaml:"max_turns,omitempty" json:"max_turns,omitempty"`           // model calls (default 10)
+	MaxToolCalls int      `yaml:"max_tool_calls,omitempty" json:"max_tool_calls,omitempty"` // default 50
+	MaxDuration  Duration `yaml:"max_duration,omitempty" json:"max_duration,omitempty"`     // default 15m
+	Budget       *Budget  `yaml:"budget,omitempty" json:"budget,omitempty"`
+}
+
+// AgentTool is a tool the model may call: a shell command. The model's
+// arguments arrive as environment variables, never in the command line:
+// $TOOL_ARGS holds them as JSON, and each top-level argument is also
+// $ARG_<NAME>. The command's output is what the model sees.
+type AgentTool struct {
+	Name        string         `yaml:"name" json:"name"`
+	Description string         `yaml:"description,omitempty" json:"description,omitempty"`
+	Parameters  map[string]any `yaml:"parameters,omitempty" json:"parameters,omitempty"` // a JSON Schema object
+	Run         string         `yaml:"run" json:"run"`
+	Timeout     Duration       `yaml:"timeout,omitempty" json:"timeout,omitempty"` // default 2m
+}
+
+// Agent defaults.
+const (
+	DefaultAgentTurns     = 10
+	DefaultAgentToolCalls = 50
+	DefaultAgentDuration  = 15 * time.Minute
+	DefaultToolTimeout    = 2 * time.Minute
+)
+
+// Budget caps what a workflow run may spend on language models. Once a run
+// goes over, it fails and compensates like any failed run.
+type Budget struct {
+	MaxTokens  int64   `yaml:"max_tokens,omitempty" json:"max_tokens,omitempty"`
+	MaxCostUSD float64 `yaml:"max_cost_usd,omitempty" json:"max_cost_usd,omitempty"`
+}
+
+// Exceeded describes how spend breaks the budget, or returns "".
+func (b *Budget) Exceeded(tokens int64, costUSD float64) string {
+	switch {
+	case b == nil:
+		return ""
+	case b.MaxTokens > 0 && tokens > b.MaxTokens:
+		return fmt.Sprintf("budget exceeded: used %d model tokens of %d", tokens, b.MaxTokens)
+	case b.MaxCostUSD > 0 && costUSD > b.MaxCostUSD:
+		return fmt.Sprintf("budget exceeded: spent $%.4f of $%.4f on models", costUSD, b.MaxCostUSD)
+	}
+	return ""
 }
 
 type HTTPSpec struct {
@@ -329,8 +437,8 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("http steps need 'http.url'")
 			break
 		}
-		if a.Run != "" || a.Container != nil {
-			add("http steps cannot have 'run' or 'container'")
+		if a.Run != "" || a.Container != nil || a.LLM != nil {
+			add("http steps cannot have 'run', 'container' or 'llm'")
 		}
 		if m := a.HTTP.Method; m != "" && !slices.Contains([]string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}, strings.ToUpper(m)) {
 			add("unsupported HTTP method %q", m)
@@ -345,8 +453,8 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("container steps need 'container.image'")
 			break
 		}
-		if a.Run != "" || a.HTTP != nil {
-			add("container steps cannot have 'run' or 'http'")
+		if a.Run != "" || a.HTTP != nil || a.LLM != nil {
+			add("container steps cannot have 'run', 'http' or 'llm'")
 		}
 		if n := a.Container.Network; n != "" && n != "bridge" && n != "none" {
 			add("container.network must be 'bridge' or 'none'")
@@ -354,8 +462,58 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 		for i, arg := range a.Container.Command {
 			checkExpr(fmt.Sprintf("container.command[%d]", i), arg)
 		}
+	case TypeLLM:
+		if a.LLM == nil || strings.TrimSpace(a.LLM.Prompt) == "" {
+			add("llm steps need 'llm.prompt'")
+			break
+		}
+		if a.Run != "" || a.HTTP != nil || a.Container != nil {
+			add("llm steps cannot have 'run', 'http' or 'container'")
+		}
+		if err := ValidateLLM(a.LLM); err != nil {
+			add("%v", err)
+		}
+		checkExpr("llm.prompt", a.LLM.Prompt)
+		checkExpr("llm.system", a.LLM.System)
+	case TypeApproval:
+		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Signal != nil {
+			add("approval steps run nothing: no 'run', 'http', 'container', 'llm' or 'signal'")
+		}
+		if a.Approval != nil {
+			if o := a.Approval.OnTimeout; o != "" && o != "approve" && o != "reject" {
+				add("approval.on_timeout must be approve or reject")
+			}
+			if a.Approval.Timeout < 0 {
+				add("approval.timeout must not be negative")
+			}
+			checkExpr("approval.message", a.Approval.Message)
+		}
+	case TypeSignal:
+		if a.Signal == nil || !signalNameRe.MatchString(a.Signal.Name) {
+			add("signal steps need 'signal.name' (letters, digits, '-' or '_')")
+			break
+		}
+		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Approval != nil {
+			add("signal steps run nothing: no 'run', 'http', 'container', 'llm' or 'approval'")
+		}
+		if a.Signal.Timeout < 0 {
+			add("signal.timeout must not be negative")
+		}
+	case TypeAgent:
+		if a.Agent == nil || strings.TrimSpace(a.Agent.Prompt) == "" {
+			add("agent steps need 'agent.prompt'")
+			break
+		}
+		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Approval != nil || a.Signal != nil {
+			add("agent steps cannot have 'run', 'http', 'container', 'llm', 'approval' or 'signal'")
+		}
+		if err := validateAgent(a.Agent); err != nil {
+			add("%v", err)
+		}
+		checkExpr("agent.prompt", a.Agent.Prompt)
+		checkExpr("agent.system", a.Agent.System)
 	default:
-		add("unknown type %q (want shell, http or container)", a.Type)
+		add("unknown type %q (want shell, http, container, llm, approval, signal or agent)", a.Type)
 	}
 
 	for k, v := range a.Env {
@@ -450,3 +608,64 @@ func joinErrors(errs []error) error {
 
 // MarshalYAML writes a compensation as its action's fields, not nested.
 func (c Compensation) MarshalYAML() (any, error) { return c.Action, nil }
+
+// ValidateLLM checks an llm spec's settings (not its expressions).
+func ValidateLLM(l *LLMSpec) error {
+	var errs []error
+	if l.Schema != nil {
+		if t, _ := l.Schema["type"].(string); t != "object" {
+			errs = append(errs, fmt.Errorf("llm.schema must be a JSON Schema with type: object"))
+		}
+	}
+	if l.MaxTokens < 0 {
+		errs = append(errs, fmt.Errorf("llm.max_tokens must not be negative"))
+	}
+	if l.Temperature != nil && (*l.Temperature < 0 || *l.Temperature > 2) {
+		errs = append(errs, fmt.Errorf("llm.temperature must be between 0 and 2"))
+	}
+	return joinErrors(errs)
+}
+
+var signalNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+
+// IsWait reports whether a step type waits instead of running a task.
+func IsWait(stepType string) bool { return stepType == TypeApproval || stepType == TypeSignal }
+
+var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func validateAgent(a *AgentSpec) error {
+	var errs []error
+	add := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+	seen := map[string]bool{}
+	for i, t := range a.Tools {
+		where := fmt.Sprintf("agent.tools[%d]", i)
+		switch {
+		case !toolNameRe.MatchString(t.Name):
+			add("%s: name must be 1-64 letters, digits, '_' or '-'", where)
+		case seen[t.Name]:
+			add("%s: duplicate tool %q", where, t.Name)
+		}
+		seen[t.Name] = true
+		if strings.TrimSpace(t.Run) == "" {
+			add("%s: 'run' is required", where)
+		}
+		if strings.Contains(t.Run, "${{") {
+			add("%s: 'run' cannot contain ${{ }} expressions; the model's arguments arrive as $ARG_<NAME> and $TOOL_ARGS", where)
+		}
+		if t.Parameters != nil {
+			if typ, _ := t.Parameters["type"].(string); typ != "object" {
+				add("%s: parameters must be a JSON Schema with type: object", where)
+			}
+		}
+	}
+	if a.MaxTurns < 0 || a.MaxTurns > 100 {
+		add("agent.max_turns must be between 1 and 100")
+	}
+	if a.MaxToolCalls < 0 || a.MaxDuration < 0 || a.MaxTokens < 0 {
+		add("agent limits must not be negative")
+	}
+	if a.Temperature != nil && (*a.Temperature < 0 || *a.Temperature > 2) {
+		add("agent.temperature must be between 0 and 2")
+	}
+	return joinErrors(errs)
+}

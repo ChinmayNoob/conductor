@@ -196,6 +196,18 @@ func (c *Client) GetTaskOutput(ctx context.Context, in *grpcapi.TaskOutputReques
 	})
 }
 
+func (c *Client) DecideStep(ctx context.Context, in *grpcapi.DecideStepRequest, opts ...grpc.CallOption) (*grpcapi.DecideStepResponse, error) {
+	return call(ctx, c, func(ctx context.Context, cl grpcapi.CoordinatorServiceClient) (*grpcapi.DecideStepResponse, error) {
+		return cl.DecideStep(ctx, in, opts...)
+	})
+}
+
+func (c *Client) SignalWorkflow(ctx context.Context, in *grpcapi.SignalRequest, opts ...grpc.CallOption) (*grpcapi.SignalResponse, error) {
+	return call(ctx, c, func(ctx context.Context, cl grpcapi.CoordinatorServiceClient) (*grpcapi.SignalResponse, error) {
+		return cl.SignalWorkflow(ctx, in, opts...)
+	})
+}
+
 func (c *Client) SendHeartbeat(ctx context.Context, in *grpcapi.HeartbeatRequest, opts ...grpc.CallOption) (*grpcapi.HeartbeatResponse, error) {
 	return call(ctx, c, func(ctx context.Context, cl grpcapi.CoordinatorServiceClient) (*grpcapi.HeartbeatResponse, error) {
 		return cl.SendHeartbeat(ctx, in, opts...)

@@ -91,7 +91,7 @@ func (s *Server) lead(ctx context.Context, sess *db.LeaderSession, epoch int64) 
 	}
 
 	loops := []func(context.Context){
-		s.dispatchLoop, s.recoveryLoop, s.workflowSweepLoop, s.scheduleLoop, s.listen,
+		s.dispatchLoop, s.recoveryLoop, s.workflowSweepLoop, s.scheduleLoop, s.waitTimeoutLoop, s.listen,
 	}
 	var wg sync.WaitGroup
 	for _, loop := range loops {

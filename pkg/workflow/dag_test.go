@@ -261,3 +261,19 @@ func TestFailureMessageNamesTheStep(t *testing.T) {
 		t.Fatalf("error %q should name the failed step", p.Error)
 	}
 }
+
+func TestAbortFailsAndCompensates(t *testing.T) {
+	s := newSim(t, diamond, map[string]string{"b": "hang", "c": "hang"})
+	s.reconcile()
+	s.tick() // a completes; b and c start and hang
+	s.reconcile()
+	s.run.Abort = "budget exceeded: used 120 model tokens of 100"
+	p := Reconcile(s.d, s.run)
+	if p.SetStatus != StatusCompensating || p.Error != s.run.Abort {
+		t.Fatalf("plan %+v, want compensating with the abort reason", p)
+	}
+	s.runToEnd()
+	if s.run.Status != StatusFailed || s.statusOf("a") != StepCompensated || s.statusOf("d") != StepSkipped {
+		t.Fatalf("status %s, steps %+v; want FAILED with a compensated and d skipped", s.run.Status, s.run.Steps)
+	}
+}

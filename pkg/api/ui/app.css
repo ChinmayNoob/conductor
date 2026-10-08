@@ -311,3 +311,21 @@ th.num { text-align: right; }
 .bulb.red, .halo.red { fill: var(--red); }
 .bulb.violet, .halo.violet { fill: var(--violet); }
 .bulb.blue, .halo.blue { fill: var(--blue); }
+
+/* ---- Approvals, agent runs and the assistant ---- */
+.actions-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.actions-row input[type="text"], textarea {
+  border: 1px solid var(--rule); background: var(--panel); border-radius: var(--radius); padding: 7px 10px;
+  min-width: 0; flex: 1 1 240px;
+}
+textarea { width: 100%; font: inherit; resize: vertical; }
+.wait { margin-top: 14px; display: grid; gap: 6px; }
+.transcript { margin: 10px 0; display: grid; gap: 6px; }
+.turn { border: 1px solid var(--rule); border-radius: var(--radius); padding: 8px 10px; background: var(--panel-sunk); }
+.turn .who { font: 600 10.5px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-faint); }
+.turn pre { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px var(--mono); }
+.turn.assistant { border-color: color-mix(in srgb, var(--violet) 40%, transparent); }
+.answer { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+.yaml { max-height: 380px; overflow: auto; margin-top: 12px; }
+.dry-run { margin: 12px 0; }
+.dry-run ol { margin: 8px 0 0; padding-left: 22px; font: 12.5px var(--mono); }

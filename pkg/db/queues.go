@@ -16,6 +16,7 @@ type Queue struct {
 	ConcurrencyLimit  *int
 	RateLimit         *int
 	RatePeriodSeconds int
+	TokensPerMinute   *int64 // model tokens per minute (llm tasks)
 	Paused            bool
 	UpdatedAt         time.Time
 
@@ -31,14 +32,16 @@ func (db *DB) UpsertQueue(ctx context.Context, q Queue) (*Queue, error) {
 	}
 	out := &Queue{}
 	err := db.q.QueryRowContext(ctx,
-		`INSERT INTO queues (namespace, name, concurrency_limit, rate_limit, rate_period_seconds, paused)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO queues (namespace, name, concurrency_limit, rate_limit, rate_period_seconds, paused, tokens_per_minute)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (namespace, name) DO UPDATE
 		 SET concurrency_limit = EXCLUDED.concurrency_limit, rate_limit = EXCLUDED.rate_limit,
-		     rate_period_seconds = EXCLUDED.rate_period_seconds, paused = EXCLUDED.paused, updated_at = NOW()
-		 RETURNING namespace, name, concurrency_limit, rate_limit, rate_period_seconds, paused, updated_at`,
-		q.Namespace, q.Name, q.ConcurrencyLimit, q.RateLimit, q.RatePeriodSeconds, q.Paused,
-	).Scan(&out.Namespace, &out.Name, &out.ConcurrencyLimit, &out.RateLimit, &out.RatePeriodSeconds, &out.Paused, &out.UpdatedAt)
+		     rate_period_seconds = EXCLUDED.rate_period_seconds, paused = EXCLUDED.paused,
+		     tokens_per_minute = EXCLUDED.tokens_per_minute, updated_at = NOW()
+		 RETURNING namespace, name, concurrency_limit, rate_limit, rate_period_seconds, paused, updated_at, tokens_per_minute`,
+		q.Namespace, q.Name, q.ConcurrencyLimit, q.RateLimit, q.RatePeriodSeconds, q.Paused, q.TokensPerMinute,
+	).Scan(&out.Namespace, &out.Name, &out.ConcurrencyLimit, &out.RateLimit, &out.RatePeriodSeconds, &out.Paused,
+		&out.UpdatedAt, &out.TokensPerMinute)
 	if err != nil {
 		return nil, fmt.Errorf("failed to save queue: %w", err)
 	}
@@ -49,9 +52,10 @@ func (db *DB) UpsertQueue(ctx context.Context, q Queue) (*Queue, error) {
 func (db *DB) GetQueue(ctx context.Context, namespace, name string) (*Queue, error) {
 	q := &Queue{}
 	err := db.q.QueryRowContext(ctx,
-		`SELECT namespace, name, concurrency_limit, rate_limit, rate_period_seconds, paused, updated_at
+		`SELECT namespace, name, concurrency_limit, rate_limit, rate_period_seconds, paused, updated_at, tokens_per_minute
 		 FROM queues WHERE namespace = $1 AND name = $2`, namespace, name,
-	).Scan(&q.Namespace, &q.Name, &q.ConcurrencyLimit, &q.RateLimit, &q.RatePeriodSeconds, &q.Paused, &q.UpdatedAt)
+	).Scan(&q.Namespace, &q.Name, &q.ConcurrencyLimit, &q.RateLimit, &q.RatePeriodSeconds, &q.Paused, &q.UpdatedAt,
+		&q.TokensPerMinute)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -70,7 +74,7 @@ func (db *DB) ListQueues(ctx context.Context, namespace string) ([]*Queue, error
 		     SELECT DISTINCT queue FROM tasks WHERE namespace = $1 AND status IN ('QUEUED', 'STARTED')
 		 )
 		 SELECT n.name, q.concurrency_limit, q.rate_limit, COALESCE(q.rate_period_seconds, 1),
-		        COALESCE(q.paused, false), COALESCE(q.updated_at, NOW()),
+		        COALESCE(q.paused, false), COALESCE(q.updated_at, NOW()), q.tokens_per_minute,
 		        (SELECT count(*) FROM tasks t WHERE t.namespace = $1 AND t.queue = n.name
 		           AND t.status = 'QUEUED' AND t.picked_at IS NULL),
 		        (SELECT count(*) FROM tasks t WHERE t.namespace = $1 AND t.queue = n.name
@@ -86,7 +90,7 @@ func (db *DB) ListQueues(ctx context.Context, namespace string) ([]*Queue, error
 	for rows.Next() {
 		q := &Queue{Namespace: namespace}
 		if err := rows.Scan(&q.Name, &q.ConcurrencyLimit, &q.RateLimit, &q.RatePeriodSeconds, &q.Paused,
-			&q.UpdatedAt, &q.Queued, &q.Running); err != nil {
+			&q.UpdatedAt, &q.TokensPerMinute, &q.Queued, &q.Running); err != nil {
 			return nil, err
 		}
 		out = append(out, q)

@@ -12,6 +12,7 @@ type queueJSON struct {
 	ConcurrencyLimit  *int      `json:"concurrency_limit"`
 	RateLimit         *int      `json:"rate_limit"`
 	RatePeriodSeconds int       `json:"rate_period_seconds"`
+	TokensPerMinute   *int64    `json:"tokens_per_minute"`
 	Paused            bool      `json:"paused"`
 	Queued            int       `json:"queued"`
 	Running           int       `json:"running"`
@@ -20,7 +21,8 @@ type queueJSON struct {
 
 func toQueueJSON(q *db.Queue) queueJSON {
 	return queueJSON{Name: q.Name, ConcurrencyLimit: q.ConcurrencyLimit, RateLimit: q.RateLimit,
-		RatePeriodSeconds: q.RatePeriodSeconds, Paused: q.Paused, Queued: q.Queued, Running: q.Running, UpdatedAt: q.UpdatedAt}
+		RatePeriodSeconds: q.RatePeriodSeconds, TokensPerMinute: q.TokensPerMinute, Paused: q.Paused,
+		Queued: q.Queued, Running: q.Running, UpdatedAt: q.UpdatedAt}
 }
 
 func (s *Server) handleListQueues(w http.ResponseWriter, r *http.Request) {
@@ -46,21 +48,23 @@ func (s *Server) handlePutQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ConcurrencyLimit  *int `json:"concurrency_limit"`
-		RateLimit         *int `json:"rate_limit"`
-		RatePeriodSeconds int  `json:"rate_period_seconds"`
-		Paused            bool `json:"paused"`
+		ConcurrencyLimit  *int   `json:"concurrency_limit"`
+		RateLimit         *int   `json:"rate_limit"`
+		RatePeriodSeconds int    `json:"rate_period_seconds"`
+		TokensPerMinute   *int64 `json:"tokens_per_minute"`
+		Paused            bool   `json:"paused"`
 	}
 	if !s.decode(w, r, &req) {
 		return
 	}
-	if (req.ConcurrencyLimit != nil && *req.ConcurrencyLimit < 1) || (req.RateLimit != nil && *req.RateLimit < 1) || req.RatePeriodSeconds < 0 {
+	if (req.ConcurrencyLimit != nil && *req.ConcurrencyLimit < 1) || (req.RateLimit != nil && *req.RateLimit < 1) ||
+		(req.TokensPerMinute != nil && *req.TokensPerMinute < 1) || req.RatePeriodSeconds < 0 {
 		writeError(w, http.StatusBadRequest, "limits must be at least 1 (use null for unlimited)")
 		return
 	}
 	q, err := s.db.UpsertQueue(r.Context(), db.Queue{
 		Namespace: namespace(r), Name: name, ConcurrencyLimit: req.ConcurrencyLimit, RateLimit: req.RateLimit,
-		RatePeriodSeconds: req.RatePeriodSeconds, Paused: req.Paused,
+		RatePeriodSeconds: req.RatePeriodSeconds, TokensPerMinute: req.TokensPerMinute, Paused: req.Paused,
 	})
 	if err != nil {
 		s.internalError(w, "Failed to save queue", err)

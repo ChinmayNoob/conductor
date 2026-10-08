@@ -580,13 +580,19 @@ func (x *HeartbeatResponse) GetAcknowledged() bool {
 }
 
 type UpdateTaskStatusRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	Status        TaskStatus             `protobuf:"varint,2,opt,name=status,proto3,enum=grpcapi.TaskStatus" json:"status,omitempty"`
-	Output        string                 `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"`
-	ErrorMessage  string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`                                             // set when status is FAILED
-	Outputs       map[string]string      `protobuf:"bytes,5,rep,name=outputs,proto3" json:"outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
-	Attempt       int32                  `protobuf:"varint,6,opt,name=attempt,proto3" json:"attempt,omitempty"`                                                                          // from TaskRequest; stale attempts are ignored
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	TaskId       string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	Status       TaskStatus             `protobuf:"varint,2,opt,name=status,proto3,enum=grpcapi.TaskStatus" json:"status,omitempty"`
+	Output       string                 `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"`
+	ErrorMessage string                 `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`                                             // set when status is FAILED
+	Outputs      map[string]string      `protobuf:"bytes,5,rep,name=outputs,proto3" json:"outputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
+	Attempt      int32                  `protobuf:"varint,6,opt,name=attempt,proto3" json:"attempt,omitempty"`                                                                          // from TaskRequest; stale attempts are ignored
+	// Set when status is FAILED: wait at least this long before retrying (a
+	// provider's Retry-After), or don't retry at all (retrying can't help).
+	RetryAfterSeconds int32 `protobuf:"varint,7,opt,name=retry_after_seconds,json=retryAfterSeconds,proto3" json:"retry_after_seconds,omitempty"`
+	Permanent         bool  `protobuf:"varint,8,opt,name=permanent,proto3" json:"permanent,omitempty"`
+	// Language model usage of this attempt (llm tasks).
+	LlmUsage      *LLMUsage `protobuf:"bytes,9,opt,name=llm_usage,json=llmUsage,proto3" json:"llm_usage,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -663,6 +669,95 @@ func (x *UpdateTaskStatusRequest) GetAttempt() int32 {
 	return 0
 }
 
+func (x *UpdateTaskStatusRequest) GetRetryAfterSeconds() int32 {
+	if x != nil {
+		return x.RetryAfterSeconds
+	}
+	return 0
+}
+
+func (x *UpdateTaskStatusRequest) GetPermanent() bool {
+	if x != nil {
+		return x.Permanent
+	}
+	return false
+}
+
+func (x *UpdateTaskStatusRequest) GetLlmUsage() *LLMUsage {
+	if x != nil {
+		return x.LlmUsage
+	}
+	return nil
+}
+
+type LLMUsage struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Model         string                 `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	InputTokens   int64                  `protobuf:"varint,2,opt,name=input_tokens,json=inputTokens,proto3" json:"input_tokens,omitempty"`
+	OutputTokens  int64                  `protobuf:"varint,3,opt,name=output_tokens,json=outputTokens,proto3" json:"output_tokens,omitempty"`
+	CostUsd       float64                `protobuf:"fixed64,4,opt,name=cost_usd,json=costUsd,proto3" json:"cost_usd,omitempty"` // 0 when the model has no configured price
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LLMUsage) Reset() {
+	*x = LLMUsage{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LLMUsage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LLMUsage) ProtoMessage() {}
+
+func (x *LLMUsage) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LLMUsage.ProtoReflect.Descriptor instead.
+func (*LLMUsage) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *LLMUsage) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *LLMUsage) GetInputTokens() int64 {
+	if x != nil {
+		return x.InputTokens
+	}
+	return 0
+}
+
+func (x *LLMUsage) GetOutputTokens() int64 {
+	if x != nil {
+		return x.OutputTokens
+	}
+	return 0
+}
+
+func (x *LLMUsage) GetCostUsd() float64 {
+	if x != nil {
+		return x.CostUsd
+	}
+	return 0
+}
+
 type UpdateTaskStatusResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ShouldRetry   bool                   `protobuf:"varint,1,opt,name=should_retry,json=shouldRetry,proto3" json:"should_retry,omitempty"` // the coordinator will retry the failed task
@@ -672,7 +767,7 @@ type UpdateTaskStatusResponse struct {
 
 func (x *UpdateTaskStatusResponse) Reset() {
 	*x = UpdateTaskStatusResponse{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[9]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -684,7 +779,7 @@ func (x *UpdateTaskStatusResponse) String() string {
 func (*UpdateTaskStatusResponse) ProtoMessage() {}
 
 func (x *UpdateTaskStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[9]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -697,7 +792,7 @@ func (x *UpdateTaskStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateTaskStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdateTaskStatusResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{9}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *UpdateTaskStatusResponse) GetShouldRetry() bool {
@@ -720,7 +815,7 @@ type WorkflowRequest struct {
 
 func (x *WorkflowRequest) Reset() {
 	*x = WorkflowRequest{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[10]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -732,7 +827,7 @@ func (x *WorkflowRequest) String() string {
 func (*WorkflowRequest) ProtoMessage() {}
 
 func (x *WorkflowRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[10]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -745,7 +840,7 @@ func (x *WorkflowRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkflowRequest.ProtoReflect.Descriptor instead.
 func (*WorkflowRequest) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{10}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *WorkflowRequest) GetNamespace() string {
@@ -793,7 +888,7 @@ type WorkflowResponse struct {
 
 func (x *WorkflowResponse) Reset() {
 	*x = WorkflowResponse{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[11]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -805,7 +900,7 @@ func (x *WorkflowResponse) String() string {
 func (*WorkflowResponse) ProtoMessage() {}
 
 func (x *WorkflowResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[11]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -818,7 +913,7 @@ func (x *WorkflowResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkflowResponse.ProtoReflect.Descriptor instead.
 func (*WorkflowResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{11}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *WorkflowResponse) GetWorkflowId() string {
@@ -845,7 +940,7 @@ type CancelWorkflowRequest struct {
 
 func (x *CancelWorkflowRequest) Reset() {
 	*x = CancelWorkflowRequest{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[12]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -857,7 +952,7 @@ func (x *CancelWorkflowRequest) String() string {
 func (*CancelWorkflowRequest) ProtoMessage() {}
 
 func (x *CancelWorkflowRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[12]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -870,7 +965,7 @@ func (x *CancelWorkflowRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelWorkflowRequest.ProtoReflect.Descriptor instead.
 func (*CancelWorkflowRequest) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{12}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CancelWorkflowRequest) GetWorkflowId() string {
@@ -897,7 +992,7 @@ type CancelWorkflowResponse struct {
 
 func (x *CancelWorkflowResponse) Reset() {
 	*x = CancelWorkflowResponse{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[13]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -909,7 +1004,7 @@ func (x *CancelWorkflowResponse) String() string {
 func (*CancelWorkflowResponse) ProtoMessage() {}
 
 func (x *CancelWorkflowResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[13]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -922,7 +1017,7 @@ func (x *CancelWorkflowResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelWorkflowResponse.ProtoReflect.Descriptor instead.
 func (*CancelWorkflowResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{13}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CancelWorkflowResponse) GetCancelled() bool {
@@ -943,7 +1038,7 @@ type TaskOutputRequest struct {
 
 func (x *TaskOutputRequest) Reset() {
 	*x = TaskOutputRequest{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[14]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -955,7 +1050,7 @@ func (x *TaskOutputRequest) String() string {
 func (*TaskOutputRequest) ProtoMessage() {}
 
 func (x *TaskOutputRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[14]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -968,7 +1063,7 @@ func (x *TaskOutputRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskOutputRequest.ProtoReflect.Descriptor instead.
 func (*TaskOutputRequest) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{14}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *TaskOutputRequest) GetTaskId() string {
@@ -1004,7 +1099,7 @@ type TaskOutputResponse struct {
 
 func (x *TaskOutputResponse) Reset() {
 	*x = TaskOutputResponse{}
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[15]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1016,7 +1111,7 @@ func (x *TaskOutputResponse) String() string {
 func (*TaskOutputResponse) ProtoMessage() {}
 
 func (x *TaskOutputResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_grpcapi_api_proto_msgTypes[15]
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1029,7 +1124,7 @@ func (x *TaskOutputResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskOutputResponse.ProtoReflect.Descriptor instead.
 func (*TaskOutputResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{15}
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *TaskOutputResponse) GetRunning() bool {
@@ -1051,6 +1146,246 @@ func (x *TaskOutputResponse) GetNextOffset() int64 {
 		return x.NextOffset
 	}
 	return 0
+}
+
+type DecideStepRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Step          string                 `protobuf:"bytes,3,opt,name=step,proto3" json:"step,omitempty"`
+	Approve       bool                   `protobuf:"varint,4,opt,name=approve,proto3" json:"approve,omitempty"`
+	Comment       string                 `protobuf:"bytes,5,opt,name=comment,proto3" json:"comment,omitempty"`
+	DecidedBy     string                 `protobuf:"bytes,6,opt,name=decided_by,json=decidedBy,proto3" json:"decided_by,omitempty"` // the API key's name, for the record
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DecideStepRequest) Reset() {
+	*x = DecideStepRequest{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DecideStepRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DecideStepRequest) ProtoMessage() {}
+
+func (x *DecideStepRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DecideStepRequest.ProtoReflect.Descriptor instead.
+func (*DecideStepRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *DecideStepRequest) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetStep() string {
+	if x != nil {
+		return x.Step
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetApprove() bool {
+	if x != nil {
+		return x.Approve
+	}
+	return false
+}
+
+func (x *DecideStepRequest) GetComment() string {
+	if x != nil {
+		return x.Comment
+	}
+	return ""
+}
+
+func (x *DecideStepRequest) GetDecidedBy() string {
+	if x != nil {
+		return x.DecidedBy
+	}
+	return ""
+}
+
+type DecideStepResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DecideStepResponse) Reset() {
+	*x = DecideStepResponse{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DecideStepResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DecideStepResponse) ProtoMessage() {}
+
+func (x *DecideStepResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DecideStepResponse.ProtoReflect.Descriptor instead.
+func (*DecideStepResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{18}
+}
+
+type SignalRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkflowId    string                 `protobuf:"bytes,1,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
+	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Name          string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	PayloadJson   []byte                 `protobuf:"bytes,4,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"` // a JSON object; its fields become the step's outputs
+	SentBy        string                 `protobuf:"bytes,5,opt,name=sent_by,json=sentBy,proto3" json:"sent_by,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SignalRequest) Reset() {
+	*x = SignalRequest{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SignalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SignalRequest) ProtoMessage() {}
+
+func (x *SignalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SignalRequest.ProtoReflect.Descriptor instead.
+func (*SignalRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *SignalRequest) GetWorkflowId() string {
+	if x != nil {
+		return x.WorkflowId
+	}
+	return ""
+}
+
+func (x *SignalRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
+	}
+	return ""
+}
+
+func (x *SignalRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SignalRequest) GetPayloadJson() []byte {
+	if x != nil {
+		return x.PayloadJson
+	}
+	return nil
+}
+
+func (x *SignalRequest) GetSentBy() string {
+	if x != nil {
+		return x.SentBy
+	}
+	return ""
+}
+
+type SignalResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Delivered     bool                   `protobuf:"varint,1,opt,name=delivered,proto3" json:"delivered,omitempty"` // false: no step waits for it yet; it is kept
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SignalResponse) Reset() {
+	*x = SignalResponse{}
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SignalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SignalResponse) ProtoMessage() {}
+
+func (x *SignalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_grpcapi_api_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SignalResponse.ProtoReflect.Descriptor instead.
+func (*SignalResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_grpcapi_api_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SignalResponse) GetDelivered() bool {
+	if x != nil {
+		return x.Delivered
+	}
+	return false
 }
 
 var File_pkg_grpcapi_api_proto protoreflect.FileDescriptor
@@ -1099,17 +1434,25 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"7\n" +
 	"\x11HeartbeatResponse\x12\"\n" +
-	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\xbb\x02\n" +
+	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\xb9\x03\n" +
 	"\x17UpdateTaskStatusRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12+\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x13.grpcapi.TaskStatusR\x06status\x12\x16\n" +
 	"\x06output\x18\x03 \x01(\tR\x06output\x12#\n" +
 	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\x12G\n" +
 	"\aoutputs\x18\x05 \x03(\v2-.grpcapi.UpdateTaskStatusRequest.OutputsEntryR\aoutputs\x12\x18\n" +
-	"\aattempt\x18\x06 \x01(\x05R\aattempt\x1a:\n" +
+	"\aattempt\x18\x06 \x01(\x05R\aattempt\x12.\n" +
+	"\x13retry_after_seconds\x18\a \x01(\x05R\x11retryAfterSeconds\x12\x1c\n" +
+	"\tpermanent\x18\b \x01(\bR\tpermanent\x12.\n" +
+	"\tllm_usage\x18\t \x01(\v2\x11.grpcapi.LLMUsageR\bllmUsage\x1a:\n" +
 	"\fOutputsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"=\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x83\x01\n" +
+	"\bLLMUsage\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12!\n" +
+	"\finput_tokens\x18\x02 \x01(\x03R\vinputTokens\x12#\n" +
+	"\routput_tokens\x18\x03 \x01(\x03R\foutputTokens\x12\x19\n" +
+	"\bcost_usd\x18\x04 \x01(\x01R\acostUsd\"=\n" +
 	"\x18UpdateTaskStatusResponse\x12!\n" +
 	"\fshould_retry\x18\x01 \x01(\bR\vshouldRetry\"\xa5\x01\n" +
 	"\x0fWorkflowRequest\x12\x1c\n" +
@@ -1137,7 +1480,26 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\arunning\x18\x01 \x01(\bR\arunning\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\x12\x1f\n" +
 	"\vnext_offset\x18\x03 \x01(\x03R\n" +
-	"nextOffset*?\n" +
+	"nextOffset\"\xb9\x01\n" +
+	"\x11DecideStepRequest\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\x12\x1c\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04step\x18\x03 \x01(\tR\x04step\x12\x18\n" +
+	"\aapprove\x18\x04 \x01(\bR\aapprove\x12\x18\n" +
+	"\acomment\x18\x05 \x01(\tR\acomment\x12\x1d\n" +
+	"\n" +
+	"decided_by\x18\x06 \x01(\tR\tdecidedBy\"\x14\n" +
+	"\x12DecideStepResponse\"\x9e\x01\n" +
+	"\rSignalRequest\x12\x1f\n" +
+	"\vworkflow_id\x18\x01 \x01(\tR\n" +
+	"workflowId\x12\x1c\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12!\n" +
+	"\fpayload_json\x18\x04 \x01(\fR\vpayloadJson\x12\x17\n" +
+	"\asent_by\x18\x05 \x01(\tR\x06sentBy\".\n" +
+	"\x0eSignalResponse\x12\x1c\n" +
+	"\tdelivered\x18\x01 \x01(\bR\tdelivered*?\n" +
 	"\n" +
 	"TaskStatus\x12\n" +
 	"\n" +
@@ -1151,7 +1513,7 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"SubmitTask\x12\x14.grpcapi.TaskRequest\x1a\x15.grpcapi.TaskResponse\"\x00\x12G\n" +
 	"\n" +
 	"CancelTask\x12\x1a.grpcapi.CancelTaskRequest\x1a\x1b.grpcapi.CancelTaskResponse\"\x00\x12J\n" +
-	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x002\xb5\x04\n" +
+	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x002\xc3\x05\n" +
 	"\x12CoordinatorService\x12G\n" +
 	"\n" +
 	"SubmitTask\x12\x1a.grpcapi.ClientTaskRequest\x1a\x1b.grpcapi.ClientTaskResponse\"\x00\x12G\n" +
@@ -1161,7 +1523,10 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\x10UpdateTaskStatus\x12 .grpcapi.UpdateTaskStatusRequest\x1a!.grpcapi.UpdateTaskStatusResponse\"\x00\x12G\n" +
 	"\x0eSubmitWorkflow\x12\x18.grpcapi.WorkflowRequest\x1a\x19.grpcapi.WorkflowResponse\"\x00\x12S\n" +
 	"\x0eCancelWorkflow\x12\x1e.grpcapi.CancelWorkflowRequest\x1a\x1f.grpcapi.CancelWorkflowResponse\"\x00\x12J\n" +
-	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x00B.Z,github.com/ChinmayNoob/conductor/pkg/grpcapib\x06proto3"
+	"\rGetTaskOutput\x12\x1a.grpcapi.TaskOutputRequest\x1a\x1b.grpcapi.TaskOutputResponse\"\x00\x12G\n" +
+	"\n" +
+	"DecideStep\x12\x1a.grpcapi.DecideStepRequest\x1a\x1b.grpcapi.DecideStepResponse\"\x00\x12C\n" +
+	"\x0eSignalWorkflow\x12\x16.grpcapi.SignalRequest\x1a\x17.grpcapi.SignalResponse\"\x00B.Z,github.com/ChinmayNoob/conductor/pkg/grpcapib\x06proto3"
 
 var (
 	file_pkg_grpcapi_api_proto_rawDescOnce sync.Once
@@ -1176,7 +1541,7 @@ func file_pkg_grpcapi_api_proto_rawDescGZIP() []byte {
 }
 
 var file_pkg_grpcapi_api_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_pkg_grpcapi_api_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(TaskStatus)(0),                  // 0: grpcapi.TaskStatus
 	(*TaskRequest)(nil),              // 1: grpcapi.TaskRequest
@@ -1188,47 +1553,57 @@ var file_pkg_grpcapi_api_proto_goTypes = []any{
 	(*HeartbeatRequest)(nil),         // 7: grpcapi.HeartbeatRequest
 	(*HeartbeatResponse)(nil),        // 8: grpcapi.HeartbeatResponse
 	(*UpdateTaskStatusRequest)(nil),  // 9: grpcapi.UpdateTaskStatusRequest
-	(*UpdateTaskStatusResponse)(nil), // 10: grpcapi.UpdateTaskStatusResponse
-	(*WorkflowRequest)(nil),          // 11: grpcapi.WorkflowRequest
-	(*WorkflowResponse)(nil),         // 12: grpcapi.WorkflowResponse
-	(*CancelWorkflowRequest)(nil),    // 13: grpcapi.CancelWorkflowRequest
-	(*CancelWorkflowResponse)(nil),   // 14: grpcapi.CancelWorkflowResponse
-	(*TaskOutputRequest)(nil),        // 15: grpcapi.TaskOutputRequest
-	(*TaskOutputResponse)(nil),       // 16: grpcapi.TaskOutputResponse
-	nil,                              // 17: grpcapi.TaskRequest.EnvEntry
-	nil,                              // 18: grpcapi.HeartbeatRequest.LabelsEntry
-	nil,                              // 19: grpcapi.UpdateTaskStatusRequest.OutputsEntry
+	(*LLMUsage)(nil),                 // 10: grpcapi.LLMUsage
+	(*UpdateTaskStatusResponse)(nil), // 11: grpcapi.UpdateTaskStatusResponse
+	(*WorkflowRequest)(nil),          // 12: grpcapi.WorkflowRequest
+	(*WorkflowResponse)(nil),         // 13: grpcapi.WorkflowResponse
+	(*CancelWorkflowRequest)(nil),    // 14: grpcapi.CancelWorkflowRequest
+	(*CancelWorkflowResponse)(nil),   // 15: grpcapi.CancelWorkflowResponse
+	(*TaskOutputRequest)(nil),        // 16: grpcapi.TaskOutputRequest
+	(*TaskOutputResponse)(nil),       // 17: grpcapi.TaskOutputResponse
+	(*DecideStepRequest)(nil),        // 18: grpcapi.DecideStepRequest
+	(*DecideStepResponse)(nil),       // 19: grpcapi.DecideStepResponse
+	(*SignalRequest)(nil),            // 20: grpcapi.SignalRequest
+	(*SignalResponse)(nil),           // 21: grpcapi.SignalResponse
+	nil,                              // 22: grpcapi.TaskRequest.EnvEntry
+	nil,                              // 23: grpcapi.HeartbeatRequest.LabelsEntry
+	nil,                              // 24: grpcapi.UpdateTaskStatusRequest.OutputsEntry
 }
 var file_pkg_grpcapi_api_proto_depIdxs = []int32{
-	17, // 0: grpcapi.TaskRequest.env:type_name -> grpcapi.TaskRequest.EnvEntry
-	18, // 1: grpcapi.HeartbeatRequest.labels:type_name -> grpcapi.HeartbeatRequest.LabelsEntry
+	22, // 0: grpcapi.TaskRequest.env:type_name -> grpcapi.TaskRequest.EnvEntry
+	23, // 1: grpcapi.HeartbeatRequest.labels:type_name -> grpcapi.HeartbeatRequest.LabelsEntry
 	0,  // 2: grpcapi.UpdateTaskStatusRequest.status:type_name -> grpcapi.TaskStatus
-	19, // 3: grpcapi.UpdateTaskStatusRequest.outputs:type_name -> grpcapi.UpdateTaskStatusRequest.OutputsEntry
-	1,  // 4: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
-	5,  // 5: grpcapi.WorkerService.CancelTask:input_type -> grpcapi.CancelTaskRequest
-	15, // 6: grpcapi.WorkerService.GetTaskOutput:input_type -> grpcapi.TaskOutputRequest
-	3,  // 7: grpcapi.CoordinatorService.SubmitTask:input_type -> grpcapi.ClientTaskRequest
-	5,  // 8: grpcapi.CoordinatorService.CancelTask:input_type -> grpcapi.CancelTaskRequest
-	7,  // 9: grpcapi.CoordinatorService.SendHeartbeat:input_type -> grpcapi.HeartbeatRequest
-	9,  // 10: grpcapi.CoordinatorService.UpdateTaskStatus:input_type -> grpcapi.UpdateTaskStatusRequest
-	11, // 11: grpcapi.CoordinatorService.SubmitWorkflow:input_type -> grpcapi.WorkflowRequest
-	13, // 12: grpcapi.CoordinatorService.CancelWorkflow:input_type -> grpcapi.CancelWorkflowRequest
-	15, // 13: grpcapi.CoordinatorService.GetTaskOutput:input_type -> grpcapi.TaskOutputRequest
-	2,  // 14: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
-	6,  // 15: grpcapi.WorkerService.CancelTask:output_type -> grpcapi.CancelTaskResponse
-	16, // 16: grpcapi.WorkerService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
-	4,  // 17: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
-	6,  // 18: grpcapi.CoordinatorService.CancelTask:output_type -> grpcapi.CancelTaskResponse
-	8,  // 19: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
-	10, // 20: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
-	12, // 21: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
-	14, // 22: grpcapi.CoordinatorService.CancelWorkflow:output_type -> grpcapi.CancelWorkflowResponse
-	16, // 23: grpcapi.CoordinatorService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
-	14, // [14:24] is the sub-list for method output_type
-	4,  // [4:14] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	24, // 3: grpcapi.UpdateTaskStatusRequest.outputs:type_name -> grpcapi.UpdateTaskStatusRequest.OutputsEntry
+	10, // 4: grpcapi.UpdateTaskStatusRequest.llm_usage:type_name -> grpcapi.LLMUsage
+	1,  // 5: grpcapi.WorkerService.SubmitTask:input_type -> grpcapi.TaskRequest
+	5,  // 6: grpcapi.WorkerService.CancelTask:input_type -> grpcapi.CancelTaskRequest
+	16, // 7: grpcapi.WorkerService.GetTaskOutput:input_type -> grpcapi.TaskOutputRequest
+	3,  // 8: grpcapi.CoordinatorService.SubmitTask:input_type -> grpcapi.ClientTaskRequest
+	5,  // 9: grpcapi.CoordinatorService.CancelTask:input_type -> grpcapi.CancelTaskRequest
+	7,  // 10: grpcapi.CoordinatorService.SendHeartbeat:input_type -> grpcapi.HeartbeatRequest
+	9,  // 11: grpcapi.CoordinatorService.UpdateTaskStatus:input_type -> grpcapi.UpdateTaskStatusRequest
+	12, // 12: grpcapi.CoordinatorService.SubmitWorkflow:input_type -> grpcapi.WorkflowRequest
+	14, // 13: grpcapi.CoordinatorService.CancelWorkflow:input_type -> grpcapi.CancelWorkflowRequest
+	16, // 14: grpcapi.CoordinatorService.GetTaskOutput:input_type -> grpcapi.TaskOutputRequest
+	18, // 15: grpcapi.CoordinatorService.DecideStep:input_type -> grpcapi.DecideStepRequest
+	20, // 16: grpcapi.CoordinatorService.SignalWorkflow:input_type -> grpcapi.SignalRequest
+	2,  // 17: grpcapi.WorkerService.SubmitTask:output_type -> grpcapi.TaskResponse
+	6,  // 18: grpcapi.WorkerService.CancelTask:output_type -> grpcapi.CancelTaskResponse
+	17, // 19: grpcapi.WorkerService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
+	4,  // 20: grpcapi.CoordinatorService.SubmitTask:output_type -> grpcapi.ClientTaskResponse
+	6,  // 21: grpcapi.CoordinatorService.CancelTask:output_type -> grpcapi.CancelTaskResponse
+	8,  // 22: grpcapi.CoordinatorService.SendHeartbeat:output_type -> grpcapi.HeartbeatResponse
+	11, // 23: grpcapi.CoordinatorService.UpdateTaskStatus:output_type -> grpcapi.UpdateTaskStatusResponse
+	13, // 24: grpcapi.CoordinatorService.SubmitWorkflow:output_type -> grpcapi.WorkflowResponse
+	15, // 25: grpcapi.CoordinatorService.CancelWorkflow:output_type -> grpcapi.CancelWorkflowResponse
+	17, // 26: grpcapi.CoordinatorService.GetTaskOutput:output_type -> grpcapi.TaskOutputResponse
+	19, // 27: grpcapi.CoordinatorService.DecideStep:output_type -> grpcapi.DecideStepResponse
+	21, // 28: grpcapi.CoordinatorService.SignalWorkflow:output_type -> grpcapi.SignalResponse
+	17, // [17:29] is the sub-list for method output_type
+	5,  // [5:17] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_pkg_grpcapi_api_proto_init() }
@@ -1242,7 +1617,7 @@ func file_pkg_grpcapi_api_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_grpcapi_api_proto_rawDesc), len(file_pkg_grpcapi_api_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   19,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

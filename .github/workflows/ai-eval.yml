@@ -1,0 +1,32 @@
+name: ai-eval
+
+# The assistant's prompts and rules are held to a labelled set of failures.
+# The rule classifier is checked on every run of the normal tests; this job
+# re-runs the evaluation, with a real model when a key is available, whenever
+# the prompts, rules or the set itself change.
+on:
+  pull_request:
+    paths:
+      - pkg/ai/**
+      - pkg/llm/redact.go
+      - .github/workflows/ai-eval.yml
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Rules and redaction
+        run: go test ./pkg/ai/ ./pkg/llm/ -run 'Eval|Redact|Explain|Generate' -v
+      - name: Live model evaluation
+        # Secrets are not shared with pull requests from forks.
+        if: ${{ env.OPENAI_API_KEY != '' }}
+        run: AI_EVAL_LIVE=1 go test ./pkg/ai/ -run TestLiveEval -v
+        env:
+          CONDUCTOR_AI_MODEL: gpt-4o-mini

@@ -21,6 +21,7 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/task"
 	"github.com/ChinmayNoob/conductor/pkg/tracing"
+	"github.com/ChinmayNoob/conductor/pkg/workflow"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -226,7 +227,7 @@ func (s *Server) recoverLostTasks(ctx context.Context) {
 		s.log.Warn("Task lost", "task_id", taskID, "attempt", l.attempt, "reason", l.reason)
 		d := s.releaseTask(taskID)
 		metrics.TasksLost.Inc()
-		if _, err := s.failTask(ctx, taskID, l.attempt, d, "", "task lost: "+l.reason); err != nil {
+		if _, err := s.failTask(ctx, taskID, l.attempt, d, "", "task lost: "+l.reason, retryAdvice{}); err != nil {
 			s.log.Error("Failed to recover lost task", "task_id", taskID, "error", err)
 		}
 	}
@@ -562,6 +563,13 @@ func (s *Server) SubmitTask(ctx context.Context, req *grpcapi.ClientTaskRequest)
 	}
 	n.IdempotencyKey = req.IdempotencyKey
 	n.TraceParent = tracing.TraceParent(ctx)
+	if n.Type == workflow.TypeLLM {
+		if msg, err := s.llmBudgetError(ctx, s.db, ns); err != nil {
+			return nil, status.Error(codes.Internal, "failed to check the namespace's model budget")
+		} else if msg != "" {
+			return nil, status.Error(codes.ResourceExhausted, msg)
+		}
+	}
 
 	t, created, err := s.db.CreateTask(ctx, n)
 	if err != nil {
@@ -726,6 +734,19 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 	attempt := int(req.Attempt)
 	log := s.log.With("task_id", taskID, "attempt", attempt)
 
+	if u := req.LlmUsage; u != nil && (u.InputTokens > 0 || u.OutputTokens > 0) {
+		// Fact-driven, so not fenced: the tokens were spent whatever happens
+		// to the report, even for a stale attempt.
+		if err := s.db.RecordUsage(ctx, taskID, db.LLMUsage{
+			Model: u.Model, InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CostUSD: u.CostUsd,
+		}); err != nil {
+			log.Warn("Failed to record model usage", "error", err)
+		}
+		metrics.LLMTokens.WithLabelValues(u.Model, "input").Add(float64(u.InputTokens))
+		metrics.LLMTokens.WithLabelValues(u.Model, "output").Add(float64(u.OutputTokens))
+		metrics.LLMCost.WithLabelValues(u.Model).Add(u.CostUsd)
+	}
+
 	shouldRetry := false
 	switch req.Status {
 	case grpcapi.TaskStatus_STARTED:
@@ -748,9 +769,7 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 			}
 			if r.Updated {
 				log.Info("Task completed")
-				if r.WorkflowID != nil {
-					s.reconcile(ctx, *r.WorkflowID)
-				}
+				s.afterTask(ctx, r)
 			} else {
 				log.Info("Ignoring COMPLETE report: not the current attempt")
 			}
@@ -759,7 +778,8 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 
 	case grpcapi.TaskStatus_FAILED:
 		d := s.releaseTask(taskID)
-		shouldRetry, err = s.failTask(ctx, taskID, attempt, d, req.Output, req.ErrorMessage)
+		advice := retryAdvice{after: time.Duration(req.RetryAfterSeconds) * time.Second, permanent: req.Permanent}
+		shouldRetry, err = s.failTask(ctx, taskID, attempt, d, req.Output, req.ErrorMessage, advice)
 		s.wakeDispatcher()
 
 	default:
@@ -776,15 +796,17 @@ func (s *Server) UpdateTaskStatus(ctx context.Context, req *grpcapi.UpdateTaskSt
 // failTask records a failed attempt. The task is requeued if it has retries
 // left; otherwise it is marked FAILED and its workflow, if any, advances
 // (which starts compensation). It returns whether the task will be retried.
-func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, d dispatchedTask, output, errMsg string) (bool, error) {
+func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, d dispatchedTask, output, errMsg string, advice retryAdvice) (bool, error) {
 	log := s.log.With("task_id", taskID, "attempt", attempt)
 
 	var retrying bool
 	var r db.TaskResult
 	err := s.fenced(ctx, func(tx *db.DB) error {
 		var err error
-		if retrying, err = tx.RetryTask(ctx, taskID, attempt, output, errMsg); err != nil || retrying {
-			return err
+		if !advice.permanent {
+			if retrying, err = tx.RetryTaskAfter(ctx, taskID, attempt, output, errMsg, advice.after); err != nil || retrying {
+				return err
+			}
 		}
 		r, err = tx.MarkTaskFailed(ctx, taskID, attempt, int64(d.workerID), output, errMsg)
 		return err
@@ -794,7 +816,7 @@ func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, d 
 	}
 	if retrying {
 		observeResult(d, "retried")
-		log.Warn("Task failed, will retry", "error", errMsg)
+		log.Warn("Task failed, will retry", "error", errMsg, "min_delay", advice.after)
 		return true, nil
 	}
 	if !r.Updated {
@@ -804,8 +826,47 @@ func (s *Server) failTask(ctx context.Context, taskID uuid.UUID, attempt int, d 
 	}
 	observeResult(d, "failed")
 	log.Error("Task failed permanently", "error", errMsg)
-	if r.WorkflowID != nil {
+	s.afterTask(ctx, r)
+	return false, nil
+}
+
+// retryAdvice is the worker's view of a failure: wait at least after before
+// retrying (a provider's Retry-After), or don't retry at all.
+type retryAdvice struct {
+	after     time.Duration
+	permanent bool
+}
+
+// llmBudgetError explains why a namespace may not start another llm task
+// today, or returns "".
+func (s *Server) llmBudgetError(ctx context.Context, q *db.DB, namespace string) (string, error) {
+	n, err := q.GetNamespace(ctx, namespace)
+	if err != nil || n == nil || (n.MaxLLMTokensPerDay == nil && n.MaxLLMCostPerDay == nil) {
+		return "", err
+	}
+	now := time.Now().UTC()
+	spend, err := q.NamespaceSpend(ctx, namespace, time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case n.MaxLLMTokensPerDay != nil && spend.Tokens >= *n.MaxLLMTokensPerDay:
+		return fmt.Sprintf("namespace %s has used its daily model budget (%d of %d tokens)",
+			namespace, spend.Tokens, *n.MaxLLMTokensPerDay), nil
+	case n.MaxLLMCostPerDay != nil && spend.CostUSD >= *n.MaxLLMCostPerDay:
+		return fmt.Sprintf("namespace %s has used its daily model budget ($%.4f of $%.4f)",
+			namespace, spend.CostUSD, *n.MaxLLMCostPerDay), nil
+	}
+	return "", nil
+}
+
+// afterTask moves on whatever a finished task belonged to: an agent run
+// (which reconciles its workflow when it ends) or a workflow run.
+func (s *Server) afterTask(ctx context.Context, r db.TaskResult) {
+	switch {
+	case r.AgentRunID != nil:
+		s.advanceAgent(ctx, *r.AgentRunID)
+	case r.WorkflowID != nil:
 		s.reconcile(ctx, *r.WorkflowID)
 	}
-	return false, nil
 }

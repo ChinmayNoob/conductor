@@ -208,7 +208,7 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 
 ---
 
-## Phase 5: AI-native durable execution ⬜
+## Phase 5: AI-native durable execution ✅
 
 **Goal:** make Conductor the reliable backbone for AI agents. AI steps are slow, flaky and expensive, which is exactly what durable workflows handle well.
 
@@ -219,29 +219,29 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 - Providers sit behind an interface: OpenAI first, others pluggable.
 
 ### 5.1 LLM steps (core)
-- ⬜ `llm` task type: model, prompt template, input variables, and optional JSON-schema structured output
-- ⬜ Rate-limit-aware scheduling: honor provider request and token limits per queue, and back off on `429` using `Retry-After`
-- ⬜ Token and cost accounting per task, workflow and namespace, with budgets that stop or pause a workflow when exceeded
-- ⬜ Response caching for identical prompts (optional)
+- ✅ `llm` task type: model, prompt template, input variables, and optional JSON-schema structured output
+- ✅ Rate-limit-aware scheduling: honor provider request and token limits per queue, and back off on `429` using `Retry-After`
+- ✅ Token and cost accounting per task, workflow and namespace, with budgets that stop or pause a workflow when exceeded
+- ⬜ Response caching for identical prompts (optional; deliberately left out, see ADR 0003)
 
 ### 5.2 Human-in-the-loop
-- ⬜ `approval` step type: the workflow pauses, shows the pending decision in the UI and API, and continues or compensates on approve, reject or timeout
-- ⬜ Signals API: external systems can send data into a waiting workflow
+- ✅ `approval` step type: the workflow pauses, shows the pending decision in the UI and API, and continues or compensates on approve, reject or timeout
+- ✅ Signals API: external systems can send data into a waiting workflow
 
 ### 5.3 Durable agents
-- ⬜ `agent` step: an LLM tool-calling loop where **each tool call is a checkpointed workflow task**. If the process crashes mid-agent, it resumes from the last completed tool call instead of starting over.
-- ⬜ Limits on step count, budget and wall-clock time per agent run
+- ✅ `agent` step: an LLM tool-calling loop where **each tool call is a checkpointed workflow task**. If the process crashes mid-agent, it resumes from the last completed tool call instead of starting over.
+- ✅ Limits on step count, budget and wall-clock time per agent run
 
 ### 5.4 AI operations assistant
-- ⬜ **Failure explainer:** on permanent failure, an async job summarizes the redacted output and error, then shows a likely cause and a suggested fix in the UI
-- ⬜ **Error classifier:** transient vs permanent (start with rules, use an LLM as fallback). It advises retry decisions and records its confidence.
-- ⬜ **Natural language to workflow:** describe a workflow in plain English, get a YAML DAG back, run a dry-run validation, require human approval, then save it
-- ⬜ **Ask your cluster:** questions like "why did yesterday's runs fail?", answered from read-only task history
+- ✅ **Failure explainer:** on permanent failure, an async job summarizes the redacted output and error, then shows a likely cause and a suggested fix in the UI
+- ✅ **Error classifier:** transient vs permanent (start with rules, use an LLM as fallback). It advises retry decisions and records its confidence.
+- ✅ **Natural language to workflow:** describe a workflow in plain English, get a YAML DAG back, run a dry-run validation, require human approval, then save it
+- ✅ **Ask your cluster:** questions like "why did yesterday's runs fail?", answered from read-only task history
 
 ### 5.5 Quality
-- ⬜ Evaluation sets for the classifier and explainer (labelled real failures), run in CI when prompts change
+- ✅ Evaluation sets for the classifier and explainer (labelled failures), run in CI when prompts change (`ai-eval.yml`)
 
-**Exit criteria:** a multi-step agent workflow survives killing its worker mid-run and resumes without repeating completed tool calls; costs are tracked and budgets enforced.
+**Exit criteria:** a multi-step agent workflow survives killing its worker mid-run and resumes without repeating completed tool calls; costs are tracked and budgets enforced. ✅ `TestAgentSurvivesWorkerCrash` kills the worker mid-agent: only the interrupted tool call runs twice. Budgets are enforced per workflow, namespace and queue.
 
 ---
 

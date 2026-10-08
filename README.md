@@ -9,6 +9,7 @@ Run shell commands, HTTP calls and containers across a cluster of workers, with:
 - **DAG workflows** that undo completed steps when a later one fails (sagas)
 - **cron schedules**, queues with concurrency and rate limits, and label-based routing
 - namespaces with quotas
+- **AI steps**: model calls with token budgets, human approvals, and agents that survive a crash without repeating finished tool calls
 - a **web dashboard**, Prometheus metrics, OpenTelemetry tracing and live task output
 
 Postgres is the only dependency.
@@ -148,6 +149,49 @@ conductorctl workflow cancel <id>                   # cancel running steps, comp
 
 Bundled examples: `trip_booking`, `trip_booking_fail`, `trip_booking_slow` and `order_pipeline` (in [examples/workflows](examples/workflows)).
 
+## AI steps
+
+Models are slow, flaky and billed by the token, which is what durable workflows are good at. Set `OPENAI_API_KEY` (or `CONDUCTOR_LLM_BASE_URL` for Ollama, vLLM, LiteLLM or Azure) and workers can run:
+
+```yaml
+name: triage
+budget: {max_tokens: 20000, max_cost_usd: 0.50}   # the run fails, and compensates, if it overspends
+steps:
+  - name: classify
+    llm:
+      prompt: "Severity of this report: ${{ inputs.report }}"
+      schema: {type: object, properties: {severity: {type: string}}, required: [severity], additionalProperties: false}
+  - name: sign_off
+    depends_on: [classify]
+    type: approval
+    approval: {message: "Page the on-call? severity is ${{ steps.classify.outputs.severity }}", timeout: 1h}
+  - name: investigate
+    depends_on: [sign_off]
+    type: agent
+    agent:
+      prompt: "Find out why checkout is slow."
+      max_turns: 8
+      tools:
+        - name: recent_errors
+          description: Last errors from the checkout service
+          run: tail -n 50 /var/log/checkout.log
+```
+
+- **`llm`** steps and tasks (`conductorctl task submit -prompt "..."`) return the answer as `text`, or the fields of a JSON schema as outputs. A provider's `Retry-After` delays the retry; permanent errors (bad key, unknown model) are not retried. Queues can cap `tokens_per_minute`; namespaces can cap tokens and dollars per day.
+- **`approval`** and **`signal`** steps wait for a person (`conductorctl approvals`, `workflow approve|reject`, or the dashboard) or an outside system (`workflow signal`), holding no worker.
+- **`agent`** steps run a model with tools in a loop. Every model call and tool call is its own task, so killing the worker mid-run resumes from the last finished call; only the call in flight runs again. Tool arguments arrive as `$ARG_<NAME>` and `$TOOL_ARGS`, never in the command line. Limits: turns, tool calls, duration, budget.
+- **Costs** are counted in tokens always, and in dollars only for models you price in `CONDUCTOR_LLM_PRICES` (none are built in).
+
+**Operations assistant** (opt in per namespace: `conductorctl namespace set NAME -ai-assist`). Redacted failures go to the model, which adds a likely cause and a fix next to a rule-based class (transient, permanent, needs attention). It never changes retries and never saves anything on its own:
+
+```bash
+conductorctl task explain <id>                     # also appears on failed tasks in the dashboard
+conductorctl ai ask "which tasks failed in the last hour, and why?"   # read-only lookups
+conductorctl ai workflow "fetch and render in parallel, then publish" -save   # validated, dry run, asks before saving
+```
+
+Design notes: [ADR 0003](docs/adr/0003-ai-features.md). For tests and demos, `docker compose --profile mock-llm` runs a free scripted model server.
+
 ## Schedules
 
 ```bash
@@ -204,7 +248,7 @@ wf, _ = c.WaitForWorkflow(ctx, wf.ID)
 
 ## Dashboard and observability
 
-**Dashboard** at `/ui` (`/` redirects there), built into the binary. Sign in with an API key; it acts with that key's permissions. It shows what is running and waiting, every task with its attempts and live output, workflow runs drawn as a live diagram of which step failed and what was undone, and workers, schedules and the dead-letter queue. You can cancel, requeue, pause or resume queues and schedules, and run schedules now. Design notes: [ADR 0002](docs/adr/0002-dashboard-stack.md).
+**Dashboard** at `/ui` (`/` redirects there), built into the binary. Sign in with an API key; it acts with that key's permissions. It shows what is running and waiting, every task with its attempts and live output, workflow runs drawn as a live diagram of which step failed and what was undone, approvals waiting for a decision, agent conversations, and workers, schedules and the dead-letter queue. You can cancel, requeue, pause or resume queues and schedules, and run schedules now. Design notes: [ADR 0002](docs/adr/0002-dashboard-stack.md).
 
 **Live output** from the CLI or HTTP:
 
@@ -248,6 +292,9 @@ All settings are environment variables; [.env.example](.env.example) lists them.
 | `CONDUCTOR_SHUTDOWN_TIMEOUT` | `25s` | How long a stopping worker lets running tasks finish |
 | `CONDUCTOR_METRICS_LISTEN` | `:9090` | Prometheus metrics (`off` disables them) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | Send traces over OTLP/gRPC; standard `OTEL_*` variables apply |
+| `OPENAI_API_KEY` / `CONDUCTOR_LLM_BASE_URL` | | Enable `llm` and `agent` steps (workers) and the assistant (API) |
+| `CONDUCTOR_LLM_MODEL` | `gpt-4o-mini` | Model for steps that name none |
+| `CONDUCTOR_LLM_PRICES` | | JSON price list, USD per million tokens; without it costs stay zero |
 
 ## Development
 

@@ -53,6 +53,11 @@ service CoordinatorService {
   rpc CancelWorkflow (CancelWorkflowRequest) returns (CancelWorkflowResponse) {}
   // Returns a running task's live output from the worker running it.
   rpc GetTaskOutput (TaskOutputRequest) returns (TaskOutputResponse) {}
+  // Approves or rejects a run's waiting approval step.
+  rpc DecideStep (DecideStepRequest) returns (DecideStepResponse) {}
+  // Sends a signal to a run: delivered to a step waiting for it, or kept
+  // until one does.
+  rpc SignalWorkflow (SignalRequest) returns (SignalResponse) {}
 }
 
 message ClientTaskRequest {
@@ -98,6 +103,19 @@ message UpdateTaskStatusRequest {
   string error_message = 4;            // set when status is FAILED
   map<string, string> outputs = 5;     // key=value pairs the task wrote to $CONDUCTOR_OUTPUT
   int32 attempt = 6;                   // from TaskRequest; stale attempts are ignored
+  // Set when status is FAILED: wait at least this long before retrying (a
+  // provider's Retry-After), or don't retry at all (retrying can't help).
+  int32 retry_after_seconds = 7;
+  bool permanent = 8;
+  // Language model usage of this attempt (llm tasks).
+  LLMUsage llm_usage = 9;
+}
+
+message LLMUsage {
+  string model = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+  double cost_usd = 4;   // 0 when the model has no configured price
 }
 
 message UpdateTaskStatusResponse {
@@ -138,4 +156,27 @@ message TaskOutputResponse {
   bool running = 1;
   bytes data = 2;
   int64 next_offset = 3;  // pass back as offset to continue
+}
+
+message DecideStepRequest {
+  string workflow_id = 1;
+  string namespace = 2;
+  string step = 3;
+  bool approve = 4;
+  string comment = 5;
+  string decided_by = 6;   // the API key's name, for the record
+}
+
+message DecideStepResponse {}
+
+message SignalRequest {
+  string workflow_id = 1;
+  string namespace = 2;
+  string name = 3;
+  bytes payload_json = 4;  // a JSON object; its fields become the step's outputs
+  string sent_by = 5;
+}
+
+message SignalResponse {
+  bool delivered = 1;      // false: no step waits for it yet; it is kept
 }

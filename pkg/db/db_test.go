@@ -716,3 +716,181 @@ func TestAttemptHistory(t *testing.T) {
 		t.Fatalf("history after requeue = %+v", got)
 	}
 }
+
+func TestLLMUsageAndSpend(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	wf, _, err := db.CreateWorkflow(ctx, NewWorkflow{Namespace: "default", Name: "x", Definition: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := create(t, db, "llm a", func(n *NewTask) { n.Type = "llm"; n.WorkflowID = &wf.ID })
+	b := create(t, db, "llm b", func(n *NewTask) { n.Type = "llm"; n.WorkflowID = &wf.ID })
+
+	// Usage accumulates across attempts.
+	for range 2 {
+		if err := db.RecordUsage(ctx, a.ID, LLMUsage{Model: "m", InputTokens: 100, OutputTokens: 20, CostUSD: 0.001}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.RecordUsage(ctx, b.ID, LLMUsage{Model: "m", InputTokens: 50, OutputTokens: 10, CostUSD: 0.0005}); err != nil {
+		t.Fatal(err)
+	}
+	got := must[*Task](t)(db.GetTask(ctx, a.ID))
+	if got.LLMModel != "m" || got.InputTokens != 200 || got.OutputTokens != 40 || got.CostUSD < 0.00199 || got.CostUSD > 0.00201 {
+		t.Fatalf("task usage = %s %d/%d $%f", got.LLMModel, got.InputTokens, got.OutputTokens, got.CostUSD)
+	}
+	if s := must[Spend](t)(db.WorkflowSpend(ctx, wf.ID)); s.Tokens != 300 {
+		t.Fatalf("workflow spend = %+v, want 300 tokens", s)
+	}
+	if s := must[Spend](t)(db.NamespaceSpend(ctx, "default", time.Now().Add(-time.Hour))); s.Tokens != 300 || s.CostUSD < 0.0024 {
+		t.Fatalf("namespace spend = %+v", s)
+	}
+	if s := must[Spend](t)(db.NamespaceSpend(ctx, "default", time.Now().Add(time.Hour))); s.Tokens != 0 {
+		t.Fatalf("spend since the future = %+v", s)
+	}
+}
+
+func TestRetryTaskAfterWaitsAtLeast(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	task := create(t, db, "rate limited", func(n *NewTask) { n.RetryDelaySeconds = 1 })
+	pick(t, db)
+	if !must[bool](t)(db.RetryTaskAfter(ctx, task.ID, 1, "", "429", 30*time.Second)) {
+		t.Fatal("not retried")
+	}
+	got := must[*Task](t)(db.GetTask(ctx, task.ID))
+	if wait := time.Until(got.ScheduledAt); wait < 28*time.Second || wait > 32*time.Second {
+		t.Fatalf("retry scheduled in %v, want about the provider's 30s", wait)
+	}
+}
+
+func TestQueueTokensPerMinute(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	limit := int64(100)
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "llm", TokensPerMinute: &limit}))
+	if q := must[*Queue](t)(db.GetQueue(ctx, "default", "llm")); q.TokensPerMinute == nil || *q.TokensPerMinute != 100 {
+		t.Fatalf("queue = %+v", q)
+	}
+	first := create(t, db, "first", func(n *NewTask) { n.Queue = "llm" })
+	create(t, db, "second", func(n *NewTask) { n.Queue = "llm" })
+	if got := pick(t, db); got == nil || got.ID != first.ID {
+		t.Fatalf("picked %v, want the first task", got)
+	}
+	// The first task used up the minute's tokens: the second waits.
+	if err := db.RecordUsage(ctx, first.ID, LLMUsage{InputTokens: 90, OutputTokens: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if got := pick(t, db); got != nil {
+		t.Fatalf("picked %s although the queue's tokens per minute are spent", got.Data)
+	}
+}
+
+func TestNamespaceModelLimits(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	tokens, cost := int64(1000), 0.5
+	n := must[*Namespace](t)(db.CreateNamespace(ctx, Namespace{Name: "ai", MaxLLMTokensPerDay: &tokens, MaxLLMCostPerDay: &cost, AIAssist: true}))
+	if n.MaxLLMTokensPerDay == nil || *n.MaxLLMTokensPerDay != 1000 || n.MaxLLMCostPerDay == nil || *n.MaxLLMCostPerDay != 0.5 || !n.AIAssist {
+		t.Fatalf("namespace = %+v", n)
+	}
+	n = must[*Namespace](t)(db.UpdateNamespace(ctx, Namespace{Name: "ai"}))
+	if n.MaxLLMTokensPerDay != nil || n.AIAssist {
+		t.Fatalf("after clearing: %+v", n)
+	}
+}
+
+func TestWaitingSteps(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	wf, _, err := db.CreateWorkflow(ctx, NewWorkflow{Namespace: "default", Name: "x", Definition: json.RawMessage(`{}`),
+		Steps: []string{"approve", "paid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := must[[]*StepState](t)(db.GetStepStates(ctx, wf.ID))
+	approve, paid := steps[0], steps[1]
+
+	past := time.Now().Add(-time.Second)
+	if err := db.StartWait(ctx, approve.ID, Wait{Kind: WaitApproval, Message: "Refund $40?", Deadline: &past, OnTimeout: "reject"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.StartWait(ctx, paid.ID, Wait{Kind: WaitSignal, Signal: "payment"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := must[[]*WaitingStep](t)(db.ListWaiting(ctx, "default", WaitApproval)); len(got) != 1 || got[0].Message != "Refund $40?" {
+		t.Fatalf("waiting approvals = %+v", got)
+	}
+	if got := must[[]*WaitingStep](t)(db.ExpiredWaits(ctx, 10)); len(got) != 1 || got[0].Step != "approve" {
+		t.Fatalf("expired = %+v, want the approval past its deadline", got)
+	}
+
+	// A decision reads like a finished task; deciding twice does nothing.
+	if !must[bool](t)(db.Decide(ctx, approve.ID, Decision{Status: "FAILED", Error: "rejected by ops", By: "ops"})) {
+		t.Fatal("decision not recorded")
+	}
+	if must[bool](t)(db.Decide(ctx, approve.ID, Decision{Status: "COMPLETED"})) {
+		t.Fatal("a decided step was decided again")
+	}
+
+	// Signals queue until taken, oldest first.
+	must[int64](t)(db.AddSignal(ctx, wf.ID, "payment", json.RawMessage(`{"amount": 40}`), "stripe"))
+	must[int64](t)(db.AddSignal(ctx, wf.ID, "payment", json.RawMessage(`{"amount": 99}`), "stripe"))
+	sig := must[*Signal](t)(db.TakeSignal(ctx, wf.ID, "payment", paid.ID))
+	if sig == nil || string(sig.Payload) != `{"amount": 40}` || sig.SentBy != "stripe" {
+		t.Fatalf("took %+v, want the first signal", sig)
+	}
+	must[bool](t)(db.Decide(ctx, paid.ID, Decision{Status: "COMPLETED", Outputs: StringMap{"amount": "40"}}))
+
+	steps = must[[]*StepState](t)(db.GetStepStates(ctx, wf.ID))
+	if s := steps[0]; s.TaskStatus != "FAILED" || s.TaskError != "rejected by ops" || s.DecidedBy != "ops" || s.WaitKind != WaitApproval {
+		t.Fatalf("approval step = %+v", s)
+	}
+	if s := steps[1]; s.TaskStatus != "COMPLETED" || s.Outputs["amount"] != "40" || s.WaitMessage != "payment" {
+		t.Fatalf("signal step = %+v", s)
+	}
+}
+
+func TestExplanations(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	must[*Namespace](t)(db.CreateNamespace(ctx, Namespace{Name: "assisted", AIAssist: true}))
+
+	fail := func(ns, data string) *Task {
+		task := create(t, db, data, func(n *NewTask) { n.Namespace = ns; n.MaxRetries = 0 })
+		pick(t, db)
+		must[TaskResult](t)(db.MarkTaskFailed(ctx, task.ID, att(t, db, task.ID), 0, "out", "boom"))
+		return must[*Task](t)(db.GetTask(ctx, task.ID))
+	}
+	optedIn, optedOut := fail("assisted", "a"), fail("default", "b")
+
+	// Only namespaces that opted in are listed.
+	todo := must[[]*Task](t)(db.UnexplainedFailures(ctx, time.Hour, 10))
+	if len(todo) != 1 || todo[0].ID != optedIn.ID {
+		t.Fatalf("unexplained = %v; want just the opted-in task (not %s)", todo, optedOut.ID)
+	}
+
+	e := Explanation{TaskID: optedIn.ID, Attempt: optedIn.Attempt, Class: "transient", Confidence: 0.9, Source: "rules", Cause: "c", Fix: "f", InputTokens: 5}
+	if err := db.SaveExplanation(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	got := must[*Explanation](t)(db.GetExplanation(ctx, optedIn.ID))
+	if got == nil || got.Class != "transient" || got.Cause != "c" || got.InputTokens != 5 {
+		t.Fatalf("explanation = %+v", got)
+	}
+	if todo := must[[]*Task](t)(db.UnexplainedFailures(ctx, time.Hour, 10)); len(todo) != 0 {
+		t.Fatalf("an explained failure is still listed: %v", todo)
+	}
+	// Saving again replaces it.
+	e.Class, e.Cause = "permanent", "again"
+	if err := db.SaveExplanation(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	if got := must[*Explanation](t)(db.GetExplanation(ctx, optedIn.ID)); got.Class != "permanent" || got.Cause != "again" {
+		t.Fatalf("explanation = %+v", got)
+	}
+	if got := must[*Explanation](t)(db.GetExplanation(ctx, optedOut.ID)); got != nil {
+		t.Fatalf("explanation for an unexplained task: %+v", got)
+	}
+}

@@ -905,6 +905,103 @@ Found while checking it in a browser: a stray `0` rendered wherever a step had n
 
 ---
 
+## Phase 5: AI-native durable execution
+
+**Done (PR #6):** `llm` tasks with token and cost accounting and budgets, approval and signal steps, durable agents, and an operations assistant that explains failures, drafts workflows and answers questions about the cluster. [ADR 0003](docs/adr/0003-ai-features.md) records the design.
+
+### A model call is just a task
+
+An `llm` step becomes a task of type `llm`, picked up by workers that can reach a model (label `type.llm`). So it gets retries, timeouts, queues, cancellation and traces without new machinery, and slow network calls stay off the scheduling path.
+
+```mermaid
+flowchart LR
+    S["llm step / task"] --> Q[("queue")]
+    Q --> W["worker with a model"]
+    W -- "Chat Completions<br/>(OpenAI, Ollama, vLLM, Azure…)" --> M["model"]
+    W -- "answer + tokens + Retry-After" --> C["coordinator"]
+    C --> DB[("tokens, cost, retry delay")]
+    C -- "over budget?" --> R["reconciler: fail + compensate"]
+```
+
+What a model call needs that a shell command does not:
+- **Rate limits:** a `429`'s `Retry-After` becomes the task's minimum retry delay, bad keys and unknown models are marked permanent (no retries), and a queue can cap `tokens_per_minute` in the pick query itself.
+- **Cost:** tokens are always counted; dollars only for models priced in `CONDUCTOR_LLM_PRICES`. A built-in table would go stale and make budgets lie.
+- **Budgets:** a workflow's `budget` aborts the run through the reconciler (`RunState.Abort`), so it compensates like any failure. Namespaces have daily token and dollar limits, checked on submission (HTTP 429) and when a step starts.
+- **Secrets:** text is redacted (keys, tokens, JWTs, passwords, credentials in URLs, Conductor keys) before it is sent anywhere.
+
+Tests run against `conductor mock-llm`, a scripted server (`[[mock: {...}]]` in the prompt names tool calls, answers, failures and delays), so CI is free and deterministic. A real smoke test against gpt-4o-mini, plain and with a JSON schema, cost about $0.00007.
+
+### Waiting for people
+
+Approval and signal steps hold no worker: the step row records what it waits for, and a leader loop settles timeouts. Approve and reject go through the coordinator so the decision and the step's next state commit together; an approval always yields `comment` and `decided_by` outputs, including when it times out. A signal sent before its step starts is kept until the step does.
+
+Found by the signal-timeout test: a run that failed with nothing to undo lost its error message, because the engine kept it only when it switched to COMPENSATING.
+
+### Durable agents
+
+```mermaid
+sequenceDiagram
+    participant E as Agent engine (leader)
+    participant PG as agent_runs (Postgres)
+    participant W as Worker
+    E->>PG: lock run, read conversation
+    E->>W: task "agent:RUN:1:model" (llm, whole conversation)
+    W-->>E: assistant message, maybe tool calls
+    E->>PG: append message, turn = 1
+    par one task per tool call
+        E->>W: task "agent:RUN:1:call_0" (the tool command)
+        E->>W: task "agent:RUN:1:call_1"
+    end
+    W-->>E: tool results (redacted, capped at 16 KB)
+    E->>PG: append results, create the next model task
+    Note over E,PG: a crash anywhere re-reads the run: every finished call is already stored
+```
+
+An agent is a state machine over tasks. Each model call and each tool call is a task with an idempotency key `agent:<run>:<turn>:<call>`, so re-running the engine step after a crash cannot create a second one; the run advances under a row lock. Tools are shell commands, and the model's arguments arrive as `$ARG_<NAME>` and `$TOOL_ARGS`, never spliced into the command. Runs stop at `max_turns`, `max_tool_calls`, `max_duration` or the budget.
+
+**The exit test:** `TestAgentSurvivesWorkerCrash` runs a three-turn agent, kills its worker while a slow tool runs, and checks the finished run: one task per call, ever; the interrupted call ran twice (attempt 2), every other call once. It passes in about 53 seconds, most of it the tool's `sleep`.
+
+### The operations assistant
+
+```mermaid
+flowchart TD
+    F["task FAILED"] --> R{"rules match?"}
+    R -- yes --> CL["class: transient / permanent / needs attention<br/>(confidence, reason)"]
+    R -- no --> U["class: unknown"]
+    CL & U --> NS{"namespace ai_assist?"}
+    NS -- no --> STOP["stop: nothing leaves the cluster"]
+    NS -- yes --> RED["redact command, error, output tail,<br/>earlier attempts"]
+    RED --> M["model: cause + fix<br/>(+ class if rules had none)"]
+    M --> SAVE[("task_explanations")] --> UI["task page, CLI, ask"]
+```
+
+- **Rules first.** A pattern table (credentials, quota, missing command, bad request, timeouts, rate limits, deadlocks…) classifies failures with a confidence; order matters, so a `401` inside a "timed out" message is still a credentials problem. The model decides only what no rule matches, and its prose never overrides a rule's class.
+- **Advice only.** The class is displayed; it never changes retries.
+- **Explanations arrive on their own.** A loop in the API process explains new failures (at most five per 15 seconds) in opted-in namespaces; the task page has a button for the rest.
+- **Drafting workflows.** The model's YAML goes through the real parser (one repair attempt, given the errors), a dry run through the real reconciler lists which steps start together, and a scan flags `rm -rf`, `curl | sh`, `sudo`, hard-coded secrets and plain-HTTP calls. The assistant has no way to save it: a person does, with `workflow apply` or the dashboard's save button.
+- **Ask your cluster.** The model can call six read-only lookups (task counts, tasks, one task, workflows, workers, spend), all scoped to the namespace, results redacted and trimmed.
+
+### Evaluation sets
+
+`pkg/ai/eval_test.go` holds 27 labelled failures. The rule classifier is checked against them on every run (when a rule decides, it must be right, and the cases meant for the model must not be caught by a rule). `TestLiveEval` runs the same cases through a real model when `AI_EVAL_LIVE=1`; `ai-eval.yml` does that whenever prompts or rules change, if the repository has an `OPENAI_API_KEY` secret. A separate test checks that no secret reaches a prompt from any field of a task.
+
+### The dashboard
+
+Approvals have their own page and buttons on the step panel (with a comment); signal steps take JSON data; an agent step shows its whole conversation and its calls; failed tasks show "What happened" with the class, cause, fix and how sure it is; workflow runs show model spend; and an Assistant page asks questions and drafts workflows, with a dry run, warnings and an explicit save button.
+
+### Phase 5 scorecard
+
+| Exit criterion | Result |
+|---|---|
+| A multi-step agent survives killing its worker mid-run and resumes without repeating completed tool calls | ✅ `TestAgentSurvivesWorkerCrash` |
+| Costs are tracked and budgets enforced | ✅ per task, workflow, namespace; budgets per workflow, namespace per day, queue per minute |
+| Generated workflows need validation and human approval | ✅ parser, dry run, warnings, and no save path in the assistant |
+| AI features are opt-in and redacted | ✅ `ai_assist` per namespace; redaction tested |
+
+Not built: response caching for identical prompts (optional in the plan). The assistant's own spend is recorded on explanations but not counted against namespace budgets.
+
+---
+
 ## What's next
 
-Phase 5, AI-native durable execution: LLM steps with retries and token budgets, agent loops as durable workflows, and an "explain this failure" assistant built on the attempt history and traces added here. See [plan.md](plan.md).
+Phase 6, Kubernetes and cloud-native: a Helm chart, worker-opened streams so workers can sit behind NAT (ADR 0001), and autoscaling. See [plan.md](plan.md).

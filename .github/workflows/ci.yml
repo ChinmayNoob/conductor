@@ -55,6 +55,10 @@ jobs:
         transport: [plaintext, mtls]
     env:
       E2E_WORKERS: "3"
+      # Language model tests run against the scripted mock model server.
+      CONDUCTOR_LLM_BASE_URL: http://mock-llm:8090/v1
+      CONDUCTOR_LLM_MODEL: mock-model
+      E2E_LLM: mock
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -79,15 +83,15 @@ jobs:
           echo "E2E_JAEGER_URL=http://localhost:16686" >> "$GITHUB_ENV"
 
       - name: Start the stack
-        run: docker compose --profile containers $EXTRA_PROFILES up -d --build --wait --scale worker=$E2E_WORKERS
+        run: docker compose --profile containers --profile mock-llm $EXTRA_PROFILES up -d --build --wait --scale worker=$E2E_WORKERS
 
       - name: Run end-to-end tests
         run: go test -tags e2e -count=1 -v -timeout 15m ./test/e2e/
 
       - name: Dump logs on failure
         if: failure()
-        run: docker compose --profile containers $EXTRA_PROFILES logs --no-color --timestamps
+        run: docker compose --profile containers --profile mock-llm $EXTRA_PROFILES logs --no-color --timestamps
 
       - name: Stop the stack
         if: always()
-        run: docker compose --profile containers $EXTRA_PROFILES down -v
+        run: docker compose --profile containers --profile mock-llm $EXTRA_PROFILES down -v

@@ -109,11 +109,11 @@ func (p *openAI) Complete(ctx context.Context, req Request) (*Response, error) {
 
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrPermanent, err)
+		return nil, fmt.Errorf("%w: %w", ErrPermanent, err)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.base+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrPermanent, err)
+		return nil, fmt.Errorf("%w: %w", ErrPermanent, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if p.key != "" {
@@ -123,12 +123,12 @@ func (p *openAI) Complete(ctx context.Context, req Request) (*Response, error) {
 	resp, err := p.http.Do(httpReq)
 	if err != nil {
 		// Network failures and timeouts: the request may succeed later.
-		return nil, fmt.Errorf("%w: %v", ErrTransient, err)
+		return nil, fmt.Errorf("%w: %w", ErrTransient, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("%w: reading the response: %v", ErrTransient, err)
+		return nil, fmt.Errorf("%w: reading the response: %w", ErrTransient, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, statusError(resp, data)
@@ -136,7 +136,7 @@ func (p *openAI) Complete(ctx context.Context, req Request) (*Response, error) {
 
 	var out oaResponse
 	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf("%w: unreadable response: %v", ErrTransient, err)
+		return nil, fmt.Errorf("%w: unreadable response: %w", ErrTransient, err)
 	}
 	if len(out.Choices) == 0 {
 		return nil, fmt.Errorf("%w: the response has no choices", ErrTransient)

@@ -53,7 +53,11 @@ function headers(extra = {}) {
 
 export async function api(method, path, body) {
   const opts = { method, headers: headers() };
-  if (body !== undefined) {
+  if (typeof body === "string") {
+    // Raw text, e.g. a YAML definition.
+    opts.headers["Content-Type"] = "application/yaml";
+    opts.body = body;
+  } else if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }

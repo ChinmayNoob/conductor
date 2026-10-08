@@ -9,7 +9,7 @@ import * as mimic from "./mimic.js";
 
 // --- building blocks ------------------------------------------------------------
 
-function page(plate, title, actions, ...body) {
+export function page(plate, title, actions, ...body) {
   return h("div", {},
     h("div", { class: "head" },
       h("div", {}, h("div", { class: "plate" }, plate), h("h1", {}, title)),
@@ -17,11 +17,11 @@ function page(plate, title, actions, ...body) {
     body);
 }
 
-function panel(plate, ...body) {
+export function panel(plate, ...body) {
   return h("section", { class: "panel" }, plate && h("span", { class: "plate" }, plate), body);
 }
 
-function table(columns, rows, { empty = "Nothing here yet.", onRow } = {}) {
+export function table(columns, rows, { empty = "Nothing here yet.", onRow } = {}) {
   const head = h("tr", {}, columns.map((c) => h("th", { class: c.num ? "num" : null, scope: "col" }, c.label)));
   const body = rows.length
     ? rows.map((r) => h("tr", {
@@ -35,13 +35,13 @@ function table(columns, rows, { empty = "Nothing here yet.", onRow } = {}) {
 }
 
 // replace swaps a placeholder's content for fresh content.
-function replace(slot, ...content) {
+export function replace(slot, ...content) {
   slot.replaceChildren(...content.flat().filter(Boolean));
 }
 
 const go = (path) => () => { location.hash = "#" + path; };
 
-function button(label, onclick, cls = "") {
+export function button(label, onclick, cls = "") {
   const b = h("button", { class: "btn " + cls, type: "button" }, label);
   b.addEventListener("click", async () => {
     b.disabled = true;
@@ -260,6 +260,7 @@ export function tasks(_, query) {
 export function task([id]) {
   const head = h("div", { class: "faint" }, "Loading…");
   const body = h("div", { class: "stack" });
+  const explainEl = h("div", {});
   const consoleEl = h("pre", { class: "console", "aria-live": "polite" });
   const attemptsEl = h("div", {});
   let following = null; // AbortController for the live log
@@ -312,11 +313,14 @@ export function task([id]) {
       t.workflow_id && ["Workflow", h("a", { href: "#/workflows/" + t.workflow_id, class: "mono" }, shortID(t.workflow_id))],
       t.trace_id && ["Trace", h("span", { class: "mono" }, t.trace_id)],
       t.idempotency_key && ["Idempotency key", h("span", { class: "mono" }, t.idempotency_key)],
+      t.llm_usage && ["Model", `${t.llm_usage.model || "–"} · ${t.llm_usage.input_tokens + t.llm_usage.output_tokens} tokens` +
+        (t.llm_usage.cost_usd ? ` · $${t.llm_usage.cost_usd.toFixed(4)}` : "")],
     ].filter(Boolean);
     const outputs = Object.entries(t.outputs || {});
     replace(body,
       t.error_message && h("div", { class: "banner red" }, h("span", { class: "lamp red" }),
         h("div", {}, h("span", { class: "title" }, t.status === "FAILED" ? "Failed" : "Last attempt failed"), h("span", { class: "mono" }, t.error_message))),
+      t.status === "FAILED" && explainEl,
       panel("Details", h("dl", { class: "facts" }, facts.map(([k, v]) => h("div", { class: k === "Command" ? "wide" : null }, h("dt", {}, k), h("dd", {}, v))))),
       outputs.length > 0 && panel("Outputs", h("div", { class: "outputs" }, outputs.map(([k, v]) => h("code", {}, `${k}=${v}`)))),
       panel("Output", consoleEl),
@@ -335,12 +339,48 @@ export function task([id]) {
     ], list.slice().reverse(), { empty: "Not dispatched yet." }));
   };
 
+  // The assistant's reading of a failure: what class it is, the likely cause
+  // and what to try. It appears on its own when the namespace has ai_assist
+  // on; the button asks for it.
+  const loadExplanation = async () => {
+    let e = null;
+    try {
+      e = await get(`/tasks/${id}/explanation`);
+    } catch (err) {
+      if (err.status !== 404) throw err;
+    }
+    const ask = button(e ? "Explain again" : "Explain this failure", async () => {
+      try {
+        e = await api("POST", `/tasks/${id}/explain`);
+      } catch (err) {
+        if (err.status === 403) throw new Error("AI assist is off for this namespace. An admin can turn it on: conductorctl namespace set NAME -ai-assist");
+        throw err;
+      }
+      await loadExplanation();
+    }, e ? "small" : "primary");
+    if (!e) return replace(explainEl, panel("What happened", h("div", { class: "actions-row" }, ask,
+      h("span", { class: "faint" }, "Sends the redacted error and output to the configured model."))));
+    const label = { transient: "Probably transient: a retry may work", permanent: "Permanent: retrying won't help",
+      needs_attention: "Needs a person to fix the environment", unknown: "Unclear" }[e.class] || e.class;
+    const color = { transient: "amber", permanent: "red", needs_attention: "violet" }[e.class] || "";
+    replace(explainEl, panel("What happened",
+      h("div", { class: "banner " + (color === "amber" ? "violet" : color || "violet") },
+        h("span", { class: `lamp ${color}` }),
+        h("div", {}, h("span", { class: "title" }, label),
+          e.cause && h("div", {}, e.cause),
+          e.fix && h("div", { style: "margin-top:6px" }, h("strong", {}, "Try: "), e.fix))),
+      h("div", { class: "actions-row" }, ask,
+        h("span", { class: "faint" }, `${Math.round(e.confidence * 100)}% sure · classified by ${e.source}` +
+          (e.model ? ` · written by ${e.model}` : "") + ` · ${ago(e.created_at)}. A suggestion, not a diagnosis.`))));
+  };
+
   const refresh = async () => {
     const t = await get("/tasks/" + id);
     const changed = !current || current.status !== t.status || current.attempt !== t.attempt;
     current = t;
     if (changed) {
       draw(t);
+      if (t.status === "FAILED") loadExplanation().catch(() => {});
       await loadAttempts();
       if (terminalTask(t.status) && !following) consoleEl.textContent = t.output || "";
       else if (!following) follow();
@@ -396,9 +436,71 @@ export function workflow([id]) {
     steps.find((st) => st.status === "RUNNING" || st.status === "COMPENSATING")?.name ||
     steps[0]?.name;
 
+  const waitPanel = (st) => {
+    const w = st.wait;
+    if (!w) return null;
+    const comment = h("input", { type: "text", placeholder: "Comment (optional)", "aria-label": "Comment" });
+    const data = h("input", { type: "text", placeholder: '{"key": "value"} (optional)', "aria-label": "Signal data" });
+    const decide = (verb) => async () => {
+      await api("POST", `/workflows/${run.id}/steps/${encodeURIComponent(st.name)}/${verb}`, { comment: comment.value });
+      toast(verb === "approve" ? "Approved" : "Rejected");
+      refresh();
+    };
+    return h("div", { class: "wait" },
+      h("span", { class: "plate" }, w.kind === "approval" ? "Waiting for approval" : "Waiting for signal"),
+      h("div", {}, w.message || ""),
+      w.deadline && h("div", { class: "faint" }, "Decides itself " + ago(w.deadline)),
+      w.waiting && w.kind === "approval" && h("div", { class: "actions-row" }, comment,
+        button("Approve", decide("approve"), "primary"), button("Reject", decide("reject"), "danger")),
+      w.waiting && w.kind === "signal" && h("div", { class: "actions-row" }, data,
+        button("Send signal", async () => {
+          let payload = {};
+          if (data.value.trim()) {
+            try { payload = JSON.parse(data.value); } catch { throw new Error("The data must be a JSON object."); }
+          }
+          await api("POST", `/workflows/${run.id}/signals/${encodeURIComponent(w.message)}`, payload);
+          toast("Signal sent");
+          refresh();
+        }, "primary")),
+      !w.waiting && w.decided_by && h("div", { class: "faint" }, "Decided by " + w.decided_by));
+  };
+
+  const agentEl = h("div", {});
+  let agentFor = null;
+  const loadAgent = async (st) => {
+    const a = await get("/agent-runs/" + st.agent_run_id);
+    if (selected !== st.name) return;
+    const said = (m) => {
+      const calls = (m.tool_calls || []).map((c) => `${c.name}(${c.arguments})`).join(", ");
+      return [m.content, calls && "→ " + calls].filter(Boolean).join("\n");
+    };
+    replace(agentEl, h("div", { style: "margin-top:14px" },
+      h("span", { class: "plate" }, `Agent · turn ${a.turn} · ${a.tool_calls} tool calls · ${a.llm_spend.tokens} tokens` +
+        (a.llm_spend.cost_usd ? ` · $${a.llm_spend.cost_usd.toFixed(4)}` : "")),
+      a.error && h("div", { class: "banner red", style: "margin-top:8px" }, h("span", { class: "lamp red" }), h("div", { class: "mono" }, a.error)),
+      h("div", { class: "transcript" }, (a.messages || []).filter((m) => m.role !== "system").map((m) =>
+        h("div", { class: "turn " + m.role }, h("span", { class: "who" }, m.role === "tool" ? "tool result" : m.role),
+          h("pre", {}, said(m).slice(0, 1500))))),
+      table([
+        { label: "Turn", num: true, cell: (c) => c.turn },
+        { label: "Call", cell: (c) => c.role === "llm" ? "model" : "tool " + (c.tool_call_id || "") },
+        { label: "Status", cell: (c) => statusEl(c.status) },
+        { label: "Tries", num: true, cell: (c) => c.attempt },
+        { label: "Task", cell: (c) => h("a", { class: "mono", href: "#/tasks/" + c.task_id }, shortID(c.task_id)) },
+      ], a.tasks || [])));
+  };
+
   const drawStep = () => {
     const st = run.steps.find((x) => x.name === selected);
     if (!st) return replace(stepPanel);
+    if (st.agent_run_id && agentFor !== st.name) {
+      agentFor = st.name;
+      replace(agentEl);
+      loadAgent(st).catch(() => {});
+    } else if (!st.agent_run_id) {
+      agentFor = null;
+      replace(agentEl);
+    }
     const facts = [
       ["Status", statusEl(st.status)],
       st.depends_on?.length && ["After", h("span", { class: "mono" }, st.depends_on.join(", "))],
@@ -414,6 +516,8 @@ export function workflow([id]) {
         st.error && h("div", { class: "banner red" }, h("span", { class: "lamp red" }),
           h("div", {}, h("span", { class: "title" }, "Why it failed"), h("span", { class: "mono" }, st.error))),
         h("dl", { class: "facts" }, facts.map(([k, v]) => h("div", {}, h("dt", {}, k), h("dd", {}, v)))),
+        waitPanel(st),
+        agentEl,
         outputs.length > 0 && h("div", { style: "margin-top:14px" }, h("span", { class: "plate" }, "Outputs"),
           h("div", { class: "outputs", style: "margin-top:8px" }, outputs.map(([k, v]) => h("code", {}, `${k}=${v}`)))),
         stepTask && stepTask.id === st.task_id && h("div", { style: "margin-top:14px" },
@@ -464,7 +568,9 @@ export function workflow([id]) {
     if (!selected || !w.steps.some((st) => st.name === selected)) selected = pickDefault(w.steps);
     replace(head, h("div", { class: "head" },
       h("div", {}, h("div", { class: "plate" }, "Workflow run · " + w.workflow + (w.version ? ` v${w.version}` : "")),
-        h("h1", {}, statusEl(w.status), " ", h("span", { class: "mono" }, w.id))),
+        h("h1", {}, statusEl(w.status), " ", h("span", { class: "mono" }, w.id)),
+        w.llm_spend && h("div", { class: "faint", style: "margin-top:6px" },
+          `Model spend: ${w.llm_spend.tokens} tokens` + (w.llm_spend.cost_usd ? ` · $${w.llm_spend.cost_usd.toFixed(4)}` : ""))),
       h("div", { class: "actions" },
         !terminalWorkflow(w.status) && button("Cancel run", async () => {
           await api("POST", `/workflows/${w.id}/cancel`);

@@ -2,6 +2,7 @@
 
 import { session, saveKey, setNamespace, signOut, get, h, APIError } from "./js/core.js";
 import * as views from "./js/views.js";
+import * as ops from "./js/ops.js";
 
 const ROUTES = [
   [/^\/$/, views.overview, "overview"],
@@ -9,6 +10,8 @@ const ROUTES = [
   [/^\/tasks\/([0-9a-f-]{36})$/, views.task, "tasks"],
   [/^\/workflows$/, views.workflows, "workflows"],
   [/^\/workflows\/([0-9a-f-]{36})$/, views.workflow, "workflows"],
+  [/^\/approvals$/, ops.approvals, "approvals"],
+  [/^\/assistant$/, ops.assistant, "assistant"],
   [/^\/dead-letter$/, views.deadLetter, "dead-letter"],
   [/^\/schedules$/, views.schedules, "schedules"],
   [/^\/workers$/, views.workers, "workers", true],
@@ -18,6 +21,8 @@ const NAV = [
   ["overview", "#/", "Overview"],
   ["tasks", "#/tasks", "Tasks"],
   ["workflows", "#/workflows", "Workflows"],
+  ["approvals", "#/approvals", "Approvals"],
+  ["assistant", "#/assistant", "Assistant"],
   ["dead-letter", "#/dead-letter", "Dead letter"],
   ["schedules", "#/schedules", "Schedules"],
   ["workers", "#/workers", "Workers", true],

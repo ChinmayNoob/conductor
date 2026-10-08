@@ -20,7 +20,10 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/task"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -395,6 +398,13 @@ func (s *Server) sendTask(ctx context.Context, worker *Worker, t *db.Task) {
 	log := s.log.With("task_id", t.ID, "worker_id", worker.ID, "attempt", t.Attempt)
 	log.Debug("Dispatching task", "priority", t.Priority)
 
+	// Continue the submitter's trace; the worker's run span follows.
+	ctx, span := tracing.Start(tracing.WithTraceParent(ctx, t.TraceParent), "dispatch",
+		trace.WithAttributes(attribute.String("conductor.task_id", t.ID.String()),
+			attribute.Int("conductor.attempt", t.Attempt), attribute.Int64("conductor.worker_id", int64(worker.ID)),
+			attribute.String("conductor.queue", t.Queue)))
+	defer span.End()
+
 	rpcCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -551,6 +561,7 @@ func (s *Server) SubmitTask(ctx context.Context, req *grpcapi.ClientTaskRequest)
 		n.ScheduledAt = time.Unix(req.ScheduledAt, 0).UTC()
 	}
 	n.IdempotencyKey = req.IdempotencyKey
+	n.TraceParent = tracing.TraceParent(ctx)
 
 	t, created, err := s.db.CreateTask(ctx, n)
 	if err != nil {

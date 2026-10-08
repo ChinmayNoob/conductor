@@ -8,6 +8,7 @@ import (
 
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/ChinmayNoob/conductor/pkg/workflow"
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
@@ -136,6 +137,7 @@ type workflowJSON struct {
 	ErrorMessage    string            `json:"error_message,omitempty"`
 	CancelRequested bool              `json:"cancel_requested"`
 	IdempotencyKey  string            `json:"idempotency_key,omitempty"`
+	TraceID         string            `json:"trace_id,omitempty"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
 	Steps           []stepJSON        `json:"steps,omitempty"`
@@ -157,7 +159,8 @@ func toWorkflowJSON(wf *db.Workflow, steps []*db.StepState) workflowJSON {
 	out := workflowJSON{
 		ID: wf.ID, Namespace: wf.Namespace, Workflow: wf.Type, Version: wf.DefinitionVersion, Status: wf.Status,
 		Input: wf.Input, ErrorMessage: wf.ErrorMessage, CancelRequested: wf.CancelRequested,
-		IdempotencyKey: userKey(wf.IdempotencyKey), CreatedAt: wf.CreatedAt, UpdatedAt: wf.UpdatedAt,
+		IdempotencyKey: userKey(wf.IdempotencyKey), TraceID: tracing.TraceID(wf.TraceParent),
+		CreatedAt: wf.CreatedAt, UpdatedAt: wf.UpdatedAt,
 	}
 	deps := map[string][]string{}
 	if def, err := workflow.FromJSON(wf.Definition); err == nil && wf.Definition != nil {

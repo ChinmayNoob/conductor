@@ -37,6 +37,7 @@ type Workflow struct {
 	ErrorMessage      string
 	CancelRequested   bool
 	IdempotencyKey    string
+	TraceParent       string
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -54,20 +55,21 @@ type WorkflowStep struct {
 }
 
 const workflowColumns = `id, namespace, type, definition_version, definition, status, context,
-	error_message, cancel_requested, idempotency_key, created_at, updated_at`
+	error_message, cancel_requested, idempotency_key, trace_parent, created_at, updated_at`
 
 func scanWorkflow(row scanner) (*Workflow, error) {
 	wf := &Workflow{}
 	var def nullJSON
-	var errMsg, idemKey sql.NullString
+	var errMsg, idemKey, traceParent sql.NullString
 	err := row.Scan(&wf.ID, &wf.Namespace, &wf.Type, &wf.DefinitionVersion, &def, &wf.Status, &wf.Input,
-		&errMsg, &wf.CancelRequested, &idemKey, &wf.CreatedAt, &wf.UpdatedAt)
+		&errMsg, &wf.CancelRequested, &idemKey, &traceParent, &wf.CreatedAt, &wf.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	wf.Definition = def.RawMessage
 	wf.ErrorMessage = errMsg.String
 	wf.IdempotencyKey = idemKey.String
+	wf.TraceParent = traceParent.String
 	return wf, nil
 }
 
@@ -79,6 +81,7 @@ type NewWorkflow struct {
 	Input             json.RawMessage
 	Steps             []string // step names, in definition order
 	IdempotencyKey    string
+	TraceParent       string
 }
 
 // CreateWorkflow inserts a run and its PENDING steps. If the idempotency key
@@ -96,11 +99,11 @@ func (db *DB) CreateWorkflow(ctx context.Context, n NewWorkflow) (wf *Workflow, 
 	err = db.WithTx(ctx, func(tx *DB) error {
 		var err error
 		wf, err = scanWorkflow(tx.q.QueryRowContext(ctx,
-			`INSERT INTO workflows (namespace, type, definition_version, definition, status, current_step, context, idempotency_key)
-			 VALUES ($1, $2, $3, $4, 'RUNNING', 0, $5, $6)
+			`INSERT INTO workflows (namespace, type, definition_version, definition, status, current_step, context, idempotency_key, trace_parent)
+			 VALUES ($1, $2, $3, $4, 'RUNNING', 0, $5, $6, NULLIF($7, ''))
 			 ON CONFLICT (namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 			 RETURNING `+workflowColumns,
-			n.Namespace, n.Name, n.DefinitionVersion, []byte(n.Definition), []byte(n.Input), idemKey,
+			n.Namespace, n.Name, n.DefinitionVersion, []byte(n.Definition), []byte(n.Input), idemKey, n.TraceParent,
 		))
 		if errors.Is(err, sql.ErrNoRows) && n.IdempotencyKey != "" {
 			wf, err = scanWorkflow(tx.q.QueryRowContext(ctx,

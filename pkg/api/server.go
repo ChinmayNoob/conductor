@@ -18,6 +18,7 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -94,7 +95,16 @@ func (s *Server) Handler() http.Handler {
 	admin("GET /v1/api-keys", s.handleListAPIKeys)
 	admin("DELETE /v1/api-keys/{id}", s.handleRevokeAPIKey)
 
-	return s.logRequests(cors(mux))
+	// Tracing wraps everything but health checks. otelhttp names each span
+	// once the mux has matched a route.
+	return otelhttp.NewHandler(s.logRequests(cors(mux)), "http",
+		otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/health" }),
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			if r.Pattern != "" {
+				return r.Pattern
+			}
+			return r.Method
+		}))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

@@ -14,8 +14,11 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/task"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/ChinmayNoob/conductor/pkg/workflow"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -66,6 +69,9 @@ func (s *Server) startWorkflow(ctx context.Context, q *db.DB, ns, name string, v
 	for i, st := range def.Steps {
 		names[i] = st.Name
 	}
+	// Every step's spans join this one's trace.
+	ctx, span := tracing.Start(ctx, "workflow "+name, trace.WithAttributes(attribute.String("conductor.workflow", name)))
+	defer span.End()
 	wf, created, err := q.CreateWorkflow(ctx, db.NewWorkflow{
 		Namespace:         ns,
 		Name:              name,
@@ -74,6 +80,7 @@ func (s *Server) startWorkflow(ctx context.Context, q *db.DB, ns, name string, v
 		Input:             normalized,
 		Steps:             names,
 		IdempotencyKey:    idemKey,
+		TraceParent:       tracing.TraceParent(ctx),
 	})
 	if err != nil {
 		s.log.Error("Failed to create workflow", "name", name, "error", err)
@@ -300,6 +307,7 @@ func (s *Server) createStepTask(ctx context.Context, tx *db.DB, wf *db.Workflow,
 		RetryDelaySeconds: max(1, int(math.Ceil(spec.RetryDelay.Seconds()))),
 		TimeoutSeconds:    max(1, int(math.Ceil(spec.Timeout.Seconds()))),
 		WorkflowID:        &wf.ID,
+		TraceParent:       wf.TraceParent,
 	}
 	var detail any
 	switch {

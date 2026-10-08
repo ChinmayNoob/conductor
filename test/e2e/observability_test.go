@@ -3,6 +3,8 @@
 package e2e
 
 import (
+	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -63,4 +65,82 @@ func TestMetrics(t *testing.T) {
 	wantMetric(t, "a worker", scrape(t, strings.Fields(compose(t, "ps", "-q", "worker"))[0]), "conductor_worker_slots")
 	wantMetric(t, "the API", scrape(t, strings.TrimSpace(compose(t, "ps", "-q", "api"))),
 		`conductor_http_requests_total{code="201",route="POST /v1/tasks"}`)
+}
+
+// TestTracing needs tracing on (OTEL_EXPORTER_OTLP_ENDPOINT); it checks the
+// whole trace in Jaeger when E2E_JAEGER_URL is set.
+func TestTracing(t *testing.T) {
+	c := newClient(t)
+	task := submit(t, c, client.TaskRequest{Command: `echo "traceparent=$TRACEPARENT"`})
+	task = waitTask(t, c, task.ID, time.Minute)
+	if task.TraceID == "" {
+		t.Skip("tracing is off; set OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	// User code sees a traceparent in the task's own trace.
+	if !strings.Contains(task.Output, "traceparent=00-"+task.TraceID+"-") {
+		t.Fatalf("output %q: TRACEPARENT is not in trace %s", task.Output, task.TraceID)
+	}
+
+	jaeger := env("E2E_JAEGER_URL", "")
+	if jaeger == "" {
+		return
+	}
+	want := map[string]bool{
+		"conductor-api/POST /v1/tasks":                                      false,
+		"conductor-coordinator/dispatch":                                    false,
+		"conductor-worker/run shell":                                        false,
+		"conductor-coordinator/grpcapi.CoordinatorService/UpdateTaskStatus": false,
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		for _, s := range jaegerSpans(t, jaeger, task.TraceID) {
+			if _, ok := want[s]; ok {
+				want[s] = true
+			}
+		}
+		missing := 0
+		for _, found := range want {
+			if !found {
+				missing++
+			}
+		}
+		if missing == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("trace %s is missing spans: %v", task.TraceID, want)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// jaegerSpans returns "service/operation" for every span in a trace.
+func jaegerSpans(t *testing.T, jaeger, traceID string) []string {
+	t.Helper()
+	resp, err := http.Get(jaeger + "/api/traces/" + traceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Data []struct {
+			Spans []struct {
+				OperationName string `json:"operationName"`
+				ProcessID     string `json:"processID"`
+			} `json:"spans"`
+			Processes map[string]struct {
+				ServiceName string `json:"serviceName"`
+			} `json:"processes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil // not indexed yet
+	}
+	var out []string
+	for _, tr := range body.Data {
+		for _, s := range tr.Spans {
+			out = append(out, tr.Processes[s.ProcessID].ServiceName+"/"+s.OperationName)
+		}
+	}
+	return out
 }

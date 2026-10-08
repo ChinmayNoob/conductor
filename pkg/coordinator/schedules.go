@@ -9,7 +9,10 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
 	"github.com/ChinmayNoob/conductor/pkg/schedule"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // scheduleLoop fires due cron schedules, sleeping until the next one is due
@@ -115,6 +118,10 @@ func (s *Server) fireSchedule(ctx context.Context, tx *db.DB, sch *db.Schedule, 
 		return uuid.Nil, false, fmt.Errorf("invalid target: %w", err)
 	}
 	key := fmt.Sprintf("schedule:%s:%d", sch.ID, at.Unix())
+	// Each run starts its own trace.
+	ctx, span := tracing.Start(ctx, "schedule "+sch.Name, trace.WithNewRoot(),
+		trace.WithAttributes(attribute.String("conductor.schedule", sch.Name)))
+	defer span.End()
 
 	if target.Workflow != nil {
 		w := target.Workflow
@@ -129,6 +136,7 @@ func (s *Server) fireSchedule(ctx context.Context, tx *db.DB, sch *db.Schedule, 
 		return uuid.Nil, false, err
 	}
 	n.IdempotencyKey = key
+	n.TraceParent = tracing.TraceParent(ctx)
 	t, _, err := tx.CreateTask(ctx, n)
 	if err != nil {
 		return uuid.Nil, false, err

@@ -58,6 +58,7 @@ type Task struct {
 	// Attempt numbers dispatches: it goes up every time the task is handed
 	// to a worker, and status reports must quote the current one.
 	Attempt        int
+	TraceParent    string
 	dispatchKey    *time.Time
 	Output         string
 	Outputs        StringMap // key=value pairs a step wrote to $CONDUCTOR_OUTPUT
@@ -85,6 +86,7 @@ type NewTask struct {
 	ScheduledAt       time.Time
 	IdempotencyKey    string
 	WorkflowID        *uuid.UUID
+	TraceParent       string // W3C traceparent of the submitter, if traced
 }
 
 // DefaultTask returns a shell task in the default namespace and queue.
@@ -104,18 +106,18 @@ func DefaultTask(data string) NewTask {
 const taskColumns = `id, namespace, queue, type, data, spec, env, requirements, status, scheduled_at,
 	picked_at, started_at, completed_at, failed_at, cancelled_at, priority, max_retries, retry_count,
 	retry_delay_seconds, timeout_seconds, output, outputs, error_message, idempotency_key,
-	workflow_id, worker_id, attempt, dispatch_key, created_at`
+	workflow_id, worker_id, attempt, dispatch_key, trace_parent, created_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanTask(row scanner) (*Task, error) {
 	t := &Task{}
 	var spec nullJSON
-	var output, errMsg, idemKey sql.NullString
+	var output, errMsg, idemKey, traceParent sql.NullString
 	err := row.Scan(&t.ID, &t.Namespace, &t.Queue, &t.Type, &t.Data, &spec, &t.Env, &t.Requirements,
 		&t.Status, &t.ScheduledAt, &t.PickedAt, &t.StartedAt, &t.CompletedAt, &t.FailedAt, &t.CancelledAt,
 		&t.Priority, &t.MaxRetries, &t.RetryCount, &t.RetryDelaySeconds, &t.TimeoutSeconds, &output,
-		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &t.CreatedAt)
+		&t.Outputs, &errMsg, &idemKey, &t.WorkflowID, &t.WorkerID, &t.Attempt, &t.dispatchKey, &traceParent, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +125,7 @@ func scanTask(row scanner) (*Task, error) {
 	t.Output = output.String
 	t.ErrorMessage = errMsg.String
 	t.IdempotencyKey = idemKey.String
+	t.TraceParent = traceParent.String
 	return t, nil
 }
 
@@ -142,12 +145,12 @@ func (db *DB) CreateTask(ctx context.Context, n NewTask) (task *Task, created bo
 	t, err := scanTask(db.q.QueryRowContext(ctx,
 		`INSERT INTO tasks (namespace, queue, type, data, spec, env, requirements, status, priority,
 		                    max_retries, retry_delay_seconds, timeout_seconds, scheduled_at,
-		                    idempotency_key, workflow_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14)
+		                    idempotency_key, workflow_id, trace_parent)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'QUEUED', $8, $9, $10, $11, $12, $13, $14, NULLIF($15, ''))
 		 ON CONFLICT (namespace, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		 RETURNING `+taskColumns,
 		n.Namespace, n.Queue, n.Type, n.Data, jsonValue(n.Spec), n.Env, n.Requirements, n.Priority,
-		n.MaxRetries, n.RetryDelaySeconds, n.TimeoutSeconds, n.ScheduledAt, idemKey, n.WorkflowID,
+		n.MaxRetries, n.RetryDelaySeconds, n.TimeoutSeconds, n.ScheduledAt, idemKey, n.WorkflowID, n.TraceParent,
 	))
 	if errors.Is(err, sql.ErrNoRows) && n.IdempotencyKey != "" {
 		t, err = scanTask(db.q.QueryRowContext(ctx,

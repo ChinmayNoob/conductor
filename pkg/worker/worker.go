@@ -16,7 +16,11 @@ import (
 
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/metrics"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -134,7 +138,7 @@ func LocalIP(coordinatorAddr string) string {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func (s *Server) SubmitTask(_ context.Context, req *grpcapi.TaskRequest) (*grpcapi.TaskResponse, error) {
+func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*grpcapi.TaskResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -155,7 +159,8 @@ func (s *Server) SubmitTask(_ context.Context, req *grpcapi.TaskRequest) (*grpca
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)
 	s.running[req.TaskId] = cancel
 	s.wg.Add(1)
-	go s.run(ctx, req)
+	// The task outlives this call; keep its trace.
+	go s.run(trace.ContextWithSpanContext(ctx, trace.SpanContextFromContext(rpcCtx)), req)
 
 	return &grpcapi.TaskResponse{TaskId: req.TaskId, Message: "accepted", Success: true}, nil
 }
@@ -183,6 +188,10 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	}
 	defer release()
 
+	ctx, span := tracing.Start(ctx, "run "+taskType(task.Type), trace.WithAttributes(
+		attribute.String("conductor.task_id", task.TaskId), attribute.Int("conductor.attempt", int(task.Attempt))))
+	defer span.End()
+
 	log := s.log.With("task_id", task.TaskId, "type", task.Type, "attempt", task.Attempt)
 	// No STARTED report: the coordinator records the start when this worker
 	// accepts the task, which keeps a round trip off every task's path.
@@ -201,6 +210,10 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 	// side effects, since a task can run more than once.
 	env["CONDUCTOR_ATTEMPT"] = strconv.Itoa(int(task.Attempt))
 	env["CONDUCTOR_RETRY"] = strconv.Itoa(int(task.RetryCount))
+	// User code can continue the trace (W3C Trace Context).
+	if tp := tracing.TraceParent(ctx); tp != "" {
+		env["TRACEPARENT"] = tp
+	}
 
 	start := time.Now()
 	var (
@@ -225,21 +238,23 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 		}
 		log.Warn("Task failed", "error", err, "duration", time.Since(start))
 		metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "failed").Observe(time.Since(start).Seconds())
+		span.SetStatus(codes.Error, err.Error())
 		release()
-		s.report(task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
+		s.report(ctx, task, grpcapi.TaskStatus_FAILED, output, err.Error(), nil)
 		return
 	}
 	log.Info("Task completed", "duration", time.Since(start))
 	metrics.WorkerTaskDuration.WithLabelValues(taskType(task.Type), "completed").Observe(time.Since(start).Seconds())
 	release()
-	s.report(task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
+	s.report(ctx, task, grpcapi.TaskStatus_COMPLETE, output, "", outputs)
 }
 
-func (s *Server) report(task *grpcapi.TaskRequest, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
+func (s *Server) report(ctx context.Context, task *grpcapi.TaskRequest, status grpcapi.TaskStatus, output, errMsg string, outputs map[string]string) {
 	taskID := task.TaskId
-	// Use a fresh context: results must be reported even while shutting
-	// down. Allow long enough to ride out a coordinator failover.
-	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
+	// Results must be reported even if the task was cancelled or the worker
+	// is shutting down, so keep only ctx's trace. Allow long enough to ride
+	// out a coordinator failover.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
 	defer cancel()
 
 	resp, err := s.coordinator.UpdateTaskStatus(ctx, &grpcapi.UpdateTaskStatusRequest{

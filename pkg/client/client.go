@@ -192,6 +192,7 @@ type Task struct {
 	WorkflowID     string            `json:"workflow_id,omitempty"`
 	WorkerID       *int64            `json:"worker_id,omitempty"`
 	Attempt        int               `json:"attempt"`
+	TraceID        string            `json:"trace_id,omitempty"` // set when tracing is on
 	CreatedAt      time.Time         `json:"created_at"`
 
 	// Created is false when SubmitTask matched an existing idempotency key.
@@ -346,6 +347,7 @@ type Workflow struct {
 	Input           json.RawMessage `json:"input"`
 	ErrorMessage    string          `json:"error_message,omitempty"`
 	CancelRequested bool            `json:"cancel_requested"`
+	TraceID         string          `json:"trace_id,omitempty"`
 	IdempotencyKey  string          `json:"idempotency_key,omitempty"`
 	CreatedAt       time.Time       `json:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at"`

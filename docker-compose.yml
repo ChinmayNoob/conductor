@@ -4,7 +4,8 @@
 #   docker compose up -d --build --scale worker=3
 #   docker compose --profile containers up -d   # also run container tasks
 #   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d   # with mTLS
-#   docker compose --profile observability up -d  # Prometheus :9091, Grafana :3000
+#   # Prometheus :9091, Grafana :3000 and, with tracing on, Jaeger :16686:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 docker compose --profile observability up -d
 
 x-conductor: &conductor
   build: .
@@ -17,6 +18,8 @@ x-cluster-env: &cluster-env
   CONDUCTOR_CLUSTER_TOKEN: ${CONDUCTOR_CLUSTER_TOKEN:-insecure-dev-cluster-token}
   CONDUCTOR_LOG_LEVEL: ${CONDUCTOR_LOG_LEVEL:-info}
   CONDUCTOR_LOG_FORMAT: ${CONDUCTOR_LOG_FORMAT:-text}
+  # Tracing is off unless this points at an OTLP collector.
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
 # Only the coordinator and API talk to Postgres; workers never see these.
 x-db-env: &db-env
@@ -135,6 +138,12 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+  jaeger:
+    image: jaegertracing/jaeger:2.9.0
+    profiles: ["observability"]
+    ports:
+      - "16686:16686"
 
 volumes:
   postgres_data:

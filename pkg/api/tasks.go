@@ -10,6 +10,7 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/db"
 	"github.com/ChinmayNoob/conductor/pkg/grpcapi"
 	"github.com/ChinmayNoob/conductor/pkg/task"
+	"github.com/ChinmayNoob/conductor/pkg/tracing"
 	"github.com/google/uuid"
 )
 
@@ -48,6 +49,7 @@ type taskJSON struct {
 	WorkflowID     *uuid.UUID        `json:"workflow_id,omitempty"`
 	WorkerID       *int64            `json:"worker_id,omitempty"`
 	Attempt        int               `json:"attempt"`
+	TraceID        string            `json:"trace_id,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 }
 
@@ -66,7 +68,7 @@ func toTaskJSON(t *db.Task) taskJSON {
 		PickedAt: t.PickedAt, StartedAt: t.StartedAt, CompletedAt: t.CompletedAt, FailedAt: t.FailedAt,
 		CancelledAt: t.CancelledAt, Output: t.Output, Outputs: t.Outputs, ErrorMessage: t.ErrorMessage,
 		IdempotencyKey: userKey(t.IdempotencyKey), WorkflowID: t.WorkflowID, WorkerID: t.WorkerID,
-		Attempt: t.Attempt, CreatedAt: t.CreatedAt,
+		Attempt: t.Attempt, TraceID: tracing.TraceID(t.TraceParent), CreatedAt: t.CreatedAt,
 	}
 }
 

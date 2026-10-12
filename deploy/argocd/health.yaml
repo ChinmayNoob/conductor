@@ -1,0 +1,43 @@
+# Argo CD health checks for the operator's resources, so the UI shows a
+# failed run or a rejected workflow instead of "Healthy". Merge into
+# argocd-cm:
+#
+#   kubectl patch configmap argocd-cm -n argocd --type merge --patch-file deploy/argocd/health.yaml
+data:
+  # Workflow and Schedule: healthy once applied; degraded if Conductor
+  # rejected the spec.
+  resource.customizations.health.conductor.dev_Workflow: &ready |
+    hs = {status = "Progressing", message = "Waiting for the operator"}
+    if obj.status ~= nil and obj.status.conditions ~= nil then
+      for _, c in ipairs(obj.status.conditions) do
+        if c.type == "Ready" then
+          hs.message = c.message
+          if c.status == "True" then
+            hs.status = "Healthy"
+          elseif c.reason == "Invalid" then
+            hs.status = "Degraded"
+          end
+        end
+      end
+    end
+    return hs
+  resource.customizations.health.conductor.dev_Schedule: *ready
+  # WorkflowRun: progressing while it runs, healthy when it completed,
+  # degraded when it failed or was cancelled.
+  resource.customizations.health.conductor.dev_WorkflowRun: |
+    hs = {status = "Progressing", message = "Waiting for the operator"}
+    if obj.status ~= nil then
+      local phase = obj.status.phase
+      if phase == "COMPLETED" then
+        hs.status, hs.message = "Healthy", "Completed"
+      elseif phase == "FAILED" or phase == "CANCELLED" then
+        hs.status, hs.message = "Degraded", (obj.status.error or phase)
+      elseif phase ~= nil and phase ~= "" then
+        hs.message = phase
+      elseif obj.status.conditions ~= nil then
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "Ready" then hs.message = c.message end
+        end
+      end
+    end
+    return hs

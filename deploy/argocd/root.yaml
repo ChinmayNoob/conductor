@@ -1,0 +1,20 @@
+# The root of an app-of-apps: Argo CD syncs every Application in apps/,
+# which install Conductor and then the workflows that live next to it in Git.
+#
+#   kubectl apply -n argocd -f deploy/argocd/root.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: conductor-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ChinmayNoob/conductor.git
+    targetRevision: master
+    path: deploy/argocd/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}

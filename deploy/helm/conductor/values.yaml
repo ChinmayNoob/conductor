@@ -229,6 +229,10 @@ metrics:
     enabled: false
     labels:
       grafana_dashboard: "1"
+  # Google Cloud Managed Service for Prometheus (GKE): a PodMonitoring.
+  googleManagedPrometheus:
+    enabled: false
+    interval: 30s
 
 networkPolicy:
   enabled: true

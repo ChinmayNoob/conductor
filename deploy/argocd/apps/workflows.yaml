@@ -1,0 +1,23 @@
+# Workflows, schedules and one-off runs as resources the operator applies
+# to Conductor. Change a file, merge, and Argo CD rolls it out; delete it
+# and the schedule goes away (an unfinished WorkflowRun is cancelled).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: conductor-workflows
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ChinmayNoob/conductor.git
+    targetRevision: master
+    path: deploy/argocd/workflows
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: conductor
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    # The CRDs come with the conductor Application.
+    syncOptions: [SkipDryRunOnMissingResource=true]

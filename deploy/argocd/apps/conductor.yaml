@@ -1,0 +1,48 @@
+# Conductor itself, from the chart in this repository. Synced after its
+# secrets (wave 0) and before the workflows (wave 2).
+#
+# Argo CD renders charts with `helm template`, where the chart can't look up
+# the secrets it generated before: they would change on every sync. So this
+# brings its own: the auth secret (create it once, or from a secret
+# manager) and the TLS secret from cert-manager (secrets/tls.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: conductor
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ChinmayNoob/conductor.git
+    targetRevision: master
+    path: deploy/helm/conductor
+    helm:
+      valuesObject:
+        auth:
+          existingSecret: conductor-auth
+        tls:
+          existingSecret: conductor-tls
+        postgres:
+          mode: cloudnativepg
+        worker:
+          autoscaling: {enabled: true, maxReplicas: 10}
+        kubernetesTasks:
+          enabled: true
+        operator:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: conductor
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions:
+      - CreateNamespace=true
+      # CRDs are large; server-side apply avoids the annotation size limit.
+      - ServerSideApply=true
+  ignoreDifferences:
+    # KEDA owns the worker Deployment's replica count.
+    - group: apps
+      kind: Deployment
+      jsonPointers: [/spec/replicas]

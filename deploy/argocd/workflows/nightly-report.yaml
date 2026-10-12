@@ -1,0 +1,37 @@
+# A workflow and its schedule, kept in Git. The report step runs as its own
+# pod (a k8s task); its output feeds the next step.
+apiVersion: conductor.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: nightly-report
+spec:
+  definition:
+    description: Build yesterday's report and announce it.
+    inputs:
+      day: {default: yesterday}
+    defaults: {retries: 2, retry_delay: 30s, timeout: 10m}
+    steps:
+      - name: build
+        type: k8s
+        k8s:
+          image: alpine:3.20
+          command: [sh, -c]
+          args:
+            - 'echo "building the report for $DAY"; echo "report=reports/$DAY.csv" >> "$CONDUCTOR_OUTPUT"'
+          memory: 64Mi
+          cpu: 100m
+        env: {DAY: "${{ inputs.day }}"}
+      - name: announce
+        depends_on: [build]
+        run: echo "report ready at $REPORT"
+        env: {REPORT: "${{ steps.build.outputs.report }}"}
+---
+apiVersion: conductor.dev/v1alpha1
+kind: Schedule
+metadata:
+  name: nightly-report
+spec:
+  cron: "0 3 * * *"
+  timezone: UTC
+  misfirePolicy: run_once
+  workflow: {name: nightly-report}

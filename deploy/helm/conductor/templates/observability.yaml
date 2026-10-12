@@ -1,4 +1,26 @@
 {{- $fullname := include "conductor.fullname" . }}
+{{- if .Values.metrics.googleManagedPrometheus.enabled }}
+# Google Cloud Managed Service for Prometheus. It reserves the namespace
+# label for the Kubernetes namespace, so the metrics' own (the Conductor
+# namespace) arrives as exported_namespace.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "conductor.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [coordinator, api, worker]}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.googleManagedPrometheus.interval }}
+---
+{{- end }}
 {{- if .Values.metrics.serviceMonitor.enabled }}
 # Scrapes every Conductor pod (workers have no Service, so a PodMonitor).
 # honorLabels keeps the metrics' own namespace label (the Conductor

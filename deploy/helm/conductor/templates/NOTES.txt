@@ -1,0 +1,38 @@
+{{- $fullname := include "conductor.fullname" . -}}
+Conductor is starting: {{ .Values.coordinator.replicas }} coordinators (one leads), the API, and workers.
+
+1. Get the admin API key:
+
+   kubectl get secret -n {{ .Release.Namespace }} {{ include "conductor.authSecret" . }} -o jsonpath='{.data.api-key}' | base64 -d; echo
+
+2. Reach the API and the dashboard:
+{{- if .Values.api.ingress.enabled }}
+
+   https://{{ .Values.api.ingress.host }}/ui/
+{{- else }}
+
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ $fullname }}-api 8081:{{ .Values.api.service.port }}
+   open http://localhost:8081/ui/  (sign in with the API key)
+{{- end }}
+
+3. Run something:
+
+   export CONDUCTOR_URL=http://localhost:8081 CONDUCTOR_API_KEY=<the key>
+   conductorctl task submit -cmd "echo hello from Kubernetes" -wait
+{{- if .Values.kubernetesTasks.enabled }}
+   conductorctl task submit -type k8s -image alpine:3.20 -memory 64Mi -wait -- echo hello from a pod
+{{- end }}
+{{- if eq .Values.postgres.mode "dev" }}
+
+WARNING: postgres.mode is "dev": a single Postgres pod with no replicas and
+no backups. Use postgres.mode cloudnativepg or external for real work.
+{{- end }}
+{{- if not .Values.tls.enabled }}
+
+WARNING: tls.enabled is false: traffic between components is not encrypted.
+{{- end }}
+{{- if include "conductor.anyPoolAutoscales" . }}
+
+Workers scale with KEDA on queue depth; check with:
+   kubectl get scaledobjects -n {{ .Release.Namespace }}
+{{- end }}

@@ -1,16 +1,27 @@
 //go:build e2e
 
-// Package e2e tests a running Conductor stack end to end. Start it first:
+// Package e2e tests a running Conductor stack end to end. Start it first,
+// with Docker Compose:
 //
 //	docker compose --profile containers up -d --build --scale worker=3
 //	go test -tags e2e -count=1 -v ./test/e2e/
+//
+// or on Kubernetes (kind):
+//
+//	./scripts/kind-up.sh
+//	E2E_PLATFORM=kubernetes E2E_API_URL=http://localhost:30081 \
+//	  E2E_API_KEY=$(./scripts/kind-up.sh --api-key) go test -tags e2e -count=1 -v ./test/e2e/
 //
 // Settings (environment):
 //
 //	E2E_API_URL        default http://localhost:8081
 //	E2E_API_KEY        default insecure-dev-api-key
 //	E2E_WORKERS        number of `worker` replicas, default 3
+//	E2E_PLATFORM       compose (default) or kubernetes
 //	E2E_COMPOSE_FILES  comma-separated compose files, default docker-compose.yml
+//	E2E_K8S_CONTEXT    kubectl context, default kind-conductor
+//	E2E_K8S_NAMESPACE  the release's namespace, default conductor
+//	E2E_K8S_RELEASE    the Helm release, default conductor
 package e2e
 
 import (
@@ -106,19 +117,13 @@ func docker(t *testing.T, args ...string) string {
 	return string(out)
 }
 
-// workerContainers lists the running containers of every worker service.
-func workerContainers(t *testing.T) []string {
-	t.Helper()
-	return strings.Fields(compose(t, "ps", "-q", "worker", "container-worker"))
-}
-
-// workerRunning returns the worker container whose processes include marker,
+// workerRunning returns the worker instance whose processes include marker,
 // waiting up to 15s for the task to start.
 func workerRunning(t *testing.T, marker string) string {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if id := containerRunning(t, marker); id != "" {
+		if id := instanceRunning(t, marker); id != "" {
 			return id
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -127,24 +132,15 @@ func workerRunning(t *testing.T, marker string) string {
 	return ""
 }
 
-// containerRunning returns the worker container running marker, or "".
-func containerRunning(t *testing.T, marker string) string {
+// instanceRunning returns the worker instance running marker, or "".
+func instanceRunning(t *testing.T, marker string) string {
 	t.Helper()
-	for _, id := range workerContainers(t) {
-		if strings.Contains(docker(t, "top", id), marker) {
+	for _, id := range plat.instances(t, "worker") {
+		if strings.Contains(plat.processes(t, id), marker) {
 			return id
 		}
 	}
 	return ""
-}
-
-// restartLater starts a stopped container again when the test ends, and
-// waits for it to register.
-func restartLater(t *testing.T, container string) {
-	t.Cleanup(func() {
-		docker(t, "start", container)
-		time.Sleep(3 * time.Second)
-	})
 }
 
 // capacity returns the total slots of healthy workers that run shell tasks.
@@ -239,21 +235,8 @@ func wantSteps(t *testing.T, wf *client.Workflow, want map[string]string) {
 	}
 }
 
-// containerByIP returns the container in the list whose IP is ip.
-func containerByIP(t *testing.T, ids []string, ip string) string {
-	t.Helper()
-	for _, id := range ids {
-		got := strings.TrimSpace(docker(t, "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", id))
-		if got == ip {
-			return id
-		}
-	}
-	t.Fatalf("no container has IP %s", ip)
-	return ""
-}
-
-// leader returns the elected leader's epoch and container.
-func leader(t *testing.T, c *client.Client) (epoch int64, container string) {
+// leader returns the elected leader's epoch and instance.
+func leader(t *testing.T, c *client.Client) (epoch int64, instance string) {
 	t.Helper()
 	cl, err := c.Cluster(ctxTimeout(t, 10*time.Second))
 	if err != nil {
@@ -263,7 +246,13 @@ func leader(t *testing.T, c *client.Client) (epoch int64, container string) {
 		t.Fatal("no leader elected")
 	}
 	ip, _, _ := strings.Cut(cl.Leader.Address, ":")
-	return cl.Leader.Epoch, containerByIP(t, strings.Fields(compose(t, "ps", "-q", "coordinator")), ip)
+	for _, id := range plat.instances(t, "coordinator") {
+		if plat.ip(t, id) == ip {
+			return cl.Leader.Epoch, id
+		}
+	}
+	t.Fatalf("no coordinator has the leader's IP %s", ip)
+	return 0, ""
 }
 
 // networkOf returns the compose network a container is attached to.

@@ -245,7 +245,7 @@ func TestCancelRunningTaskKillsProcess(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
-	for containerRunning(t, marker) != "" {
+	for instanceRunning(t, marker) != "" {
 		if time.Now().After(deadline) {
 			t.Fatal("the cancelled task's process is still running")
 		}

@@ -1,0 +1,17 @@
+# A local Kubernetes cluster for developing and testing the chart:
+#
+#   ./scripts/kind-up.sh        # creates it, builds and loads the image, installs Conductor
+#
+# Three nodes, so pods spread and a node can be drained. The API's NodePort
+# (30081) is published on the host as localhost:30081.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: conductor
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30081
+        hostPort: 30081
+        protocol: TCP
+  - role: worker
+  - role: worker

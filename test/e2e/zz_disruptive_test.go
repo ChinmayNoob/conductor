@@ -11,8 +11,8 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/client"
 )
 
-// These tests stop and kill worker containers, so they run last (Go runs test
-// files in name order). Each restarts the container it stopped.
+// These tests stop and kill workers and coordinators, so they run last (Go
+// runs test files in name order). Each restores what it stopped.
 
 func TestGracefulDrainFinishesRunningTask(t *testing.T) {
 	c := newClient(t)
@@ -20,9 +20,9 @@ func TestGracefulDrainFinishesRunningTask(t *testing.T) {
 
 	task := submit(t, c, client.TaskRequest{Command: "sleep 6; echo " + marker})
 	container := workerRunning(t, marker)
-	restartLater(t, container)
+	plat.restoreLater(t, container)
 
-	docker(t, "stop", "-t", "30", container) // SIGTERM, then wait for the drain
+	plat.stop(t, container, 30*time.Second) // SIGTERM, then wait for the drain
 
 	task = waitTask(t, c, task.ID, 2*time.Minute)
 	if task.Status != "COMPLETED" || task.RetryCount != 0 || !strings.Contains(task.Output, marker) {
@@ -41,9 +41,9 @@ func TestWorkerCrashIsRecovered(t *testing.T) {
 		TimeoutSeconds:    60,
 	})
 	container := workerRunning(t, marker)
-	restartLater(t, container)
+	plat.restoreLater(t, container)
 
-	docker(t, "kill", container) // no chance to drain
+	plat.kill(t, container) // no chance to drain
 
 	task = waitTask(t, c, task.ID, 3*time.Minute)
 	if task.Status != "COMPLETED" || task.RetryCount != 1 {
@@ -54,7 +54,7 @@ func TestWorkerCrashIsRecovered(t *testing.T) {
 func TestLeaderFailover(t *testing.T) {
 	c := newClient(t)
 	epoch, victim := leader(t, c)
-	restartLater(t, victim)
+	plat.restoreLater(t, victim)
 
 	wf := startWorkflow(t, c, "order_pipeline", map[string]any{"order_id": uniqueName("ha")})
 	var tasks []*client.Task
@@ -64,7 +64,7 @@ func TestLeaderFailover(t *testing.T) {
 	time.Sleep(time.Second)
 
 	killed := time.Now()
-	docker(t, "kill", victim)
+	plat.kill(t, victim)
 
 	// A standby must take over quickly.
 	var newEpoch int64
@@ -96,6 +96,7 @@ func TestLeaderFailover(t *testing.T) {
 }
 
 func TestPartitionedWorkerIsFenced(t *testing.T) {
+	needCompose(t, "it disconnects a worker's Docker network")
 	c := newClient(t)
 	marker := uniqueName("partition")
 

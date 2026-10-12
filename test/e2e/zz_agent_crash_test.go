@@ -39,8 +39,8 @@ steps:
 	// Kill the worker while turn 2's slow tool call runs; turn 1's two
 	// calls have finished by then.
 	victim := workerRunning(t, marker)
-	restartLater(t, victim)
-	docker(t, "kill", victim)
+	plat.restoreLater(t, victim)
+	plat.kill(t, victim)
 
 	wf = waitWorkflow(t, c, wf.ID, 3*time.Minute)
 	if wf.Status != "COMPLETED" || wf.Step("work").Outputs["answer"] != "all done" {

@@ -115,8 +115,8 @@ steps:
 	if !strings.Contains(task.Output, "user="+evil) {
 		t.Fatalf("output %q should contain the input verbatim", task.Output)
 	}
-	for _, id := range workerContainers(t) {
-		if out, _ := exec.Command("docker", "exec", id, "ls", "/tmp").CombinedOutput(); strings.Contains(string(out), "pwned-"+name) {
+	for _, id := range plat.instances(t, "worker") {
+		if out, _ := plat.exec(t, id, "ls", "/tmp"); strings.Contains(out, "pwned-"+name) {
 			t.Fatalf("the injected command ran on worker %s", id)
 		}
 	}
@@ -138,13 +138,13 @@ func TestTasksCannotSeeClusterSecrets(t *testing.T) {
 
 func TestHTTPTask(t *testing.T) {
 	c := newClient(t)
-	task := submit(t, c, client.TaskRequest{HTTP: &client.HTTPSpec{URL: "http://api:8081/health"}, Type: "http"})
+	task := submit(t, c, client.TaskRequest{HTTP: &client.HTTPSpec{URL: plat.internalAPI() + "/health"}, Type: "http"})
 	task = waitTask(t, c, task.ID, time.Minute)
 	if task.Status != "COMPLETED" || task.Outputs["status"] != "200" || !strings.Contains(task.Outputs["body"], `"ok"`) {
 		t.Fatalf("http task = %s, outputs %v, error %q", task.Status, task.Outputs, task.ErrorMessage)
 	}
 
-	notFound := submit(t, c, client.TaskRequest{Type: "http", HTTP: &client.HTTPSpec{URL: "http://api:8081/nope"}, MaxRetries: client.Retries(0)})
+	notFound := submit(t, c, client.TaskRequest{Type: "http", HTTP: &client.HTTPSpec{URL: plat.internalAPI() + "/nope"}, MaxRetries: client.Retries(0)})
 	if notFound = waitTask(t, c, notFound.ID, time.Minute); notFound.Status != "FAILED" {
 		t.Fatalf("a 404 should fail the task, got %s", notFound.Status)
 	}
@@ -443,6 +443,7 @@ func TestDevMode(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and runs a second Conductor")
 	}
+	needCompose(t, "it uses the Compose Postgres")
 	root := repoRoot(t)
 	bin := filepath.Join(t.TempDir(), "conductor")
 	if runtime.GOOS == "windows" {

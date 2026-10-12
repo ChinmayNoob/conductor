@@ -1,0 +1,103 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "conductor.fullname" . }}
+{{- /* Each component accepts connections only from those that need it,
+and /metrics from networkPolicy.metricsFrom (default anyone). Egress is
+open: workers run http tasks against anything, and Postgres may be external. */ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-coordinator
+  labels:
+    {{- include "conductor.componentLabels" (list . "coordinator") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "coordinator") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{port: 8080}]
+      from:
+        {{- include "conductor.np.from" (list . "api") | nindent 8 }}
+        {{- include "conductor.np.from" (list . "worker") | nindent 8 }}
+    {{- include "conductor.np.metrics" . | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-api
+  labels:
+    {{- include "conductor.componentLabels" (list . "api") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "api") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{port: 8081}]
+      {{- with .Values.networkPolicy.apiFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- include "conductor.np.metrics" . | nindent 4 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-worker
+  labels:
+    {{- include "conductor.componentLabels" (list . "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "worker") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{port: 9000}]
+      from:
+        {{- include "conductor.np.from" (list . "coordinator") | nindent 8 }}
+    {{- include "conductor.np.metrics" . | nindent 4 }}
+{{- if eq .Values.postgres.mode "dev" }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-postgres
+  labels:
+    {{- include "conductor.componentLabels" (list . "postgres") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "postgres") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{port: 5432}]
+      from:
+        {{- include "conductor.np.from" (list . "coordinator") | nindent 8 }}
+        {{- include "conductor.np.from" (list . "api") | nindent 8 }}
+        {{- if include "conductor.anyPoolAutoscales" . }}
+        # KEDA reads the queue depth.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.kedaNamespace }}
+        {{- end }}
+{{- end }}
+{{- if .Values.mockLLM.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-mock-llm
+  labels:
+    {{- include "conductor.componentLabels" (list . "mock-llm") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "mock-llm") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{port: 8090}]
+      from:
+        {{- include "conductor.np.from" (list . "worker") | nindent 8 }}
+        {{- include "conductor.np.from" (list . "api") | nindent 8 }}
+{{- end }}
+{{- end }}

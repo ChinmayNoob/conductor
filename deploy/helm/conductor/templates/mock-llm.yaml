@@ -1,0 +1,51 @@
+{{- if .Values.mockLLM.enabled }}
+{{- $fullname := include "conductor.fullname" . }}
+# A scripted stand-in for a language model (OpenAI-compatible), for tests
+# and demos. Not for production.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-mock-llm
+  labels:
+    {{- include "conductor.componentLabels" (list . "mock-llm") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "mock-llm") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "conductor.componentLabels" (list . "mock-llm") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mock-llm
+          image: {{ include "conductor.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [mock-llm]
+          ports:
+            - {name: http, containerPort: 8090}
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-mock-llm
+  labels:
+    {{- include "conductor.componentLabels" (list . "mock-llm") | nindent 4 }}
+spec:
+  selector:
+    {{- include "conductor.componentSelector" (list . "mock-llm") | nindent 4 }}
+  ports:
+    - {name: http, port: 8090, targetPort: http}
+{{- end }}

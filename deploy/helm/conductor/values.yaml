@@ -1,0 +1,276 @@
+# Conductor on Kubernetes.
+#
+#   helm install conductor deploy/helm/conductor
+#
+# The defaults run a complete, highly available cluster for trying Conductor
+# out: two coordinators (one leads, one stands by), two API replicas, two
+# workers, mutual TLS between them, and a single-pod Postgres. For
+# production, bring a real database (postgres.mode: cloudnativepg or
+# external); see values-production.yaml.
+
+image:
+  repository: ghcr.io/chinmaynoob/conductor
+  # Default: the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Secrets every component shares.
+auth:
+  # A Secret with the keys cluster-token (authenticates traffic between
+  # components) and api-key (the bootstrap admin API key). Empty: the chart
+  # generates both on install and keeps them on upgrades.
+  existingSecret: ""
+
+# Mutual TLS for gRPC between coordinators, the API and workers.
+tls:
+  enabled: true
+  # A Secret with ca.crt, tls.crt and tls.key; the certificate is used as
+  # both server and client certificate, and its SANs must include
+  # serverName. Empty: the chart generates a CA and certificate (valid for
+  # 10 years) on install and keeps them on upgrades. cert-manager users can
+  # point this at a Certificate's secret.
+  existingSecret: ""
+  serverName: conductor
+
+postgres:
+  # Where the database comes from:
+  #   dev            a single Postgres pod, to try Conductor out (no backups, no HA)
+  #   cloudnativepg  a CloudNativePG Cluster the chart creates; needs the operator
+  #                  (https://cloudnative-pg.io)
+  #   external       your own Postgres, e.g. a managed service
+  mode: dev
+  database: conductor
+
+  dev:
+    image: postgres:16-alpine
+    storage:
+      size: 2Gi
+      storageClass: ""
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {memory: 512Mi}
+
+  cloudnativepg:
+    instances: 3
+    storage:
+      size: 10Gi
+      storageClass: ""
+    # Merged into the Cluster's spec, e.g. backup, resources, postgresql.parameters.
+    spec: {}
+
+  external:
+    host: ""
+    port: 5432
+    user: conductor
+    # A Secret holding the password, under passwordKey.
+    existingSecret: ""
+    passwordKey: password
+    sslMode: require
+
+coordinator:
+  # One leads (elected through a Postgres advisory lock); the rest stand by
+  # and take over within seconds.
+  replicas: 2
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+api:
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 8081
+    # Only for type NodePort.
+    nodePort: null
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: conductor.example.com
+    tls: []
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# The default worker pool. Every pool runs shell and http tasks, llm tasks
+# when a model is configured, and k8s tasks when kubernetesTasks is enabled.
+worker:
+  replicas: 2
+  # Tasks each worker runs at once.
+  slots: 4
+  # Labels tasks can require (labels: {gpu: "true"}). Every worker also gets
+  # pool: <pool name>, so tasks can pick a pool.
+  labels: {}
+  # A dedicated pool runs only tasks that ask for it (labels: {pool: <name>}),
+  # so other work never lands there: for expensive pools, and for pools
+  # that scale from zero.
+  dedicated: false
+  # Worker environment variables tasks may see (nothing else is passed on).
+  passEnv: []
+  # On shutdown (a rollout, scale-down or node drain) a worker stops taking
+  # tasks and lets running ones finish for this many seconds; tasks still
+  # running then are killed and retried elsewhere. Set it above your
+  # longest task to never cut one short. Pods get 15s more to exit.
+  shutdownTimeoutSeconds: 60
+  # Scale on queue depth with KEDA (https://keda.sh), down to zero when
+  # idle. Needs KEDA installed; replaces replicas.
+  autoscaling:
+    enabled: false
+    minReplicas: 0
+    maxReplicas: 10
+    # Seconds between checks of the queue, and how long a pool sits idle
+    # before scaling to zero.
+    pollingInterval: 10
+    cooldownPeriod: 120
+    # HorizontalPodAutoscaler scaling behavior, e.g. a shorter scale-down
+    # stabilization window.
+    behavior: {}
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  resources:
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# More worker pools, by name. Each takes the settings above and overrides
+# some, e.g. a GPU pool that scales from zero:
+#
+#   workerPools:
+#     gpu:
+#       dedicated: true      # only tasks with labels {pool: gpu}
+#       labels: {gpu: "true"}
+#       nodeSelector: {cloud.google.com/gke-accelerator: nvidia-l4}
+#       resources: {limits: {nvidia.com/gpu: 1}}
+#       autoscaling: {enabled: true, maxReplicas: 4}
+workerPools: {}
+
+# k8s tasks: workers run each task as its own pod, with its own image,
+# resources and service account.
+kubernetesTasks:
+  enabled: false
+  # Namespace for task pods; default the release's. The chart gives
+  # workers the RBAC to manage pods there, and nothing else.
+  namespace: ""
+  # Service accounts tasks may name (they must exist in that namespace).
+  # Tasks that name none run as a chart-made account with no permissions
+  # and no token.
+  serviceAccounts: []
+
+# Language models, for llm tasks, agents and the operations assistant.
+llm:
+  # A Secret holding an OpenAI (or compatible) API key, under apiKeyKey.
+  existingSecret: ""
+  apiKeyKey: api-key
+  # Any server speaking the Chat Completions API (Ollama, vLLM, LiteLLM, Azure).
+  baseURL: ""
+  model: ""
+  # USD per million tokens, e.g. {"gpt-4o-mini": {"input": 0.15, "output": 0.60}}.
+  prices: ""
+  # Model for the operations assistant (default: model).
+  assistantModel: ""
+
+# A scripted stand-in for a language model, for tests and demos. Used when
+# no baseURL is set.
+mockLLM:
+  enabled: false
+
+tracing:
+  # An OTLP gRPC endpoint (e.g. http://jaeger-collector.tracing:4317);
+  # tracing is off when empty.
+  otlpEndpoint: ""
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  # Prometheus Operator resources. Pods also carry prometheus.io/scrape
+  # annotations for plain Prometheus.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+  prometheusRule:
+    enabled: false
+    labels: {}
+  # A ConfigMap with the Grafana dashboard, for Grafana's sidecar.
+  grafanaDashboard:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
+
+networkPolicy:
+  enabled: true
+  # Who may reach the API (NetworkPolicyPeers); empty means anyone.
+  apiFrom: []
+  # Who may scrape /metrics; empty means anyone.
+  metricsFrom: []
+  # KEDA's namespace, let in to the dev Postgres when workers autoscale.
+  kedaNamespace: keda
+
+# Install the operator, which manages Workflow, WorkflowRun and Schedule
+# resources (GitOps). See operator/README.md.
+operator:
+  enabled: false
+  image:
+    repository: ghcr.io/chinmaynoob/conductor-operator
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Install the CustomResourceDefinitions (kept on uninstall).
+  installCRDs: true
+  # The Conductor namespace resources go to when they don't say.
+  defaultNamespace: default
+  # Watch only these Kubernetes namespaces; empty means all.
+  watchNamespaces: []
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+serviceAccount:
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]

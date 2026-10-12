@@ -12,7 +12,15 @@ timeline
     section Phase 1 · Production basics
         Oct 2026 : One binary, migrations, auth, mTLS, cancellation, graceful drain, CI + e2e (PR #2)
     section Phase 2 · A real scheduler
-        Oct 2026 : YAML DAG workflows, cron, queues, labels, task types, namespaces
+        Oct 2026 : YAML DAG workflows, cron, queues, labels, task types, namespaces (PR #3)
+    section Phase 3 · Distributed-systems depth
+        Oct 2026 : Coordinator HA, fencing, faster dispatch, benchmarks, chaos (PR #4)
+    section Phase 4 · Observability and UI
+        Oct 2026 : Metrics, tracing, live logs, dashboard (PR #5)
+    section Phase 5 · AI-native
+        Oct 2026 : llm steps, approvals, durable agents, operations assistant (PR #6)
+    section Phase 6 · Kubernetes
+        Oct 2026 : Helm chart, KEDA, k8s tasks, operator, e2e on kind (PR #7)
 ```
 
 ---
@@ -22,6 +30,10 @@ timeline
 1. [Phase 0: Foundation and the bug-fix round](#phase-0-foundation-and-the-bug-fix-round)
 2. [Phase 1: Production basics](#phase-1-production-basics)
 3. [Phase 2: A real scheduler](#phase-2-a-real-scheduler)
+4. [Phase 3: Distributed-systems depth](#phase-3-distributed-systems-depth)
+5. [Phase 4: Observability and UI](#phase-4-observability-and-ui)
+6. [Phase 5: AI-native durable execution](#phase-5-ai-native-durable-execution)
+7. [Phase 6: Kubernetes and cloud-native](#phase-6-kubernetes-and-cloud-native)
 
 ---
 
@@ -1002,6 +1014,111 @@ Not built: response caching for identical prompts (optional in the plan). The as
 
 ---
 
+## Phase 6: Kubernetes and cloud-native
+
+**Done (PR #7):** a Helm chart for a highly available cluster, workers that scale on queue depth down to zero with KEDA, a `k8s` task type that runs each attempt as its own pod, an operator for `Workflow`, `WorkflowRun` and `Schedule` resources, the e2e suite on kind in CI, and reference setups for GKE (Terraform) and Argo CD. [ADR 0004](docs/adr/0004-kubernetes.md) records the design.
+
+### The chart
+
+```mermaid
+flowchart LR
+    subgraph ns ["namespace conductor"]
+        API["api Deployment<br/>HPA, PDB, preStop"] --> CO["coordinator Deployment<br/>2 replicas: leader + standby"]
+        CO -- "gRPC + mTLS" --> WP["worker pools<br/>one Deployment each"]
+        WP -- "k8s tasks" --> TP["task pods<br/>no privileges, no token"]
+        OP["operator"] -- "HTTP API" --> API
+    end
+    KEDA["KEDA"] -- "SELECT conductor_slot_demand(...)" --> PG
+    KEDA -. "scales 0..N" .-> WP
+    API & CO --> PG[("Postgres: dev pod,<br/>CloudNativePG or external")]
+```
+
+Every component already had what Kubernetes wants, except a way to say it's healthy: `/healthz` and `/readyz` now sit next to `/metrics`. Coordinators and the API are ready when the database answers (standbys too: they redirect callers to the leader); workers when a coordinator acknowledged a recent heartbeat and they aren't draining.
+
+Two details mattered in practice:
+
+- **Worker identity.** Worker IDs hashed the advertised address. Kubernetes reuses pod IPs, so a new pod could inherit a dead one's ID, and the coordinator would think it was still running the dead pod's tasks. The ID now hashes the host name (the pod name) too.
+- **Zero-downtime rollouts.** Coordinators surge before stopping, so a standby is always up to take over; workers drain for `shutdownTimeoutSeconds` (the pod gets 15 s more); the API sleeps 5 s in `preStop` so endpoints stop routing to it before it stops accepting. `TestRollingRestartLosesNothing` restarts every component under load while polling the API: no lost task, no failed request.
+
+Secure by default: mutual TLS between components with a CA the chart generates, the cluster token, API key and certificates generated on install and read back (`lookup`) on upgrades, non-root pods with read-only root filesystems, and NetworkPolicies that let Postgres accept only coordinators and the API, workers only coordinators, and task pods nothing. kind's CNI enforces them, which a probe pod confirmed: Postgres was unreachable from another namespace.
+
+### Scaling on demand, down to zero
+
+KEDA's postgresql scaler runs one query per pool: `conductor_slot_demand(labels, exclusive)`, a SQL function shipped as a migration. It counts tasks the pool could run that are due (not delayed, not in a paused queue) plus tasks running on the pool's workers; KEDA divides by the slots per worker. The function is `SECURITY DEFINER`, so a database role with no table access can call it, and the scaler's settings never depend on the table layout.
+
+The first version had a flaw that showed up only when designing the test: a pool that scales from zero would also take plain tasks, since any worker whose labels cover a task's requirements may run it. A GPU pool would wake up for `echo`. So workers can now be **dedicated**: `CONDUCTOR_WORKER_EXCLUSIVE=pool` names labels a task must require to run there, like a taint. The heartbeat carries them, and both the coordinator's worker choice and the pick query check them:
+
+```sql
+EXISTS (SELECT 1 FROM jsonb_array_elements($1) w
+        WHERE (w->'labels') @> t.requirements
+          AND t.requirements @> COALESCE(w->'exclusive', '{}'))
+```
+
+(The parentheses matter: `->` and `@>` have the same precedence in Postgres, and without them `t.requirements @> w->'exclusive'` parses as `(t.requirements @> w) -> 'exclusive'`.)
+
+`TestWorkersScaleOnQueueDepth` submits six 20-second tasks for the dedicated `burst` pool on kind: it went from 0 to 3 workers in 16 s, the tasks ran there (and a plain task didn't), and it was back at 0 workers 53 s after the burst began.
+
+### Tasks as pods
+
+```mermaid
+sequenceDiagram
+    participant C as coordinator
+    participant W as worker
+    participant K as Kubernetes API
+    participant P as task pod
+    C->>W: SubmitTask (type k8s, attempt n)
+    W->>K: create pod (owner: worker pod, labels: task, attempt)
+    W->>K: watch pod
+    K-->>W: Running
+    W->>K: follow logs (live output)
+    P->>P: writes key=value to /dev/termination-log
+    K-->>W: Succeeded, exit 0, termination message
+    W->>K: delete pod
+    W->>C: result + outputs
+```
+
+A worker with `CONDUCTOR_K8S_TASKS` talks to the API server with its service account through a small REST client, the same way the container executor talks to Docker without its SDK. One attempt is one bare pod: a Job would add a controller that retries pods itself, while Conductor already owns retries, back-off and attempt fencing.
+
+- **Outputs:** `$CONDUCTOR_OUTPUT` is `/dev/termination-log`, which the kubelet keeps after the container exits, so `key=value` outputs feed later steps exactly as for shell tasks.
+- **Least privilege:** user 65534, no capabilities, no privilege escalation, RuntimeDefault seccomp, no service-link variables, no token. A task may name a service account only from the workers' allow-list; any other fails it permanently.
+- **Failing fast:** `InvalidImageName` fails permanently, `ImagePullBackOff` and config errors fail the attempt (to be retried, maybe elsewhere), and a timeout says when a pod was never scheduled ("0/3 nodes have a GPU").
+- **Cleanup:** the worker deletes the pod when the task finishes, times out or is cancelled. If the worker dies, its pod owns the task pods (garbage collected with it), `activeDeadlineSeconds` stops them a minute past their timeout, a restarted worker deletes what its pod left behind, and any worker sweeps finished pods nobody collected.
+
+The unit tests run against a fake API server that stores pods, serves watches and logs, and scripts each pod's life.
+
+### The operator
+
+`operator/` is its own Go module, so controller-runtime and client-go never reach the engine's binary. It is just another API client: it never touches the database.
+
+| Resource | Reconciled by |
+|---|---|
+| `Workflow` | applying the definition (a no-op if unchanged; a new version if changed) |
+| `WorkflowRun` | starting the run once, with the resource's UID as the idempotency key, then polling it into `status.phase` and steps; deleting it cancels an unfinished run |
+| `Schedule` | `PUT /v1/schedules/{name}` (new: create or replace, keeping history and the pending run), pausing on `suspend`, deleting with the resource |
+
+GitOps applies resources in any order, and running the Argo CD example found a gap: a Schedule applied before its Workflow got "no such definition" from Conductor, which the operator took as an invalid spec. It now waits (`Ready=False, reason Waiting`) and checks again, as runs already did. Every resource reports through a `Ready` condition: `Invalid` is not retried until the spec changes, `Unreachable` is retried with back-off.
+
+### The suite on Kubernetes
+
+The e2e helpers now go through a platform interface with two implementations: Compose (containers, `docker kill`) and Kubernetes (pods, `kubectl delete --force`, rollout status). The same 60-odd tests run on both; only the network-partition and dev-mode tests are Compose-only, and the Kubernetes ones (k8s tasks, autoscaling, the operator, the rolling restart) skip on Compose. CI runs it on kind twice: with the dev Postgres pod and with CloudNativePG, the production path, whose application user isn't a superuser (the migrations still apply: `uuid-ossp` is a trusted extension).
+
+### Reference setups
+
+- **[deploy/terraform/gke](deploy/terraform/gke):** GKE Autopilot with private nodes and Cloud NAT, Cloud SQL Postgres 16 (regional, private IP only, backups with PITR, TLS required), KEDA and Conductor through Helm, scraped by Google Managed Prometheus (a new chart option renders a `PodMonitoring`). `terraform validate` passes; it wasn't applied, since it costs money.
+- **[deploy/argocd](deploy/argocd):** an app-of-apps in three sync waves (cert-manager TLS, then Conductor, then workflows) and Argo CD health checks for the operator's resources. Argo CD renders with `helm template`, where the chart can't read back its generated secrets, so this setup brings its own. Run end to end on kind against this branch: the chart synced from GitHub onto CloudNativePG, the workflow and schedule were applied, and firing the schedule scaled the pool from zero and ran the pod step.
+
+### Phase 6 scorecard
+
+| Exit criterion | Result |
+|---|---|
+| `helm install` gives a working HA cluster | ✅ 2 coordinators, API with HPA, PDBs, mTLS; `helm test` passes; failover and rolling restarts tested |
+| Workers autoscale on queue depth | ✅ `TestWorkersScaleOnQueueDepth`: 0 → 3 → 0 |
+| The e2e suite passes on Kubernetes in CI | ✅ on kind, with dev Postgres and CloudNativePG |
+
+Not built: Job-based tasks, NetworkPolicy egress rules (workers' http tasks may call anything, and the database may be external), and published images (Phase 7 releases them; until then the Terraform example builds its own).
+
+---
+
 ## What's next
 
-Phase 6, Kubernetes and cloud-native: a Helm chart, worker-opened streams so workers can sit behind NAT (ADR 0001), and autoscaling. See [plan.md](plan.md).
+Phase 7, the open-source launch: a new name, releases with published images, a documentation site and the community work, once the launch gate in [plan.md](plan.md) is met.

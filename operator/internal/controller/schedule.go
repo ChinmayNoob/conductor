@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/ChinmayNoob/conductor/operator/api/v1alpha1"
 	conductor "github.com/ChinmayNoob/conductor/pkg/client"
@@ -63,18 +65,31 @@ func (r *ScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	err := r.apply(ctx, &sch, ns)
-	if err != nil {
+	var wait *waitingError
+	switch {
+	case errors.As(err, &wait):
+		// Applied in any order (GitOps): the workflow will come.
+		setReady(&sch.Status.Conditions, sch.Generation, false, v1alpha1.ReasonWaiting, wait.Error())
+	case err != nil:
 		failure(&sch.Status.Conditions, sch.Generation, err)
 		log.FromContext(ctx).Info("Schedule not applied", "error", err.Error())
 	}
 	if serr := r.Status().Update(ctx, &sch); serr != nil {
 		return ctrl.Result{}, serr
 	}
-	if err != nil && !isPermanent(err) {
+	switch {
+	case wait != nil:
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	case err != nil && !isPermanent(err):
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: r.Resync}, nil
 }
+
+// waitingError means a resource needs another to exist first.
+type waitingError struct{ what string }
+
+func (e *waitingError) Error() string { return "waiting for " + e.what + " to exist" }
 
 // applied returns the namespace the schedule was last applied in.
 func applied(sch *v1alpha1.Schedule, fallback string) string {
@@ -101,6 +116,13 @@ func (r *ScheduleReconciler) apply(ctx context.Context, sch *v1alpha1.Schedule, 
 	if w := sch.Spec.Workflow; w != nil {
 		input, err := object(w.Input, "workflow.input")
 		if err != nil {
+			return err
+		}
+		// Conductor refuses schedules of unknown workflows; its Workflow
+		// resource may simply not be applied yet.
+		if _, err := r.client(ns).GetDefinition(ctx, w.Name, w.Version); conductor.IsNotFound(err) {
+			return &waitingError{fmt.Sprintf("workflow %q", w.Name)}
+		} else if err != nil {
 			return err
 		}
 		req.Workflow = &conductor.ScheduledWorkflow{Name: w.Name, Version: w.Version}

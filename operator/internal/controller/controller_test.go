@@ -75,6 +75,14 @@ func (f *fakeConductor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(w, code, map[string]any{"name": def["name"], "version": len(f.definitions[key])})
 
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/workflow-definitions/"):
+		name := strings.TrimPrefix(r.URL.Path, "/v1/workflow-definitions/")
+		if versions := f.definitions[ns+"/"+name]; len(versions) > 0 {
+			reply(w, http.StatusOK, map[string]any{"name": name, "version": len(versions)})
+			return
+		}
+		reply(w, http.StatusNotFound, map[string]string{"error": "workflow definition not found"})
+
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/workflows":
 		var req conductor.WorkflowRequest
 		_ = json.Unmarshal(body, &req)
@@ -346,6 +354,17 @@ func TestScheduleLifecycle(t *testing.T) {
 		_ = kc.Get(context.Background(), client.ObjectKeyFromObject(sch), &got)
 		return got
 	}
+
+	// Applied before its Workflow (GitOps applies in any order): it waits.
+	res, err := reconcile(t, r, "nightly")
+	if err != nil || res.RequeueAfter == 0 || len(f.schedules) != 0 {
+		t.Fatalf("before the workflow exists: %v, %+v, schedules %v", err, res, f.schedules)
+	}
+	if c := ready(get().Status.Conditions); c == nil || c.Reason != v1alpha1.ReasonWaiting {
+		t.Fatalf("Ready = %+v, want Waiting", c)
+	}
+	f.definitions["reports/nightly-report"] = []string{"{}"}
+	f.definitions["ops/nightly-report"] = []string{"{}"}
 
 	if _, err := reconcile(t, r, "nightly"); err != nil {
 		t.Fatal(err)

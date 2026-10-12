@@ -90,6 +90,9 @@ message HeartbeatRequest {
   int32 slots = 4;               // tasks it can run at once
   int32 running = 5;             // tasks it is running now
   map<string, string> labels = 6;
+  // Label keys a task must require (with this worker's values) to run here,
+  // so a dedicated pool, e.g. of GPU workers, takes only tasks meant for it.
+  repeated string exclusive_labels = 7;
 }
 
 message HeartbeatResponse {

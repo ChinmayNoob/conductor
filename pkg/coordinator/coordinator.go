@@ -54,6 +54,9 @@ type Worker struct {
 	Draining  bool
 	Slots     int
 	Labels    map[string]string
+	// Exclusive holds the labels (some of Labels) a task must require to
+	// run here: a dedicated worker.
+	Exclusive map[string]string
 	inFlight  int
 	client    grpcapi.WorkerServiceClient
 	conn      *grpc.ClientConn
@@ -63,14 +66,11 @@ func (w *Worker) available() bool {
 	return w.IsHealthy && !w.Draining && w.client != nil && w.inFlight < w.Slots
 }
 
-// hasLabels reports whether the worker has every required label.
-func (w *Worker) hasLabels(req map[string]string) bool {
-	for k, v := range req {
-		if w.Labels[k] != v {
-			return false
-		}
-	}
-	return true
+// accepts reports whether the worker may run a task with these
+// requirements: it has every required label, and the task requires its
+// exclusive labels.
+func (w *Worker) accepts(req map[string]string) bool {
+	return db.WorkerMatch{Labels: w.Labels, Exclusive: w.Exclusive}.Accepts(req)
 }
 
 func (w *Worker) status() string {
@@ -293,7 +293,7 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 	for ctx.Err() == nil {
 		// Only claim tasks some free worker can run, so tasks aren't picked
 		// just to be put back.
-		labels, free := s.freeCapacity()
+		kinds, free := s.freeCapacity()
 		if free == 0 {
 			return
 		}
@@ -301,7 +301,7 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 		var tasks []*db.Task
 		err := s.fencedStmt(ctx, func(q *db.DB) error {
 			var err error
-			tasks, err = q.PickTasks(ctx, db.PickOptions{WorkerLabels: labels}, want)
+			tasks, err = q.PickTasks(ctx, db.PickOptions{Workers: kinds}, want)
 			return err
 		})
 		if err != nil {
@@ -332,27 +332,27 @@ func (s *Server) dispatchTasks(ctx context.Context) {
 	}
 }
 
-// freeCapacity returns the distinct label sets of workers with a free slot,
-// and the total number of free slots.
-func (s *Server) freeCapacity() ([]map[string]string, int) {
+// freeCapacity returns the distinct kinds (labels and exclusive labels) of
+// workers with a free slot, and the total number of free slots.
+func (s *Server) freeCapacity() ([]db.WorkerMatch, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	seen := make(map[string]bool)
-	var labels []map[string]string
+	var kinds []db.WorkerMatch
 	free := 0
 	for _, w := range s.workers {
 		if !w.available() {
 			continue
 		}
 		free += w.Slots - w.inFlight
-		key := labelKey(w.Labels)
+		key := labelKey(w.Labels) + "\x01" + labelKey(w.Exclusive)
 		if !seen[key] {
 			seen[key] = true
-			labels = append(labels, w.Labels)
+			kinds = append(kinds, db.WorkerMatch{Labels: w.Labels, Exclusive: w.Exclusive})
 		}
 	}
-	return labels, free
+	return kinds, free
 }
 
 func labelKey(labels map[string]string) string {
@@ -372,7 +372,7 @@ func (s *Server) chooseWorker(req map[string]string) *Worker {
 
 	var ids []uint32
 	for id, w := range s.workers {
-		if w.available() && w.hasLabels(req) {
+		if w.available() && w.accepts(req) {
 			ids = append(ids, id)
 		}
 	}
@@ -706,6 +706,13 @@ func (s *Server) SendHeartbeat(ctx context.Context, req *grpcapi.HeartbeatReques
 	worker.Draining = req.Draining
 	worker.Slots = max(int(req.Slots), 1)
 	worker.Labels = req.Labels
+	worker.Exclusive = nil
+	for _, k := range req.ExclusiveLabels {
+		if worker.Exclusive == nil {
+			worker.Exclusive = make(map[string]string)
+		}
+		worker.Exclusive[k] = req.Labels[k]
+	}
 	becameAvailable = becameAvailable && worker.available()
 	record := db.WorkerRecord{
 		ID: int64(worker.ID), Address: worker.Address, Labels: worker.Labels,

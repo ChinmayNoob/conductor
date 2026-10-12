@@ -188,6 +188,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		Address:      address,
 		Slots:        cfg.Worker.Slots,
 		Labels:       cfg.Worker.Labels,
+		Exclusive:    cfg.Worker.Exclusive,
 		MaxOutput:    cfg.MaxOutputBytes,
 		PassEnv:      cfg.Worker.PassEnv,
 		DockerSocket: cfg.Worker.DockerSocket,
@@ -212,7 +213,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	go w.RunHeartbeats(heartbeatCtx)
 
 	slog.Info("Worker listening", "addr", lis.Addr().String(), "advertise", address,
-		"slots", cfg.Worker.Slots, "labels", w.Labels())
+		"slots", cfg.Worker.Slots, "labels", w.Labels(), "exclusive", cfg.Worker.Exclusive)
 	err = serveUntilDone(ctx, func() error { return grpcServer.Serve(lis) })
 
 	slog.Info("Shutting down")

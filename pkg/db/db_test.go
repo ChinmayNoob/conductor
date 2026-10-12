@@ -78,7 +78,7 @@ func must[T any](t *testing.T) func(T, error) T {
 }
 
 // shellWorkers is the label set of a plain worker.
-var shellWorkers = PickOptions{WorkerLabels: []map[string]string{{"type.shell": "true"}}}
+var shellWorkers = PickOptions{Workers: []WorkerMatch{{Labels: map[string]string{"type.shell": "true"}}}}
 
 // create inserts a shell task, letting the caller adjust it first.
 func create(t *testing.T, db *DB, data string, adjust ...func(*NewTask)) *Task {
@@ -265,9 +265,38 @@ func TestPickMatchesWorkerLabels(t *testing.T) {
 	if got := pick(t, db); got != nil {
 		t.Fatalf("a plain worker got the GPU task")
 	}
-	withGPU := PickOptions{WorkerLabels: []map[string]string{{"type.shell": "true"}, {"type.shell": "true", "gpu": "true"}}}
+	withGPU := PickOptions{Workers: []WorkerMatch{
+		{Labels: map[string]string{"type.shell": "true"}},
+		{Labels: map[string]string{"type.shell": "true", "gpu": "true"}},
+	}}
 	if got := pick(t, db, withGPU); got == nil || got.ID != gpu.ID {
 		t.Fatalf("a GPU worker got %v, want the GPU task", got)
+	}
+}
+
+func TestPickHonorsExclusiveLabels(t *testing.T) {
+	db := testDB(t)
+	// A dedicated GPU pool: its workers take only tasks that ask for it.
+	dedicated := PickOptions{Workers: []WorkerMatch{{
+		Labels:    map[string]string{"type.shell": "true", "pool": "gpu"},
+		Exclusive: map[string]string{"pool": "gpu"},
+	}}}
+	plain := create(t, db, "plain")
+	if got := pick(t, db, dedicated); got != nil {
+		t.Fatalf("a dedicated worker took %q, which doesn't ask for its pool", got.Data)
+	}
+	meant := create(t, db, "for the pool", func(n *NewTask) { n.Requirements["pool"] = "gpu" })
+	if got := pick(t, db, dedicated); got == nil || got.ID != meant.ID {
+		t.Fatalf("a dedicated worker got %v, want the task meant for it", got)
+	}
+	if got := pick(t, db); got == nil || got.ID != plain.ID {
+		t.Fatalf("a plain worker got %v, want the plain task", got)
+	}
+
+	if (WorkerMatch{Labels: dedicated.Workers[0].Labels}).Accepts(map[string]string{"type.shell": "true"}) != true ||
+		dedicated.Workers[0].Accepts(map[string]string{"type.shell": "true"}) ||
+		!dedicated.Workers[0].Accepts(map[string]string{"type.shell": "true", "pool": "gpu"}) {
+		t.Fatal("WorkerMatch.Accepts disagrees with the pick query")
 	}
 }
 
@@ -992,5 +1021,15 @@ func TestSlotDemand(t *testing.T) {
 	}
 	if n := demand(`{"type.http": "true"}`); n != 0 {
 		t.Errorf("http-only pool demand = %d, want 0", n)
+	}
+
+	// A dedicated pool counts only the tasks that ask for it.
+	create(t, db, "for burst", func(n *NewTask) { n.Requirements["pool"] = "burst" })
+	var n int64
+	if err := db.q.QueryRowContext(ctx, `SELECT conductor_slot_demand($1::jsonb, '{"pool": "burst"}')`, burst).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("dedicated burst pool demand = %d, want 2 (1 ready for it, 1 running on it)", n)
 	}
 }

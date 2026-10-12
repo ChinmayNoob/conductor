@@ -79,6 +79,9 @@ type Worker struct {
 	AdvertiseAddr string // host:port the coordinator dials; empty means auto-detect
 	Slots         int    // tasks run at once
 	Labels        map[string]string
+	// Exclusive names labels a task must require to run here (a dedicated
+	// worker); each must be one of Labels.
+	Exclusive []string
 	// PassEnv names worker environment variables that tasks may see.
 	PassEnv      []string
 	DockerSocket string // enables container tasks when Docker answers here
@@ -178,6 +181,12 @@ func Load() (*Config, error) {
 	}
 	c.Worker.Labels, err = parseLabels(os.Getenv("CONDUCTOR_WORKER_LABELS"))
 	collect(wrap("CONDUCTOR_WORKER_LABELS", err))
+	c.Worker.Exclusive = splitList(os.Getenv("CONDUCTOR_WORKER_EXCLUSIVE"))
+	for _, k := range c.Worker.Exclusive {
+		if _, ok := c.Worker.Labels[k]; !ok && err == nil {
+			collect(fmt.Errorf("CONDUCTOR_WORKER_EXCLUSIVE: %q is not one of the worker's labels (CONDUCTOR_WORKER_LABELS)", k))
+		}
+	}
 	c.Worker.K8s.Enabled, err = strconv.ParseBool(env("CONDUCTOR_K8S_TASKS", "false"))
 	collect(wrap("CONDUCTOR_K8S_TASKS", err))
 

@@ -455,12 +455,15 @@ type HeartbeatRequest struct {
 	WorkerId uint32                 `protobuf:"varint,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	Address  string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
 	// A draining worker finishes its current tasks but accepts no new ones.
-	Draining      bool              `protobuf:"varint,3,opt,name=draining,proto3" json:"draining,omitempty"`
-	Slots         int32             `protobuf:"varint,4,opt,name=slots,proto3" json:"slots,omitempty"`     // tasks it can run at once
-	Running       int32             `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"` // tasks it is running now
-	Labels        map[string]string `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Draining bool              `protobuf:"varint,3,opt,name=draining,proto3" json:"draining,omitempty"`
+	Slots    int32             `protobuf:"varint,4,opt,name=slots,proto3" json:"slots,omitempty"`     // tasks it can run at once
+	Running  int32             `protobuf:"varint,5,opt,name=running,proto3" json:"running,omitempty"` // tasks it is running now
+	Labels   map[string]string `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Label keys a task must require (with this worker's values) to run here,
+	// so a dedicated pool, e.g. of GPU workers, takes only tasks meant for it.
+	ExclusiveLabels []string `protobuf:"bytes,7,rep,name=exclusive_labels,json=exclusiveLabels,proto3" json:"exclusive_labels,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -531,6 +534,13 @@ func (x *HeartbeatRequest) GetRunning() int32 {
 func (x *HeartbeatRequest) GetLabels() map[string]string {
 	if x != nil {
 		return x.Labels
+	}
+	return nil
+}
+
+func (x *HeartbeatRequest) GetExclusiveLabels() []string {
+	if x != nil {
+		return x.ExclusiveLabels
 	}
 	return nil
 }
@@ -1422,14 +1432,15 @@ const file_pkg_grpcapi_api_proto_rawDesc = "" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"2\n" +
 	"\x12CancelTaskResponse\x12\x1c\n" +
-	"\tcancelled\x18\x01 \x01(\bR\tcancelled\"\x8f\x02\n" +
+	"\tcancelled\x18\x01 \x01(\bR\tcancelled\"\xba\x02\n" +
 	"\x10HeartbeatRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\rR\bworkerId\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1a\n" +
 	"\bdraining\x18\x03 \x01(\bR\bdraining\x12\x14\n" +
 	"\x05slots\x18\x04 \x01(\x05R\x05slots\x12\x18\n" +
 	"\arunning\x18\x05 \x01(\x05R\arunning\x12=\n" +
-	"\x06labels\x18\x06 \x03(\v2%.grpcapi.HeartbeatRequest.LabelsEntryR\x06labels\x1a9\n" +
+	"\x06labels\x18\x06 \x03(\v2%.grpcapi.HeartbeatRequest.LabelsEntryR\x06labels\x12)\n" +
+	"\x10exclusive_labels\x18\a \x03(\tR\x0fexclusiveLabels\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"7\n" +

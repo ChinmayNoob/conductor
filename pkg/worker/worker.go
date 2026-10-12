@@ -52,6 +52,7 @@ type Server struct {
 	address     string
 	slots       int
 	labels      map[string]string
+	exclusive   []string
 	maxOutput   int
 	env         []string     // base environment for tasks
 	docker      *docker      // nil if containers aren't available
@@ -75,11 +76,14 @@ type Server struct {
 }
 
 type Options struct {
-	ID        uint32
-	Address   string            // host:port the coordinator dials
-	Slots     int               // tasks run concurrently
-	Labels    map[string]string // user labels, e.g. region=eu
-	MaxOutput int               // bytes of output kept per task
+	ID      uint32
+	Address string            // host:port the coordinator dials
+	Slots   int               // tasks run concurrently
+	Labels  map[string]string // user labels, e.g. region=eu
+	// Exclusive names labels a task must require to run here, making this a
+	// dedicated worker (e.g. pool=gpu takes only tasks that ask for it).
+	Exclusive []string
+	MaxOutput int // bytes of output kept per task
 	// PassEnv names worker environment variables that tasks may see. Nothing
 	// else from the worker's environment is passed on.
 	PassEnv []string
@@ -100,6 +104,7 @@ func NewServer(opts Options) *Server {
 		id:          opts.ID,
 		address:     opts.Address,
 		slots:       max(opts.Slots, 1),
+		exclusive:   opts.Exclusive,
 		maxOutput:   opts.MaxOutput,
 		env:         baseEnv(opts.PassEnv),
 		coordinator: opts.Coordinator,
@@ -404,12 +409,13 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 	s.mu.Unlock()
 
 	_, err := s.coordinator.SendHeartbeat(ctx, &grpcapi.HeartbeatRequest{
-		WorkerId: s.id,
-		Address:  s.address,
-		Draining: draining,
-		Slots:    int32(s.slots),
-		Running:  int32(running),
-		Labels:   s.labels,
+		WorkerId:        s.id,
+		Address:         s.address,
+		Draining:        draining,
+		Slots:           int32(s.slots),
+		Running:         int32(running),
+		Labels:          s.labels,
+		ExclusiveLabels: s.exclusive,
 	})
 	if err != nil {
 		s.log.Warn("Heartbeat failed", "error", err)

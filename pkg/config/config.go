@@ -82,6 +82,19 @@ type Worker struct {
 	// PassEnv names worker environment variables that tasks may see.
 	PassEnv      []string
 	DockerSocket string // enables container tasks when Docker answers here
+	K8s          K8s
+}
+
+// K8s configures Kubernetes tasks (type k8s), which run as pods. Only
+// workers running in a cluster can enable them.
+type K8s struct {
+	Enabled         bool
+	Namespace       string   // for task pods; default the worker's own
+	ServiceAccount  string   // for tasks that name none (no token mounted)
+	ServiceAccounts []string // others tasks may name
+	// The worker's own pod (from the downward API), which owns its tasks' pods.
+	PodName string
+	PodUID  string
 }
 
 // TLS secures gRPC between components. All components share one certificate
@@ -116,6 +129,13 @@ func Load() (*Config, error) {
 			AdvertiseAddr: os.Getenv("CONDUCTOR_WORKER_ADVERTISE_ADDR"),
 			DockerSocket:  env("CONDUCTOR_DOCKER_SOCKET", "/var/run/docker.sock"),
 			PassEnv:       splitList(os.Getenv("CONDUCTOR_WORKER_PASS_ENV")),
+			K8s: K8s{
+				Namespace:       os.Getenv("CONDUCTOR_K8S_NAMESPACE"),
+				ServiceAccount:  os.Getenv("CONDUCTOR_K8S_SERVICE_ACCOUNT"),
+				ServiceAccounts: splitList(os.Getenv("CONDUCTOR_K8S_SERVICE_ACCOUNTS")),
+				PodName:         os.Getenv("CONDUCTOR_POD_NAME"),
+				PodUID:          os.Getenv("CONDUCTOR_POD_UID"),
+			},
 		},
 		ClusterToken: os.Getenv("CONDUCTOR_CLUSTER_TOKEN"),
 		APIKey:       os.Getenv("CONDUCTOR_API_KEY"),
@@ -158,6 +178,8 @@ func Load() (*Config, error) {
 	}
 	c.Worker.Labels, err = parseLabels(os.Getenv("CONDUCTOR_WORKER_LABELS"))
 	collect(wrap("CONDUCTOR_WORKER_LABELS", err))
+	c.Worker.K8s.Enabled, err = strconv.ParseBool(env("CONDUCTOR_K8S_TASKS", "false"))
+	collect(wrap("CONDUCTOR_K8S_TASKS", err))
 
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		collect(fmt.Errorf("CONDUCTOR_LOG_FORMAT must be text or json, got %q", c.LogFormat))

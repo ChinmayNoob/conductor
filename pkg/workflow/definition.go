@@ -36,6 +36,7 @@ const (
 	TypeShell     = "shell"
 	TypeHTTP      = "http"
 	TypeContainer = "container"
+	TypeK8s       = "k8s" // a Kubernetes pod
 	TypeLLM       = "llm"
 	// Waiting steps run no task: they wait for a person or a signal.
 	TypeApproval = "approval"
@@ -82,6 +83,7 @@ type Action struct {
 	Run       string            `yaml:"run,omitempty" json:"run,omitempty"`
 	HTTP      *HTTPSpec         `yaml:"http,omitempty" json:"http,omitempty"`
 	Container *ContainerSpec    `yaml:"container,omitempty" json:"container,omitempty"`
+	K8s       *K8sSpec          `yaml:"k8s,omitempty" json:"k8s,omitempty"`
 	LLM       *LLMSpec          `yaml:"llm,omitempty" json:"llm,omitempty"`
 	Approval  *ApprovalSpec     `yaml:"approval,omitempty" json:"approval,omitempty"`
 	Signal    *SignalSpec       `yaml:"signal,omitempty" json:"signal,omitempty"`
@@ -199,6 +201,56 @@ type ContainerSpec struct {
 	Memory  string   `yaml:"memory,omitempty" json:"memory,omitempty"` // e.g. "256m"
 	CPUs    float64  `yaml:"cpus,omitempty" json:"cpus,omitempty"`
 	Network string   `yaml:"network,omitempty" json:"network,omitempty"` // "bridge" (default) or "none"
+}
+
+// K8sSpec runs the step as its own Kubernetes pod, on workers with
+// Kubernetes tasks enabled. Command and args may use ${{ }} expressions
+// (no shell runs them unless the command is one). Outputs work as for shell
+// steps: write key=value lines to $CONDUCTOR_OUTPUT (up to 4 KB).
+type K8sSpec struct {
+	Image   string   `yaml:"image" json:"image"`
+	Command []string `yaml:"command,omitempty" json:"command,omitempty"` // replaces the image's entrypoint
+	Args    []string `yaml:"args,omitempty" json:"args,omitempty"`
+	// CPU and memory are both the request and the limit, e.g. "500m", "256Mi".
+	CPU    string `yaml:"cpu,omitempty" json:"cpu,omitempty"`
+	Memory string `yaml:"memory,omitempty" json:"memory,omitempty"`
+	// ServiceAccount must be one the workers allow; by default the pod
+	// gets no service account token.
+	ServiceAccount string            `yaml:"service_account,omitempty" json:"service_account,omitempty"`
+	NodeSelector   map[string]string `yaml:"node_selector,omitempty" json:"node_selector,omitempty"`
+	// RunAsUser overrides the default non-root user (65534).
+	RunAsUser *int64 `yaml:"run_as_user,omitempty" json:"run_as_user,omitempty"`
+}
+
+var (
+	quantityRe = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$`)
+	dnsNameRe  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+)
+
+// ValidateK8s checks a k8s spec's fields; the cluster checks the rest.
+func ValidateK8s(k *K8sSpec) error {
+	var errs []error
+	if strings.TrimSpace(k.Image) == "" {
+		errs = append(errs, errors.New("k8s.image is required"))
+	}
+	if k.CPU != "" && !quantityRe.MatchString(k.CPU) {
+		errs = append(errs, fmt.Errorf("k8s.cpu %q is not a Kubernetes quantity (e.g. 500m or 2)", k.CPU))
+	}
+	if k.Memory != "" && !quantityRe.MatchString(k.Memory) {
+		errs = append(errs, fmt.Errorf("k8s.memory %q is not a Kubernetes quantity (e.g. 256Mi or 1Gi)", k.Memory))
+	}
+	if sa := k.ServiceAccount; sa != "" && (len(sa) > 253 || !dnsNameRe.MatchString(sa)) {
+		errs = append(errs, fmt.Errorf("k8s.service_account %q is not a valid name", sa))
+	}
+	for key := range k.NodeSelector {
+		if key == "" {
+			errs = append(errs, errors.New("k8s.node_selector keys must not be empty"))
+		}
+	}
+	if k.RunAsUser != nil && *k.RunAsUser < 0 {
+		errs = append(errs, errors.New("k8s.run_as_user must not be negative"))
+	}
+	return errors.Join(errs...)
 }
 
 type Step struct {
@@ -429,16 +481,10 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("'run' cannot contain ${{ }} expressions; set them in 'env' and use $VARIABLE instead, " +
 				"so values can never be interpreted as shell code")
 		}
-		if a.HTTP != nil || a.Container != nil {
-			add("shell steps cannot have 'http' or 'container'")
-		}
 	case TypeHTTP:
 		if a.HTTP == nil || a.HTTP.URL == "" {
 			add("http steps need 'http.url'")
 			break
-		}
-		if a.Run != "" || a.Container != nil || a.LLM != nil {
-			add("http steps cannot have 'run', 'container' or 'llm'")
 		}
 		if m := a.HTTP.Method; m != "" && !slices.Contains([]string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}, strings.ToUpper(m)) {
 			add("unsupported HTTP method %q", m)
@@ -453,22 +499,30 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("container steps need 'container.image'")
 			break
 		}
-		if a.Run != "" || a.HTTP != nil || a.LLM != nil {
-			add("container steps cannot have 'run', 'http' or 'llm'")
-		}
 		if n := a.Container.Network; n != "" && n != "bridge" && n != "none" {
 			add("container.network must be 'bridge' or 'none'")
 		}
 		for i, arg := range a.Container.Command {
 			checkExpr(fmt.Sprintf("container.command[%d]", i), arg)
 		}
+	case TypeK8s:
+		if a.K8s == nil {
+			add("k8s steps need 'k8s.image'")
+			break
+		}
+		if err := ValidateK8s(a.K8s); err != nil {
+			add("%v", err)
+		}
+		for i, arg := range a.K8s.Command {
+			checkExpr(fmt.Sprintf("k8s.command[%d]", i), arg)
+		}
+		for i, arg := range a.K8s.Args {
+			checkExpr(fmt.Sprintf("k8s.args[%d]", i), arg)
+		}
 	case TypeLLM:
 		if a.LLM == nil || strings.TrimSpace(a.LLM.Prompt) == "" {
 			add("llm steps need 'llm.prompt'")
 			break
-		}
-		if a.Run != "" || a.HTTP != nil || a.Container != nil {
-			add("llm steps cannot have 'run', 'http' or 'container'")
 		}
 		if err := ValidateLLM(a.LLM); err != nil {
 			add("%v", err)
@@ -476,9 +530,6 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 		checkExpr("llm.prompt", a.LLM.Prompt)
 		checkExpr("llm.system", a.LLM.System)
 	case TypeApproval:
-		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Signal != nil {
-			add("approval steps run nothing: no 'run', 'http', 'container', 'llm' or 'signal'")
-		}
 		if a.Approval != nil {
 			if o := a.Approval.OnTimeout; o != "" && o != "approve" && o != "reject" {
 				add("approval.on_timeout must be approve or reject")
@@ -493,9 +544,6 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("signal steps need 'signal.name' (letters, digits, '-' or '_')")
 			break
 		}
-		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Approval != nil {
-			add("signal steps run nothing: no 'run', 'http', 'container', 'llm' or 'approval'")
-		}
 		if a.Signal.Timeout < 0 {
 			add("signal.timeout must not be negative")
 		}
@@ -504,16 +552,25 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 			add("agent steps need 'agent.prompt'")
 			break
 		}
-		if a.Run != "" || a.HTTP != nil || a.Container != nil || a.LLM != nil || a.Approval != nil || a.Signal != nil {
-			add("agent steps cannot have 'run', 'http', 'container', 'llm', 'approval' or 'signal'")
-		}
 		if err := validateAgent(a.Agent); err != nil {
 			add("%v", err)
 		}
 		checkExpr("agent.prompt", a.Agent.Prompt)
 		checkExpr("agent.system", a.Agent.System)
 	default:
-		add("unknown type %q (want shell, http, container, llm, approval, signal or agent)", a.Type)
+		add("unknown type %q (want shell, http, container, k8s, llm, approval, signal or agent)", a.Type)
+	}
+	// Each type has its own settings, and only those.
+	if own, ok := typeSettings[a.typ()]; ok {
+		var others []string
+		for _, key := range a.settings() {
+			if key != own {
+				others = append(others, "'"+key+"'")
+			}
+		}
+		if len(others) > 0 {
+			add("%s steps cannot have %s", a.typ(), strings.Join(others, ", "))
+		}
 	}
 
 	for k, v := range a.Env {
@@ -523,6 +580,27 @@ func (d *Definition) validateAction(a Action, where string, visibleSteps map[str
 		checkExpr("env."+k, v)
 	}
 	return joinErrors(errs)
+}
+
+// typeSettings names the key holding each type's settings.
+var typeSettings = map[string]string{
+	TypeShell: "run", TypeHTTP: "http", TypeContainer: "container", TypeK8s: "k8s", TypeLLM: "llm",
+	TypeApproval: "approval", TypeSignal: "signal", TypeAgent: "agent",
+}
+
+// settings lists the type-specific keys an action sets.
+func (a Action) settings() []string {
+	var keys []string
+	for key, set := range map[string]bool{
+		"run": a.Run != "", "http": a.HTTP != nil, "container": a.Container != nil, "k8s": a.K8s != nil,
+		"llm": a.LLM != nil, "approval": a.Approval != nil, "signal": a.Signal != nil, "agent": a.Agent != nil,
+	} {
+		if set {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func (a Action) typ() string {

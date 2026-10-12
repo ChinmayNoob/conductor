@@ -42,6 +42,7 @@ const (
 	LabelShell     = "type.shell"
 	LabelHTTP      = "type.http"
 	LabelContainer = "type.container"
+	LabelK8s       = "type.k8s"
 )
 
 type Server struct {
@@ -54,6 +55,7 @@ type Server struct {
 	maxOutput   int
 	env         []string     // base environment for tasks
 	docker      *docker      // nil if containers aren't available
+	kube        *kube        // nil if Kubernetes tasks aren't enabled
 	llm         llm.Provider // nil if no language model is configured
 	llmPrices   llm.Prices
 	coordinator grpcapi.CoordinatorServiceClient
@@ -83,6 +85,8 @@ type Options struct {
 	PassEnv []string
 	// DockerSocket enables the container executor if the daemon answers.
 	DockerSocket string
+	// Kube enables Kubernetes tasks, if the worker runs in a cluster.
+	Kube *KubeOptions
 	// LLM enables llm tasks; nil disables them. Prices turn token usage
 	// into cost.
 	LLM         llm.Provider
@@ -123,6 +127,18 @@ func NewServer(opts Options) *Server {
 		} else {
 			s.docker = d
 			s.labels[LabelContainer] = "true"
+		}
+	}
+	if opts.Kube != nil {
+		if k, err := inClusterKube(*opts.Kube); err != nil {
+			s.log.Warn("Kubernetes tasks disabled", "error", err)
+		} else {
+			s.kube = k
+			s.labels[LabelK8s] = "true"
+			// Nothing runs here yet, so any pod this worker's pod
+			// started is from before a restart.
+			k.deleteOwnLeftovers(context.Background())
+			s.log.Info("Kubernetes tasks enabled", "namespace", k.namespace, "service_account", k.opts.ServiceAccount)
 		}
 	}
 	return s
@@ -170,6 +186,8 @@ func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*
 		return reject("task is already running here")
 	case req.Type == "container" && s.docker == nil:
 		return reject("container tasks are not available on this worker")
+	case req.Type == "k8s" && s.kube == nil:
+		return reject("k8s tasks are not available on this worker")
 	case req.Type == "llm" && s.llm == nil:
 		return reject("llm tasks are not available on this worker: no language model is configured")
 	}
@@ -265,6 +283,8 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 		res.output, res.outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
 	case "container":
 		res.output, err = s.docker.run(ctx, task.TaskId, task.SpecJson, taskEnv(nil, env), timeout, s.maxOutput)
+	case "k8s":
+		res.output, res.outputs, err = s.kube.run(ctx, task.TaskId, task.Attempt, task.SpecJson, env, timeout, s.outputOf(task.TaskId))
 	case "llm":
 		res, err = s.runLLM(ctx, task.SpecJson, timeout)
 	default:
@@ -315,8 +335,12 @@ func (s *Server) report(ctx context.Context, req *grpcapi.UpdateTaskStatusReques
 	}
 }
 
-// RunHeartbeats sends heartbeats until ctx is cancelled.
+// RunHeartbeats sends heartbeats, and does other periodic housekeeping,
+// until ctx is cancelled.
 func (s *Server) RunHeartbeats(ctx context.Context) {
+	if s.kube != nil {
+		go s.kube.sweepOrphans(ctx, k8sOrphanAge)
+	}
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 

@@ -191,6 +191,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		MaxOutput:    cfg.MaxOutputBytes,
 		PassEnv:      cfg.Worker.PassEnv,
 		DockerSocket: cfg.Worker.DockerSocket,
+		Kube:         kubeOptions(cfg.Worker.K8s),
 		LLM:          provider,
 		LLMPrices:    prices,
 		Coordinator:  coord,
@@ -355,6 +356,17 @@ func gracefulStop(s *grpc.Server, timeout time.Duration) {
 	case <-done:
 	case <-time.After(timeout):
 		s.Stop()
+	}
+}
+
+// kubeOptions returns the Kubernetes task settings, or nil when they're off.
+func kubeOptions(c config.K8s) *worker.KubeOptions {
+	if !c.Enabled {
+		return nil
+	}
+	return &worker.KubeOptions{
+		Namespace: c.Namespace, ServiceAccount: c.ServiceAccount, ServiceAccounts: c.ServiceAccounts,
+		PodName: c.PodName, PodUID: c.PodUID,
 	}
 }
 

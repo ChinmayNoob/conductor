@@ -107,6 +107,18 @@ steps: [{name: a, run: a}, {name: a, run: b}]`, "duplicate step"},
 		"no steps": {`
 name: x
 steps: []`, "at least one step"},
+		"settings of another type": {`
+name: x
+steps: [{name: a, run: echo, http: {url: "http://x"}}]`, "shell steps cannot have 'http'"},
+		"k8s without image": {`
+name: x
+steps: [{name: a, type: k8s, k8s: {command: [date]}}]`, "k8s.image is required"},
+		"k8s with a bad quantity": {`
+name: x
+steps: [{name: a, type: k8s, k8s: {image: alpine, memory: lots}}]`, "not a Kubernetes quantity"},
+		"k8s with run": {`
+name: x
+steps: [{name: a, type: k8s, run: date, k8s: {image: alpine}}]`, "k8s steps cannot have 'run'"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -269,5 +281,39 @@ steps:
 		if _, err := Parse([]byte(yaml)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%q) = %v, want an error mentioning %q", yaml, err, want)
 		}
+	}
+}
+
+func TestK8sStepResolvesExpressions(t *testing.T) {
+	d, err := Parse([]byte(`
+name: x
+inputs:
+  report: {required: true}
+steps:
+  - name: build
+    type: k8s
+    k8s:
+      image: alpine:3.20
+      command: [sh, -c]
+      args: ['echo "$1"', '${{ inputs.report }}']
+      cpu: 250m
+      memory: 64Mi
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := d.StepTask("build", Context{Inputs: map[string]string{"report": "q3; rm -rf /"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Type != TypeK8s || spec.K8s == nil || spec.K8s.Args[1] != "q3; rm -rf /" || spec.K8s.CPU != "250m" {
+		t.Fatalf("spec = %+v, k8s = %+v", spec, spec.K8s)
+	}
+	// The definition itself is untouched.
+	if d.Steps[0].K8s.Args[1] != "${{ inputs.report }}" {
+		t.Fatalf("resolving changed the definition: %v", d.Steps[0].K8s.Args)
+	}
+	if spec.Command != `alpine:3.20 sh -c echo "$1" q3; rm -rf /` {
+		t.Fatalf("summary = %q", spec.Command)
 	}
 }

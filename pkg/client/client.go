@@ -612,6 +612,14 @@ func (c *Client) CreateSchedule(ctx context.Context, req ScheduleRequest) (*Sche
 	return &s, err
 }
 
+// PutSchedule creates the schedule named in req or replaces its settings,
+// keeping its run history. created reports which happened.
+func (c *Client) PutSchedule(ctx context.Context, req ScheduleRequest) (s *Schedule, created bool, err error) {
+	s = &Schedule{}
+	code, err := c.do(ctx, http.MethodPut, "/v1/schedules/"+url.PathEscape(req.Name), req, s)
+	return s, code == http.StatusCreated, err
+}
+
 func (c *Client) ListSchedules(ctx context.Context) ([]Schedule, error) {
 	var list []Schedule
 	_, err := c.do(ctx, http.MethodGet, "/v1/schedules", nil, &list)

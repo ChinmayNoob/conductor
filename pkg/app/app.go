@@ -63,6 +63,8 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		PriorityAging: cfg.PriorityAging,
 	})
 	prometheus.MustRegister(srv.Collector())
+	// Standbys are ready too: they redirect callers to the leader.
+	metrics.AddReadyCheck("database", database.Ping)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	// Standbys turn every call away, pointing at the leader.
 	grpcServer := grpc.NewServer(append(serverOpts, grpc.ChainUnaryInterceptor(srv.LeaderOnly))...)
@@ -122,6 +124,7 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 
 	srv := api.NewServer(database, coord, cfg.MaxRequestBytes)
 	srv.SetAssistant(assistant)
+	metrics.AddReadyCheck("database", database.Ping)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	httpServer := &http.Server{
 		Addr:              cfg.APIListen,
@@ -171,7 +174,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	}
 	id := cfg.Worker.ID
 	if id == 0 {
-		id = worker.ID(address)
+		hostname, _ := os.Hostname()
+		id = worker.ID(hostname, address)
 	}
 	slog.SetDefault(slog.Default().With("worker_id", id))
 
@@ -192,6 +196,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		Coordinator:  coord,
 	})
 	prometheus.MustRegister(w.Collector())
+	metrics.AddReadyCheck("coordinator", w.Ready)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterWorkerServiceServer(grpcServer, w)

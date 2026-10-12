@@ -91,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	authed("POST /v1/schedules", s.handleCreateSchedule)
 	authed("GET /v1/schedules", s.handleListSchedules)
 	authed("GET /v1/schedules/{name}", s.handleGetSchedule)
+	authed("PUT /v1/schedules/{name}", s.handlePutSchedule)
 	authed("DELETE /v1/schedules/{name}", s.handleDeleteSchedule)
 	authed("POST /v1/schedules/{name}/pause", s.handlePauseSchedule)
 	authed("POST /v1/schedules/{name}/resume", s.handleResumeSchedule)

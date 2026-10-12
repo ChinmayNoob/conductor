@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -634,6 +635,52 @@ func TestSchedules(t *testing.T) {
 	}
 }
 
+func TestPutSchedule(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	put := func(s Schedule) (*Schedule, bool) {
+		t.Helper()
+		s.Namespace, s.Name, s.Timezone, s.MisfirePolicy = "default", "nightly", "UTC", "skip"
+		if s.Target == nil {
+			s.Target = json.RawMessage(`{"task": {"command": "echo"}}`)
+		}
+		out, created, err := db.PutSchedule(ctx, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out, created
+	}
+	first := time.Now().Add(time.Hour).Truncate(time.Second)
+
+	s, created := put(Schedule{Cron: "0 3 * * *", Enabled: true, NextRunAt: first})
+	if !created || !s.NextRunAt.Equal(first) {
+		t.Fatalf("first put: created=%v next=%v", created, s.NextRunAt)
+	}
+	id := uuid.New()
+	if err := db.RecordScheduleRun(ctx, s.ID, first, true, &id, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same timing, new target: the pending run and the history stay.
+	s, created = put(Schedule{Cron: "0 3 * * *", Enabled: true, NextRunAt: first.Add(time.Hour),
+		Target: json.RawMessage(`{"task": {"command": "date"}}`)})
+	if created || !s.NextRunAt.Equal(first) || s.LastRunID == nil || *s.LastRunID != id ||
+		!strings.Contains(string(s.Target), "date") {
+		t.Fatalf("update keeping the timing: created=%v %+v", created, s)
+	}
+	// New timing: the next run moves.
+	if s, _ = put(Schedule{Cron: "0 4 * * *", Enabled: true, NextRunAt: first.Add(time.Hour)}); !s.NextRunAt.Equal(first.Add(time.Hour)) {
+		t.Fatalf("cron change kept next run %v", s.NextRunAt)
+	}
+	// Pausing keeps it; resuming starts from the given time.
+	if s, _ = put(Schedule{Cron: "0 4 * * *", Enabled: false, NextRunAt: first}); s.Enabled || !s.NextRunAt.Equal(first.Add(time.Hour)) {
+		t.Fatalf("pause: %+v", s)
+	}
+	if s, _ = put(Schedule{Cron: "0 4 * * *", Enabled: true, NextRunAt: first.Add(2 * time.Hour)}); !s.Enabled || !s.NextRunAt.Equal(first.Add(2*time.Hour)) {
+		t.Fatalf("resume: %+v", s)
+	}
+}
+
 func TestAPIKeys(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
@@ -892,5 +939,58 @@ func TestExplanations(t *testing.T) {
 	}
 	if got := must[*Explanation](t)(db.GetExplanation(ctx, optedOut.ID)); got != nil {
 		t.Fatalf("explanation for an unexplained task: %+v", got)
+	}
+}
+
+func TestSlotDemand(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	demand := func(labels string) int64 {
+		t.Helper()
+		var n int64
+		if err := db.q.QueryRowContext(ctx, `SELECT conductor_slot_demand($1::jsonb)`, labels).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	burst := `{"type.shell": "true", "pool": "burst"}`
+	if n := demand(burst); n != 0 {
+		t.Fatalf("empty database: demand %d", n)
+	}
+
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "held", Paused: true}))
+	for _, w := range []WorkerRecord{
+		{ID: 7, Address: "10.0.0.7:9000", Labels: StringMap{"type.shell": "true", "pool": "burst"}, Slots: 2, Status: "healthy"},
+		{ID: 8, Address: "10.0.0.8:9000", Labels: StringMap{"type.shell": "true"}, Slots: 2, Status: "healthy"},
+	} {
+		if err := db.UpsertWorker(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two tasks start: one on a burst worker, one elsewhere.
+	for _, worker := range []int64{7, 8} {
+		task := create(t, db, "running")
+		pick(t, db)
+		must[bool](t)(db.MarkTaskStarted(ctx, task.ID, att(t, db, task.ID), worker))
+	}
+	create(t, db, "ready")
+	create(t, db, "ready too")
+	create(t, db, "later", func(n *NewTask) { n.ScheduledAt = time.Now().Add(time.Hour) })
+	create(t, db, "held", func(n *NewTask) { n.Queue = "held" })
+	create(t, db, "needs a gpu", func(n *NewTask) { n.Requirements["gpu"] = "true" })
+
+	// Burst workers could take the 2 ready tasks, and run 1.
+	if n := demand(burst); n != 3 {
+		t.Errorf("burst pool demand = %d, want 3", n)
+	}
+	// Any shell worker could take the same 2, and the pool runs both.
+	if n := demand(`{"type.shell": "true"}`); n != 4 {
+		t.Errorf("shell pool demand = %d, want 4", n)
+	}
+	if n := demand(`{"type.shell": "true", "gpu": "true"}`); n != 3 {
+		t.Errorf("gpu pool demand = %d, want 3 (2 ready, 1 gpu)", n)
+	}
+	if n := demand(`{"type.http": "true"}`); n != 0 {
+		t.Errorf("http-only pool demand = %d, want 0", n)
 	}
 }

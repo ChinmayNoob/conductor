@@ -67,7 +67,9 @@ type Server struct {
 	mu       sync.Mutex
 	running  map[string]*runningTask
 	draining bool
-	wg       sync.WaitGroup
+	// lastHeartbeat is when a coordinator last acknowledged a heartbeat.
+	lastHeartbeat time.Time
+	wg            sync.WaitGroup
 }
 
 type Options struct {
@@ -129,11 +131,13 @@ func NewServer(opts Options) *Server {
 // Labels returns the labels the worker advertises.
 func (s *Server) Labels() map[string]string { return maps.Clone(s.labels) }
 
-// ID derives a stable worker ID from the advertised address, so replicas of
-// the same service get distinct IDs without configuration.
-func ID(address string) uint32 {
+// ID derives a worker ID from the host name and advertised address, so
+// replicas of the same service get distinct IDs without configuration. The
+// host name matters on Kubernetes, which reuses pod IPs: a new pod must not
+// inherit a dead pod's identity (and with it, the tasks it was running).
+func ID(hostname, address string) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(address))
+	h.Write([]byte(hostname + "/" + address))
 	return max(h.Sum32(), 1)
 }
 
@@ -385,7 +389,27 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 	})
 	if err != nil {
 		s.log.Warn("Heartbeat failed", "error", err)
+		return
 	}
+	s.mu.Lock()
+	s.lastHeartbeat = time.Now()
+	s.mu.Unlock()
+}
+
+// Ready reports whether the worker can take tasks: it is not draining, and a
+// coordinator acknowledged one of its last two heartbeats.
+func (s *Server) Ready(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.draining:
+		return errors.New("draining")
+	case s.lastHeartbeat.IsZero():
+		return errors.New("not registered with a coordinator yet")
+	case time.Since(s.lastHeartbeat) > 2*heartbeatInterval+5*time.Second:
+		return fmt.Errorf("no heartbeat acknowledged for %v", time.Since(s.lastHeartbeat).Round(time.Second))
+	}
+	return nil
 }
 
 // Drain stops accepting tasks and waits for running ones to finish. If ctx

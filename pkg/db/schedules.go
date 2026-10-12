@@ -54,6 +54,34 @@ func (db *DB) CreateSchedule(ctx context.Context, s Schedule) (*Schedule, error)
 	return out, nil
 }
 
+// PutSchedule creates a schedule or replaces an existing one's settings,
+// keeping its run history. The pending run stays unless the cron expression
+// or time zone changed or the schedule is being resumed; then s.NextRunAt
+// replaces it.
+func (db *DB) PutSchedule(ctx context.Context, s Schedule) (out *Schedule, created bool, err error) {
+	row := db.q.QueryRowContext(ctx,
+		`INSERT INTO schedules AS cur (namespace, name, cron, timezone, misfire_policy, target, enabled, next_run_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT (namespace, name) DO UPDATE SET
+		     cron = EXCLUDED.cron, timezone = EXCLUDED.timezone, misfire_policy = EXCLUDED.misfire_policy,
+		     target = EXCLUDED.target, enabled = EXCLUDED.enabled,
+		     next_run_at = CASE
+		         WHEN cur.cron <> EXCLUDED.cron OR cur.timezone <> EXCLUDED.timezone
+		              OR (EXCLUDED.enabled AND NOT cur.enabled)
+		         THEN EXCLUDED.next_run_at ELSE cur.next_run_at END
+		 RETURNING `+scheduleColumns+`, xmax = 0`,
+		s.Namespace, s.Name, s.Cron, s.Timezone, s.MisfirePolicy, []byte(s.Target), s.Enabled, s.NextRunAt)
+	out = &Schedule{}
+	var lastErr sql.NullString
+	err = row.Scan(&out.ID, &out.Namespace, &out.Name, &out.Cron, &out.Timezone, &out.MisfirePolicy, &out.Target,
+		&out.Enabled, &out.NextRunAt, &out.LastRunAt, &out.LastRunID, &lastErr, &out.CreatedAt, &created)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to save schedule: %w", err)
+	}
+	out.LastError = lastErr.String
+	return out, created, nil
+}
+
 // GetSchedule returns a schedule by name, or nil if it doesn't exist.
 func (db *DB) GetSchedule(ctx context.Context, namespace, name string) (*Schedule, error) {
 	s, err := scanSchedule(db.q.QueryRowContext(ctx,

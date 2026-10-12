@@ -419,13 +419,14 @@ func TestKubeServiceAccounts(t *testing.T) {
 
 func TestKubeLeftovers(t *testing.T) {
 	f, k := newFakeKube(t, nil)
-	add := func(name, worker string, change func(p *pod)) {
+	add := func(name, worker string, change func(p *pod)) *pod {
 		p := &pod{}
 		p.Metadata.Name = name
 		p.Metadata.CreationTimestamp = time.Now()
-		p.Metadata.Labels = map[string]string{k8sLabelManagedBy: "conductor", k8sLabelWorker: worker}
+		p.Metadata.Labels = map[string]string{k8sLabelManagedBy: "conductor", k8sLabelInstance: "conductor", k8sLabelWorker: worker}
 		change(p)
 		f.pods[name] = p
+		return p
 	}
 	add("mine-running", "worker-abc", running)
 	add("theirs-running", "worker-xyz", running)
@@ -434,11 +435,14 @@ func TestKubeLeftovers(t *testing.T) {
 		exited(1, "Error", "")(p)
 		p.Status.ContainerStatuses[0].State.Terminated.FinishedAt = time.Now().Add(-time.Hour)
 	})
+	// Another installation's pod with this worker's name: not ours to touch.
+	add("other-release", "worker-abc", running).Metadata.Labels[k8sLabelInstance] = "staging"
 
 	k.deleteOwnLeftovers(context.Background())
 	if len(f.deleted) != 1 || f.deleted[0] != "mine-running" {
 		t.Fatalf("deleted %v, want only this worker's leftover", f.deleted)
 	}
+	delete(f.pods, "other-release")
 
 	var orphans []string
 	for name, p := range f.pods {
@@ -458,5 +462,64 @@ func TestLabelValue(t *testing.T) {
 	long := strings.Repeat("a", 70)
 	if got := labelValue(long); got == long || !labelValueRe.MatchString(got) {
 		t.Errorf("labelValue(70 chars) = %q", got)
+	}
+}
+
+// Kubernetes expands $(VAR) in command, args and env values; tasks must get
+// their strings as written, or an input like "$(API_TOKEN)" reads a variable.
+func TestKubePodGetsStringsVerbatim(t *testing.T) {
+	f, k := newFakeKube(t, lifecycle("", exited(0, "Completed", "")))
+	_, _, err := k.run(context.Background(), "task-1", 1,
+		[]byte(`{"image": "alpine", "command": ["sh", "-c", "echo $$"], "args": ["$(API_TOKEN)"]}`),
+		map[string]string{"INPUT_X": "$(API_TOKEN) costs $5"}, time.Minute, newCappedBuffer(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := f.manifests[0]["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
+	if got := c["command"].([]any)[2]; got != "echo $$$$" {
+		t.Errorf("command = %q, want each $ escaped", got)
+	}
+	if got := c["args"].([]any)[0]; got != "$$(API_TOKEN)" {
+		t.Errorf("args = %q, want the reference escaped", got)
+	}
+	for _, e := range c["env"].([]any) {
+		if e := e.(map[string]any); e["name"] == "INPUT_X" && e["value"] != "$$(API_TOKEN) costs $$5" {
+			t.Errorf("env INPUT_X = %q", e["value"])
+		}
+	}
+}
+
+// The create call failed, but the pod may exist: it must not run on.
+func TestKubeCreateFailureCleansUp(t *testing.T) {
+	f, k := newFakeKube(t, nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// Created, but the answer is lost.
+			f.ServeHTTP(httptest.NewRecorder(), r)
+			http.Error(w, `{"message": "etcdserver: request timed out"}`, http.StatusInternalServerError)
+			return
+		}
+		f.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	k.api, k.http = srv.URL, srv.Client()
+
+	_, _, err := k.run(context.Background(), "task-1", 3, []byte(`{"image": "alpine"}`), nil, time.Minute, newCappedBuffer(1024))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if len(f.deleted) != 1 || len(f.pods) != 0 {
+		t.Fatalf("deleted %v, pods left %d: the attempt's pod was not cleaned up", f.deleted, len(f.pods))
+	}
+}
+
+// The kubelet cuts termination messages at 4 KB; a cut output must fail
+// the task, not reach the next step truncated.
+func TestKubeOutputsTooLarge(t *testing.T) {
+	cut := "k=" + strings.Repeat("x", k8sMaxOutputs-2)
+	_, k := newFakeKube(t, lifecycle("", exited(0, "Completed", cut)))
+	_, outputs, err := runKube(t, k, `{"image": "alpine"}`, time.Minute)
+	if _, permanent := retryAdvice(err); err == nil || !permanent || !strings.Contains(err.Error(), "exceeds") || outputs != nil {
+		t.Fatalf("outputs %v, err %v (permanent %v): want a permanent failure", len(outputs), err, permanent)
 	}
 }

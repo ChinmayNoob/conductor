@@ -37,7 +37,7 @@ func (r *ScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, req.NamespacedName, &sch); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	ns := r.namespace(sch.Spec.ConductorNamespace)
+	ns := r.namespace(&sch, sch.Spec.ConductorNamespace)
 
 	if !sch.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(&sch, scheduleFinalizer) {
@@ -118,13 +118,6 @@ func (r *ScheduleReconciler) apply(ctx context.Context, sch *v1alpha1.Schedule, 
 		if err != nil {
 			return err
 		}
-		// Conductor refuses schedules of unknown workflows; its Workflow
-		// resource may simply not be applied yet.
-		if _, err := r.client(ns).GetDefinition(ctx, w.Name, w.Version); conductor.IsNotFound(err) {
-			return &waitingError{fmt.Sprintf("workflow %q", w.Name)}
-		} else if err != nil {
-			return err
-		}
 		req.Workflow = &conductor.ScheduledWorkflow{Name: w.Name, Version: w.Version}
 		if input != nil {
 			req.Workflow.Input = input
@@ -140,7 +133,17 @@ func (r *ScheduleReconciler) apply(ctx context.Context, sch *v1alpha1.Schedule, 
 		}
 	}
 
+	if err := r.ensureNamespace(ctx, ns); err != nil {
+		return err
+	}
 	s, created, err := r.client(ns).PutSchedule(ctx, req)
+	if rejected(err) && req.Workflow != nil {
+		// Conductor refuses schedules of unknown workflows; its Workflow
+		// resource may simply not be applied yet.
+		if _, derr := r.client(ns).GetDefinition(ctx, req.Workflow.Name, req.Workflow.Version); conductor.IsNotFound(derr) {
+			return &waitingError{fmt.Sprintf("workflow %q", req.Workflow.Name)}
+		}
+	}
 	if err != nil {
 		return err
 	}

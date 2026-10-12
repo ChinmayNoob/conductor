@@ -287,6 +287,11 @@ true
 {{- .Values.kubernetesTasks.namespace | default .Release.Namespace }}
 {{- end }}
 
+{{/* A pool is dedicated when dedicated is true (or the string "true"). */}}
+{{- define "conductor.poolDedicated" -}}
+{{- if eq (toString .dedicated) "true" }}true{{ end }}
+{{- end }}
+
 {{- define "conductor.anyPoolAutoscales" -}}
 {{- range $name, $p := include "conductor.workerPools" . | fromYaml }}{{ if $p.autoscaling.enabled }}true{{ end }}{{ end }}
 {{- end }}

@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -99,7 +100,7 @@ func (composePlatform) kill(t *testing.T, id string) {
 
 func (composePlatform) stop(t *testing.T, id string, grace time.Duration) {
 	t.Helper()
-	docker(t, "stop", "-t", strings.TrimSuffix(grace.Round(time.Second).String(), "s"), id)
+	docker(t, "stop", "-t", strconv.Itoa(int(grace.Seconds())), id)
 }
 
 func (composePlatform) restoreLater(t *testing.T, id string) {
@@ -181,7 +182,7 @@ func (k kubePlatform) kill(t *testing.T, pod string) {
 
 func (k kubePlatform) stop(t *testing.T, pod string, grace time.Duration) {
 	t.Helper()
-	k.kubectl(t, "delete", "pod", pod, "--grace-period="+strings.TrimSuffix(grace.Round(time.Second).String(), "s"))
+	k.kubectl(t, "delete", "pod", pod, "--grace-period="+strconv.Itoa(int(grace.Seconds())))
 }
 
 // restoreLater waits for every Deployment to be back at full strength:

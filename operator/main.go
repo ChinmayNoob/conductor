@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/operator/api/v1alpha1"
@@ -29,13 +30,14 @@ import (
 func main() {
 	var (
 		url              = flag.String("conductor-url", envOr("CONDUCTOR_URL", "http://localhost:8081"), "Conductor API base URL")
-		defaultNamespace = flag.String("default-namespace", envOr("CONDUCTOR_NAMESPACE", "default"), "Conductor namespace for resources that name none")
-		watch            = flag.String("watch-namespaces", os.Getenv("WATCH_NAMESPACES"), "Kubernetes namespaces to watch, comma separated; empty watches all")
-		poll             = flag.Duration("poll-interval", 5*time.Second, "how often unfinished WorkflowRuns are checked")
-		resync           = flag.Duration("resync", 5*time.Minute, "how often Workflows and Schedules are re-applied and their status refreshed")
-		metricsAddr      = flag.String("metrics-bind-address", ":8080", "metrics endpoint; 0 disables it")
-		probeAddr        = flag.String("health-probe-bind-address", ":8081", "health and readiness probes")
-		leaderElect      = flag.Bool("leader-elect", false, "elect a leader, so several replicas can run")
+		defaultNamespace = flag.String("default-namespace", os.Getenv("CONDUCTOR_NAMESPACE"),
+			"Conductor namespace for resources that name none; empty means the one named after each resource's Kubernetes namespace (created if missing)")
+		watch       = flag.String("watch-namespaces", os.Getenv("WATCH_NAMESPACES"), "Kubernetes namespaces to watch, comma separated; empty watches all")
+		poll        = flag.Duration("poll-interval", 5*time.Second, "how often unfinished WorkflowRuns are checked")
+		resync      = flag.Duration("resync", 5*time.Minute, "how often Workflows and Schedules are re-applied and their status refreshed")
+		metricsAddr = flag.String("metrics-bind-address", ":8080", "metrics endpoint; 0 disables it")
+		probeAddr   = flag.String("health-probe-bind-address", ":8081", "health and readiness probes")
+		leaderElect = flag.Bool("leader-elect", false, "elect a leader, so several replicas can run")
 	)
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
@@ -79,6 +81,7 @@ func main() {
 	c := controller.Options{
 		Conductor:        conductor.New(*url, apiKey),
 		DefaultNamespace: *defaultNamespace,
+		Known:            &sync.Map{},
 		PollInterval:     *poll,
 		Resync:           *resync,
 	}

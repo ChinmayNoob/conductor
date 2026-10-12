@@ -45,7 +45,8 @@ func (k kubePlatform) waitFor(t *testing.T, resource, jsonpath, want string, wit
 // schedule follows the resource through a change and its deletion.
 func TestOperatorManagesWorkflowsRunsAndSchedules(t *testing.T) {
 	k := kube(t)
-	c := newClient(t)
+	// Resources land in the Conductor namespace named after their own.
+	c := newClient(t).WithNamespace(k.namespace)
 	name := uniqueName("gitops")
 	t.Cleanup(func() {
 		_, _ = k.try("delete", "workflowrun,schedule,workflow", "-l", "e2e="+name, "--wait=false")

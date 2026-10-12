@@ -154,9 +154,6 @@ func NewServer(opts Options) *Server {
 		} else {
 			s.kube = k
 			s.labels[LabelK8s] = "true"
-			// Nothing runs here yet, so any pod this worker's pod
-			// started is from before a restart.
-			k.deleteOwnLeftovers(context.Background())
 			s.log.Info("Kubernetes tasks enabled", "namespace", k.namespace, "service_account", k.opts.ServiceAccount)
 		}
 	}
@@ -355,6 +352,9 @@ func (s *Server) report(ctx context.Context, req *grpcapi.UpdateTaskStatusReques
 // until ctx is cancelled.
 func (s *Server) RunHeartbeats(ctx context.Context) {
 	if s.kube != nil {
+		// Before the first heartbeat, nothing can have been dispatched
+		// here: any pod this worker's pod started is from before a restart.
+		s.kube.deleteOwnLeftovers(ctx)
 		go s.kube.sweepOrphans(ctx, k8sOrphanAge)
 	}
 	ticker := time.NewTicker(heartbeatInterval)

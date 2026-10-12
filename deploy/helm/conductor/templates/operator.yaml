@@ -141,7 +141,9 @@ spec:
           imagePullPolicy: {{ $op.image.pullPolicy }}
           args:
             - --leader-elect
-            - --default-namespace={{ $op.defaultNamespace }}
+            {{- with $op.defaultNamespace }}
+            - --default-namespace={{ . }}
+            {{- end }}
             {{- with $op.watchNamespaces }}
             - --watch-namespaces={{ join "," . }}
             {{- end }}

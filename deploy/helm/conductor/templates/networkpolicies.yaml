@@ -37,6 +37,9 @@ spec:
       {{- with .Values.networkPolicy.apiFrom }}
       from:
         {{- toYaml . | nindent 8 }}
+        # The chart's own callers: the operator and helm test.
+        {{- include "conductor.np.from" (list $ "operator") | nindent 8 }}
+        {{- include "conductor.np.from" (list $ "test") | nindent 8 }}
       {{- end }}
     {{- include "conductor.np.metrics" . | nindent 4 }}
 ---

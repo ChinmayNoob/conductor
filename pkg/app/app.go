@@ -368,7 +368,7 @@ func kubeOptions(c config.K8s) *worker.KubeOptions {
 	}
 	return &worker.KubeOptions{
 		Namespace: c.Namespace, ServiceAccount: c.ServiceAccount, ServiceAccounts: c.ServiceAccounts,
-		PodName: c.PodName, PodUID: c.PodUID,
+		PodName: c.PodName, PodUID: c.PodUID, Instance: c.Instance,
 	}
 }
 

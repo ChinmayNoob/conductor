@@ -20,8 +20,13 @@ The chart installs it with `operator.enabled=true`, along with the CRDs
 helm upgrade --install conductor deploy/helm/conductor --set operator.enabled=true
 ```
 
-It uses the chart's bootstrap admin key, so resources may name any Conductor
-namespace (`spec.conductorNamespace`; default `operator.defaultNamespace`).
+Each resource goes to the Conductor namespace named after its Kubernetes
+namespace, which the operator creates if it doesn't exist: resources in
+`team-a` land in Conductor's `team-a`, so same-named resources in two
+Kubernetes namespaces never collide. `spec.conductorNamespace` picks another,
+and `operator.defaultNamespace` sends every resource that names none to one
+namespace (then keep names unique across Kubernetes namespaces). It uses the
+chart's bootstrap admin key, which can create namespaces and act in any.
 
 ## Example
 
@@ -90,6 +95,7 @@ make e2e-k8s             # the whole suite on kind, operator included
 ```
 
 Flags: `--conductor-url` (`CONDUCTOR_URL`), `--default-namespace`
-(`CONDUCTOR_NAMESPACE`), `--watch-namespaces`, `--poll-interval` (runs,
+(`CONDUCTOR_NAMESPACE`; empty maps each Kubernetes namespace to its own),
+`--watch-namespaces`, `--poll-interval` (runs,
 default 5s), `--resync` (re-apply Workflows and Schedules, default 5m),
 `--leader-elect`. `CONDUCTOR_API_KEY` is required.

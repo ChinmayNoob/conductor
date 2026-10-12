@@ -30,12 +30,13 @@ type fakeConductor struct {
 	runs        map[string]*conductor.Workflow
 	keys        map[string]string // idempotency key -> run ID
 	schedules   map[string]map[string]any
+	namespaces  map[string]bool
 	started     int
 }
 
 func newFakeConductor(t *testing.T) (*fakeConductor, *conductor.Client) {
 	f := &fakeConductor{definitions: map[string][]string{}, runs: map[string]*conductor.Workflow{},
-		keys: map[string]string{}, schedules: map[string]map[string]any{}}
+		keys: map[string]string{}, schedules: map[string]map[string]any{}, namespaces: map[string]bool{"default": true}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, conductor.New(srv.URL, "key")
@@ -118,11 +119,25 @@ func (f *fakeConductor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wf.Status = "CANCELLED"
 		reply(w, http.StatusOK, wf)
 
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/namespaces":
+		var n map[string]any
+		_ = json.Unmarshal(body, &n)
+		if f.namespaces[n["name"].(string)] {
+			reply(w, http.StatusConflict, map[string]string{"error": "namespace exists"})
+			return
+		}
+		f.namespaces[n["name"].(string)] = true
+		reply(w, http.StatusCreated, n)
+
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/schedules/"):
 		var s map[string]any
 		_ = json.Unmarshal(body, &s)
 		if s["cron"] == "bogus" {
 			reply(w, http.StatusBadRequest, map[string]string{"error": "invalid cron expression"})
+			return
+		}
+		if wf, ok := s["workflow"].(map[string]any); ok && len(f.definitions[ns+"/"+wf["name"].(string)]) == 0 {
+			reply(w, http.StatusBadRequest, map[string]string{"error": "no workflow definition named " + wf["name"].(string)})
 			return
 		}
 		key := ns + "/" + strings.TrimPrefix(r.URL.Path, "/v1/schedules/")
@@ -330,14 +345,47 @@ func TestWorkflowRunWithBadInputFails(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "report-3", Namespace: "apps", UID: "uid-3", Generation: 1},
 		Spec:       v1alpha1.WorkflowRunSpec{Workflow: "x", Input: &runtime.RawExtension{Raw: []byte(`["not", "an", "object"]`)}},
 	}
-	_, kc, opts := setup(t, run)
-	if _, err := reconcile(t, &WorkflowRunReconciler{Client: kc, Options: opts}, "report-3"); err != nil {
+	f, kc, opts := setup(t, run)
+	r := &WorkflowRunReconciler{Client: kc, Options: opts}
+	if _, err := reconcile(t, r, "report-3"); err != nil {
 		t.Fatal(err)
 	}
 	var got v1alpha1.WorkflowRun
 	_ = kc.Get(context.Background(), client.ObjectKeyFromObject(run), &got)
 	if got.Status.Phase != "FAILED" || !strings.Contains(got.Status.Error, "input must be an object") {
 		t.Fatalf("status = %+v", got.Status)
+	}
+
+	// Failed for good: later reconciles (an operator restart) start nothing.
+	f.definitions["default/x"] = []string{"{}"}
+	if _, err := reconcile(t, r, "report-3"); err != nil {
+		t.Fatal(err)
+	}
+	if f.started != 0 {
+		t.Fatalf("a failed WorkflowRun started %d runs", f.started)
+	}
+}
+
+// With no default, resources map to the Conductor namespace named after
+// their Kubernetes namespace (created on demand), so same-named resources in
+// two Kubernetes namespaces stay apart.
+func TestResourcesMapToTheirKubernetesNamespace(t *testing.T) {
+	def := raw(`{"steps": [{"name": "s", "run": "true"}]}`)
+	a := &v1alpha1.Workflow{ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "team-a", Generation: 1}, Spec: v1alpha1.WorkflowSpec{Definition: def}}
+	b := &v1alpha1.Workflow{ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "team-b", Generation: 1}, Spec: v1alpha1.WorkflowSpec{Definition: def}}
+	f, kc, opts := setup(t, a, b)
+	opts.DefaultNamespace, opts.Known = "", &sync.Map{}
+	r := &WorkflowReconciler{Client: kc, Options: opts}
+	for _, ns := range []string{"team-a", "team-b"} {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: "nightly"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !f.namespaces["team-a"] || !f.namespaces["team-b"] {
+		t.Fatalf("namespaces = %v, want both created", f.namespaces)
+	}
+	if len(f.definitions["team-a/nightly"]) != 1 || len(f.definitions["team-b/nightly"]) != 1 || len(f.definitions["default/nightly"]) != 0 {
+		t.Fatalf("definitions = %v", f.definitions)
 	}
 }
 

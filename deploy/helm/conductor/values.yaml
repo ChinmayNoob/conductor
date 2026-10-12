@@ -267,8 +267,11 @@ operator:
     pullPolicy: IfNotPresent
   # Install the CustomResourceDefinitions (kept on uninstall).
   installCRDs: true
-  # The Conductor namespace resources go to when they don't say.
-  defaultNamespace: default
+  # The Conductor namespace for resources that don't name one. Empty: the
+  # one named after each resource's Kubernetes namespace (created if
+  # missing), so same-named resources in two Kubernetes namespaces never
+  # collide. Setting one sends everything there.
+  defaultNamespace: ""
   # Watch only these Kubernetes namespaces; empty means all.
   watchNamespaces: []
   replicas: 1

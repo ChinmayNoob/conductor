@@ -117,3 +117,35 @@ func TestOnlyTheK8sPoolHoldsCredentials(t *testing.T) {
 		t.Fatalf("a pool running k8s and shell tasks was accepted: %v\n%s", err, mixed)
 	}
 }
+
+func TestChartRules(t *testing.T) {
+	helm, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm is not installed")
+	}
+	// Two pools that take any task would both scale for the same tasks.
+	out, err := exec.Command(helm, "template", "t", "conductor", "--set", "worker.autoscaling.enabled=true",
+		"--set", "workerPools.highmem.autoscaling.enabled=true").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "make all but one dedicated") {
+		t.Errorf("two generic autoscaled pools were accepted: %v\n%s", err, out)
+	}
+
+	// "false" as a string is not dedicated, for the workers and KEDA alike.
+	rendered := render(t, "--set-string", "workerPools.batch.dedicated=false", "--set", "workerPools.batch.autoscaling.enabled=true")
+	if strings.Contains(rendered, "CONDUCTOR_WORKER_EXCLUSIVE") || !strings.Contains(rendered, `'{}'::jsonb`) {
+		t.Error(`dedicated: "false" made a dedicated pool`)
+	}
+
+	// Restricting the API keeps the chart's own callers in.
+	rendered = render(t, "--set", "operator.enabled=true", "--set", "networkPolicy.apiFrom[0].ipBlock.cidr=10.0.0.0/8",
+		"-s", "templates/networkpolicies.yaml")
+	want := "            cidr: 10.0.0.0/8\n" +
+		"        # The chart's own callers: the operator and helm test.\n" +
+		"        - podSelector:\n            matchLabels:\n              app.kubernetes.io/name: conductor\n" +
+		"              app.kubernetes.io/instance: t\n              app.kubernetes.io/component: operator\n" +
+		"        - podSelector:\n            matchLabels:\n              app.kubernetes.io/name: conductor\n" +
+		"              app.kubernetes.io/instance: t\n              app.kubernetes.io/component: test\n"
+	if !strings.Contains(rendered, want) {
+		t.Errorf("the API's NetworkPolicy doesn't admit the operator and helm test:\n%s", rendered)
+	}
+}

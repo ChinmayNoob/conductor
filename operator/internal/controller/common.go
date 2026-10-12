@@ -3,10 +3,12 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/ChinmayNoob/conductor/operator/api/v1alpha1"
@@ -24,8 +26,12 @@ type Options struct {
 	// namespace the resources name (an admin key).
 	Conductor *conductor.Client
 	// DefaultNamespace is the Conductor namespace for resources that don't
-	// name one.
+	// name one. Empty means the one named after each resource's Kubernetes
+	// namespace, so same-named resources in different Kubernetes namespaces
+	// never land on (and fight over) the same Conductor object.
 	DefaultNamespace string
+	// Known remembers Conductor namespaces that exist; may be nil.
+	Known *sync.Map
 	// PollInterval is how often unfinished WorkflowRuns are checked.
 	PollInterval time.Duration
 	// Resync is how often applied Workflows and Schedules are re-applied
@@ -33,14 +39,36 @@ type Options struct {
 	Resync time.Duration
 }
 
-func (o Options) namespace(spec string) string {
-	if spec != "" {
+// namespace returns the Conductor namespace for a resource.
+func (o Options) namespace(obj metav1.Object, spec string) string {
+	switch {
+	case spec != "":
 		return spec
-	}
-	if o.DefaultNamespace != "" {
+	case o.DefaultNamespace != "":
 		return o.DefaultNamespace
 	}
-	return "default"
+	return obj.GetNamespace()
+}
+
+// ensureNamespace creates a Conductor namespace unless it exists (which
+// takes an admin API key).
+func (o Options) ensureNamespace(ctx context.Context, ns string) error {
+	if ns == "default" {
+		return nil
+	}
+	if o.Known != nil {
+		if _, ok := o.Known.Load(ns); ok {
+			return nil
+		}
+	}
+	_, err := o.Conductor.CreateNamespace(ctx, conductor.Namespace{Name: ns})
+	if err != nil && conductor.StatusCode(err) != http.StatusConflict {
+		return fmt.Errorf("conductor namespace %q: %w", ns, err)
+	}
+	if o.Known != nil {
+		o.Known.Store(ns, true)
+	}
+	return nil
 }
 
 func (o Options) client(namespace string) *conductor.Client {

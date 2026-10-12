@@ -101,6 +101,8 @@ type K8s struct {
 	// The worker's own pod (from the downward API), which owns its tasks' pods.
 	PodName string
 	PodUID  string
+	// Instance names the installation, scoping task pod cleanup.
+	Instance string
 }
 
 // TLS secures gRPC between components. All components share one certificate
@@ -141,6 +143,7 @@ func Load() (*Config, error) {
 				ServiceAccounts: splitList(os.Getenv("CONDUCTOR_K8S_SERVICE_ACCOUNTS")),
 				PodName:         os.Getenv("CONDUCTOR_POD_NAME"),
 				PodUID:          os.Getenv("CONDUCTOR_POD_UID"),
+				Instance:        os.Getenv("CONDUCTOR_K8S_INSTANCE"),
 			},
 		},
 		ClusterToken: os.Getenv("CONDUCTOR_CLUSTER_TOKEN"),

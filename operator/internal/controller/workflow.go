@@ -61,7 +61,11 @@ func (r *WorkflowReconciler) apply(ctx context.Context, wf *v1alpha1.Workflow) e
 	if err != nil {
 		return fmt.Errorf("%w: %w", errInvalidSpec, err)
 	}
-	d, err := r.client(r.namespace(wf.Spec.ConductorNamespace)).ApplyDefinition(ctx, body)
+	ns := r.namespace(wf, wf.Spec.ConductorNamespace)
+	if err := r.ensureNamespace(ctx, ns); err != nil {
+		return err
+	}
+	d, err := r.client(ns).ApplyDefinition(ctx, body)
 	if err != nil {
 		return err
 	}

@@ -83,7 +83,9 @@ touches the database: it is just another API client, with the same
 validation and auth as `conductorctl`. Its own Go module keeps
 controller-runtime out of the engine's binary. A WorkflowRun starts with the
 resource's UID as the idempotency key, so a lost status update can't start a
-second run. Deleting a Workflow keeps its definition's versions, since past
+second run. Resources map to the Conductor namespace named after their
+Kubernetes namespace (created on demand), so same-named resources in two
+Kubernetes namespaces never overwrite each other. Deleting a Workflow keeps its definition's versions, since past
 runs refer to them; deleting a Schedule deletes it; deleting an unfinished
 WorkflowRun cancels it.
 

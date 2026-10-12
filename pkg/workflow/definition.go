@@ -591,15 +591,18 @@ var typeSettings = map[string]string{
 // settings lists the type-specific keys an action sets.
 func (a Action) settings() []string {
 	var keys []string
-	for key, set := range map[string]bool{
-		"run": a.Run != "", "http": a.HTTP != nil, "container": a.Container != nil, "k8s": a.K8s != nil,
-		"llm": a.LLM != nil, "approval": a.Approval != nil, "signal": a.Signal != nil, "agent": a.Agent != nil,
+	for _, s := range []struct {
+		key string
+		set bool
+	}{
+		{"agent", a.Agent != nil}, {"approval", a.Approval != nil}, {"container", a.Container != nil},
+		{"http", a.HTTP != nil}, {"k8s", a.K8s != nil}, {"llm", a.LLM != nil}, {"run", a.Run != ""},
+		{"signal", a.Signal != nil},
 	} {
-		if set {
-			keys = append(keys, key)
+		if s.set {
+			keys = append(keys, s.key)
 		}
 	}
-	slices.Sort(keys)
 	return keys
 }
 

@@ -37,6 +37,8 @@ const (
 	// container's termination message, which the kubelet keeps (up to 4 KB)
 	// after the container exits.
 	k8sOutputPath = "/dev/termination-log"
+	// The kubelet keeps at most this much of a termination message.
+	k8sMaxOutputs = 4096
 	// The task's container in its pod.
 	k8sContainer = "task"
 	// The user task pods run as unless the task says otherwise: nobody.
@@ -46,6 +48,7 @@ const (
 	k8sLabelTask      = "conductor.dev/task-id"
 	k8sLabelAttempt   = "conductor.dev/attempt"
 	k8sLabelWorker    = "conductor.dev/worker"
+	k8sLabelInstance  = "conductor.dev/instance"
 	// Finished task pods older than this are deleted by any worker's sweep.
 	// Workers delete their own pods as soon as they read the result, so
 	// these are left over from workers that died.
@@ -81,6 +84,10 @@ type KubeOptions struct {
 	// so Kubernetes deletes them if the worker's pod goes away.
 	PodName string
 	PodUID  string
+	// Instance names this Conductor installation (the Helm release), so
+	// workers clean up only their own installation's task pods when
+	// several share a namespace. Default "conductor".
+	Instance string
 }
 
 // kube runs task pods through the Kubernetes API.
@@ -150,6 +157,9 @@ func newKube(api string, client *http.Client, token func() (string, error), work
 	}
 	if opts.ServiceAccount == "" {
 		opts.ServiceAccount = "default"
+	}
+	if opts.Instance == "" {
+		opts.Instance = "conductor"
 	}
 	k := &kube{api: api, http: client, token: token, namespace: opts.Namespace, opts: opts, log: slog.Default()}
 	// Owner references can't cross namespaces.
@@ -324,6 +334,10 @@ func (k *kube) run(ctx context.Context, taskID string, attempt int32, specJSON [
 	if err := k.do(runCtx, http.MethodPost, k.podsPath(), manifest, &created); err != nil {
 		if isKubeCode(err, http.StatusBadRequest, http.StatusUnprocessableEntity) {
 			err = permanent(err) // the pod spec is invalid
+		} else {
+			// The request may have reached the API server even though its
+			// answer didn't reach us (a network error, or a cancel mid-call).
+			k.deleteAttemptPods(taskID, attempt)
 		}
 		return "", nil, fmt.Errorf("failed to create the task's pod: %w", err)
 	}
@@ -358,7 +372,7 @@ func (k *kube) run(ctx context.Context, taskID string, attempt int32, specJSON [
 		return out.String(), nil, waitErr
 	}
 
-	output := out.String()
+	var reread *cappedBuffer
 	if following.Load() {
 		var followErr error
 		select {
@@ -372,11 +386,13 @@ func (k *kube) run(ctx context.Context, taskID string, attempt int32, specJSON [
 			log.Debug("Following logs failed, reading them again", "error", followErr)
 			full := newCappedBuffer(out.limit)
 			if err := k.copyLogs(context.WithoutCancel(ctx), name, false, full); err == nil {
-				output = full.String()
+				reread = full
 			}
-		} else {
-			output = out.String()
 		}
+	}
+	output := out.String()
+	if reread != nil {
+		output = reread.String()
 	}
 	outputs, err := podResult(final)
 	return output, outputs, err
@@ -401,7 +417,7 @@ func (k *kube) podManifest(taskID string, attempt int32, spec *k8sSpec, env map[
 	envList := []map[string]string{}
 	keys := slices.Sorted(maps.Keys(env))
 	for _, key := range keys {
-		envList = append(envList, map[string]string{"name": key, "value": env[key]})
+		envList = append(envList, map[string]string{"name": key, "value": verbatim(env[key])})
 	}
 	envList = append(envList, map[string]string{"name": "CONDUCTOR_OUTPUT", "value": k8sOutputPath})
 
@@ -424,10 +440,10 @@ func (k *kube) podManifest(taskID string, attempt int32, spec *k8sSpec, env map[
 		},
 	}
 	if len(spec.Command) > 0 {
-		container["command"] = spec.Command
+		container["command"] = verbatimAll(spec.Command)
 	}
 	if len(spec.Args) > 0 {
-		container["args"] = spec.Args
+		container["args"] = verbatimAll(spec.Args)
 	}
 	if len(resources) > 0 {
 		// Requests equal limits: the task gets what it asked for, no more.
@@ -449,6 +465,7 @@ func (k *kube) podManifest(taskID string, attempt int32, spec *k8sSpec, env map[
 
 	labels := map[string]string{
 		k8sLabelManagedBy: "conductor",
+		k8sLabelInstance:  labelValue(k.opts.Instance),
 		k8sLabelTask:      taskID,
 		k8sLabelAttempt:   strconv.Itoa(int(attempt)),
 	}
@@ -476,6 +493,19 @@ func (k *kube) podManifest(taskID string, attempt int32, spec *k8sSpec, env map[
 		podSpec["nodeSelector"] = spec.NodeSelector
 	}
 	return map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": metadata, "spec": podSpec}, nil
+}
+
+// verbatim escapes s for a pod's command, args or env value, where
+// Kubernetes expands $(VAR) to another variable's value and turns $$ into $.
+// Without it, a workflow input of "$(API_TOKEN)" would read the variable.
+func verbatim(s string) string { return strings.ReplaceAll(s, "$", "$$") }
+
+func verbatimAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = verbatim(s)
+	}
+	return out
 }
 
 // labelValue returns s if it is a valid label value, else a hash of it.
@@ -630,6 +660,20 @@ func (k *kube) copyLogs(ctx context.Context, name string, follow bool, w io.Writ
 	return err
 }
 
+// deleteAttemptPods deletes any pod of this task attempt.
+func (k *kube) deleteAttemptPods(taskID string, attempt int32) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pods, err := k.listTaskPods(ctx, k8sLabelTask+"="+taskID+","+k8sLabelAttempt+"="+strconv.Itoa(int(attempt)))
+	if err != nil {
+		k.log.Warn("Failed to look for the pod of a failed create", "task_id", taskID, "error", err)
+		return
+	}
+	for _, p := range pods {
+		k.deletePod(p.Metadata.Name, k.log)
+	}
+}
+
 // deletePod deletes a task pod, whatever state it's in.
 func (k *kube) deletePod(name string, log *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -661,6 +705,9 @@ func podResult(p *pod) (map[string]string, error) {
 		return nil, fmt.Errorf("container exited with status %d", t.ExitCode)
 	case p.Status.Phase == "Failed":
 		return nil, fmt.Errorf("the pod failed: %s %s", p.Status.Reason, p.Status.Message)
+	case len(t.Message) >= k8sMaxOutputs:
+		// The kubelet cut it: the last output would be truncated.
+		return nil, permanent(fmt.Errorf("$CONDUCTOR_OUTPUT exceeds %d bytes, the most a k8s task can return", k8sMaxOutputs-1))
 	}
 	return parseOutputs([]byte(t.Message)), nil
 }
@@ -668,7 +715,7 @@ func podResult(p *pod) (map[string]string, error) {
 // listTaskPods lists task pods matching a label selector (besides being
 // Conductor's).
 func (k *kube) listTaskPods(ctx context.Context, selector string) ([]pod, error) {
-	sel := k8sLabelManagedBy + "=conductor"
+	sel := k8sLabelManagedBy + "=conductor," + k8sLabelInstance + "=" + labelValue(k.opts.Instance)
 	if selector != "" {
 		sel += "," + selector
 	}
@@ -693,10 +740,16 @@ func (k *kube) deleteOwnLeftovers(ctx context.Context) {
 		k.log.Warn("Failed to list this worker's leftover task pods", "error", err)
 		return
 	}
+	var wg sync.WaitGroup
 	for _, p := range pods {
 		k.log.Info("Deleting a task pod left from before a restart", "pod", p.Metadata.Name, "task_id", p.Metadata.Labels[k8sLabelTask])
-		k.deletePod(p.Metadata.Name, k.log)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			k.deletePod(p.Metadata.Name, k.log)
+		}()
 	}
+	wg.Wait()
 }
 
 // sweepOrphans periodically deletes finished task pods nobody collected:

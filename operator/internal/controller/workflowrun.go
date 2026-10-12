@@ -36,7 +36,8 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	cc := r.client(r.namespace(run.Spec.ConductorNamespace))
+	ns := r.namespace(&run, run.Spec.ConductorNamespace)
+	cc := r.client(ns)
 
 	if !run.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, r.finalize(ctx, cc, &run)
@@ -46,9 +47,19 @@ func (r *WorkflowRunReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 	}
+	if run.Status.Finished() {
+		return ctrl.Result{}, nil // including runs that never could start
+	}
 	before := run.Status.DeepCopy()
 
 	if run.Status.RunID == "" {
+		if err := r.ensureNamespace(ctx, ns); err != nil {
+			failure(&run.Status.Conditions, run.Generation, err)
+			if serr := r.updateStatus(ctx, &run, before); serr != nil {
+				return ctrl.Result{}, serr
+			}
+			return ctrl.Result{}, err
+		}
 		result, err := r.start(ctx, cc, &run)
 		if err != nil || run.Status.RunID == "" {
 			if serr := r.updateStatus(ctx, &run, before); serr != nil {

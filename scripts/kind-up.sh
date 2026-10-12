@@ -42,9 +42,10 @@ fi
 export KUBECONFIG_CONTEXT="kind-$CLUSTER"
 kubectl config use-context "kind-$CLUSTER" >/dev/null
 
-step "Building conductor:dev and loading it into the cluster"
+step "Building conductor:dev and conductor-operator:dev and loading them into the cluster"
 docker build -q -t conductor:dev . >/dev/null
-kind load docker-image conductor:dev --name "$CLUSTER"
+docker build -q -f operator/Dockerfile -t conductor-operator:dev . >/dev/null
+kind load docker-image conductor:dev conductor-operator:dev --name "$CLUSTER"
 
 step "Installing KEDA $KEDA_VERSION"
 kubectl apply --server-side --force-conflicts \

@@ -57,3 +57,11 @@ postgres:
 
 logging:
   format: text
+
+# Workflow, WorkflowRun and Schedule resources (TestOperator...).
+operator:
+  enabled: true
+  image:
+    repository: conductor-operator
+    tag: dev
+    pullPolicy: Never

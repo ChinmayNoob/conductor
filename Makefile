@@ -3,13 +3,15 @@
 
 GOLANGCI_LINT_IMAGE ?= golangci/golangci-lint:v2.5.0
 PROTOC_IMAGE        ?= conductor-protoc
+CONTROLLER_GEN      ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.22.0
 COMPOSE             ?= docker compose
 WORKERS             ?= 3
 
-.PHONY: help build test test-db lint fmt proto up down logs e2e chaos bench clean
+.PHONY: help build test test-db lint fmt proto up down logs e2e chaos bench clean \
+        operator operator-generate helm-lint kind-up kind-down e2e-k8s
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
 
 build: ## Build all binaries into ./bin
 	go build -o bin/ ./cmd/...
@@ -53,6 +55,30 @@ chaos: ## Run the chaos suite (Toxiproxy in front of Postgres; restarts the stac
 
 bench: ## Benchmark the stack at 1, 10 and 50 workers (see BENCHMARKS.md)
 	./scripts/bench.sh
+
+# --- Kubernetes ---
+
+operator: ## Build and test the operator (its own module)
+	cd operator && go build ./... && go test -race ./...
+
+operator-generate: ## Regenerate the operator's deepcopy code and CRDs, and the chart's copies
+	cd operator && $(CONTROLLER_GEN) object paths=./api/v1alpha1 && \
+		$(CONTROLLER_GEN) crd paths=./api/v1alpha1 output:crd:artifacts:config=config/crd
+	cp operator/config/crd/*.yaml deploy/helm/conductor/files/crds/
+
+helm-lint: ## Lint the chart and check it renders in every mode
+	helm lint deploy/helm/conductor
+	go test ./deploy/...
+
+kind-up: ## Run Conductor on a local kind cluster (builds images, installs KEDA and the chart)
+	./scripts/kind-up.sh
+
+kind-down: ## Delete the kind cluster
+	kind delete cluster --name conductor
+
+e2e-k8s: kind-up ## Run the end-to-end suite on the kind cluster
+	E2E_PLATFORM=kubernetes E2E_API_URL=http://localhost:30081 E2E_API_KEY=$$(./scripts/kind-up.sh --api-key) \
+		E2E_LLM=mock go test -tags e2e -count=1 -v -timeout 40m ./test/e2e/
 
 clean: ## Remove build output
 	rm -rf bin

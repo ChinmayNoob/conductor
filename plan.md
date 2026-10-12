@@ -268,7 +268,7 @@ Design decisions: [ADR 0004](docs/adr/0004-kubernetes.md).
 - ✅ Dedicated pools (exclusive worker labels, like taints), so a pool that scales from zero is never woken by unrelated tasks. Not in the original plan; without it scale-to-zero didn't work
 
 ### 6.3 Kubernetes executor
-- ✅ `k8s` task type: each attempt runs as its own Pod (not a Job: Conductor already owns retries) with its own image, resources and service account (least-privilege RBAC: a Role for pods in the task namespace; task pods non-root, no capabilities, no token unless an allowed account is named). Outputs come from the termination message; logs stream live; pods are cleaned up on finish, cancel, timeout and worker crash
+- ✅ `k8s` task type: each attempt runs as its own Pod (not a Job: Conductor already owns retries) with its own image, resources and service account (least-privilege RBAC: a Role for pods in the task namespace, held only by a pool that runs k8s tasks and no task code; task pods non-root, no capabilities, no token unless an allowed account is named). Outputs come from the termination message; logs stream live; pods are cleaned up on finish, cancel, timeout and worker crash
 
 ### 6.4 Operator
 - ✅ Operator ([operator/](operator)) with CRDs for `Workflow`, `WorkflowRun` and `Schedule`, so workflows can be managed with GitOps (`kubectl apply`, Argo CD). Built on controller-runtime with controller-gen (the kubebuilder toolchain) as its own Go module; it drives Conductor through the HTTP API. Runs start exactly once (the resource UID is the idempotency key)

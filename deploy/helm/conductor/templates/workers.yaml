@@ -2,6 +2,7 @@
 {{- $pools := include "conductor.workerPools" . | fromYaml }}
 {{- range $name, $p := $pools }}
 {{- $deploy := include "conductor.workerName" (list $ $name) }}
+{{- $runsK8s := include "conductor.poolRunsK8s" (list $ $p) }}
 {{- $labels := merge (dict "pool" $name) ($p.labels | default dict) }}
 {{- $pairs := list }}
 {{- range $k, $v := $labels }}{{ $pairs = append $pairs (printf "%s=%v" $k $v) }}{{ end }}
@@ -33,9 +34,14 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      {{- if $runsK8s }}
+      # Only this pool talks to the Kubernetes API, and runs no task code.
+      serviceAccountName: {{ $fullname }}-task-runner
+      automountServiceAccountToken: true
+      {{- else }}
       serviceAccountName: {{ $fullname }}-worker
-      # Only Kubernetes tasks need the API.
-      automountServiceAccountToken: {{ $.Values.kubernetesTasks.enabled }}
+      automountServiceAccountToken: false
+      {{- end }}
       # Running tasks get shutdownTimeoutSeconds to finish.
       terminationGracePeriodSeconds: {{ add $p.shutdownTimeoutSeconds 15 }}
       {{- with $.Values.imagePullSecrets }}
@@ -71,6 +77,10 @@ spec:
             - name: CONDUCTOR_WORKER_EXCLUSIVE
               value: pool
             {{- end }}
+            {{- with $p.taskTypes }}
+            - name: CONDUCTOR_WORKER_TASK_TYPES
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- with $p.passEnv }}
             - name: CONDUCTOR_WORKER_PASS_ENV
               value: {{ join "," . | quote }}
@@ -83,7 +93,7 @@ spec:
             - name: CONDUCTOR_POD_UID
               valueFrom:
                 fieldRef: {fieldPath: metadata.uid}
-            {{- if $.Values.kubernetesTasks.enabled }}
+            {{- if $runsK8s }}
             - name: CONDUCTOR_K8S_TASKS
               value: "true"
             - name: CONDUCTOR_K8S_NAMESPACE

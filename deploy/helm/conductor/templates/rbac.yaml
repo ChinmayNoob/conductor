@@ -26,8 +26,16 @@ automountServiceAccountToken: false
 {{- if .Values.kubernetesTasks.enabled }}
 {{- $tasksNS := include "conductor.taskNamespace" . }}
 ---
-# Workers run k8s tasks as pods in the task namespace: they may manage pods
-# there, and do nothing else.
+# The k8s pool's workers run k8s tasks as pods in the task namespace: they
+# may manage pods there, and do nothing else. No other pool has a token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-task-runner
+  labels:
+    {{- include "conductor.componentLabels" (list . "worker") | nindent 4 }}
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -56,7 +64,7 @@ roleRef:
   name: {{ $fullname }}-task-runner
 subjects:
   - kind: ServiceAccount
-    name: {{ $fullname }}-worker
+    name: {{ $fullname }}-task-runner
     namespace: {{ .Release.Namespace }}
 ---
 # What task pods run as unless they name an allowed account: no

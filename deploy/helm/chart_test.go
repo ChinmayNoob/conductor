@@ -98,3 +98,22 @@ func TestBadDatabaseSettingsFailClearly(t *testing.T) {
 		t.Fatalf("external without a host: %v\n%s", err, out)
 	}
 }
+
+// Shell tasks run as their worker's user, so only the pool that runs k8s
+// tasks, and nothing else, may hold Kubernetes credentials.
+func TestOnlyTheK8sPoolHoldsCredentials(t *testing.T) {
+	out := render(t, "--set", "kubernetesTasks.enabled=true", "--set", "workerPools.gpu.dedicated=true")
+	if n := strings.Count(out, "automountServiceAccountToken: true"); n != 1 {
+		t.Fatalf("%d pod specs mount a token, want only the k8s pool's", n)
+	}
+	if !strings.Contains(out, "serviceAccountName: t-conductor-task-runner\n      automountServiceAccountToken: true") {
+		t.Fatal("the k8s pool doesn't run as the task-runner account")
+	}
+
+	helm, _ := exec.LookPath("helm")
+	mixed, err := exec.Command(helm, "template", "t", "conductor", "--set", "kubernetesTasks.enabled=true",
+		"--set", "workerPools.mixed.taskTypes={k8s,shell}").CombinedOutput()
+	if err == nil || !strings.Contains(string(mixed), "can't also run shell or container tasks") {
+		t.Fatalf("a pool running k8s and shell tasks was accepted: %v\n%s", err, mixed)
+	}
+}

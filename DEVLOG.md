@@ -1084,6 +1084,8 @@ A worker with `CONDUCTOR_K8S_TASKS` talks to the API server with its service acc
 - **Failing fast:** `InvalidImageName` fails permanently, `ImagePullBackOff` and config errors fail the attempt (to be retried, maybe elsewhere), and a timeout says when a pod was never scheduled ("0/3 nodes have a GPU").
 - **Cleanup:** the worker deletes the pod when the task finishes, times out or is cancelled. If the worker dies, its pod owns the task pods (garbage collected with it), `activeDeadlineSeconds` stops them a minute past their timeout, a restarted worker deletes what its pod left behind, and any worker sweeps finished pods nobody collected.
 
+A review pass caught a hole in the first version: every worker pool mounted the service account token when k8s tasks were on, and a shell task runs as its worker's user, so `cat /var/run/secrets/.../token` would have let any task create any pod. Now k8s tasks get a pool of their own (`CONDUCTOR_WORKER_TASK_TYPES=k8s`, a worker runs exactly the types it advertises) that runs no task code and is the only one with credentials; other pools mount no token, and the chart refuses a pool mixing k8s with shell or container tasks. `TestShellTasksHaveNoKubernetesToken` checks it on kind.
+
 The unit tests run against a fake API server that stores pods, serves watches and logs, and scripts each pod's life.
 
 ### The operator

@@ -238,7 +238,30 @@ prometheus.io/path: /metrics
 {{- range $name, $overrides := .Values.workerPools }}
 {{- $_ := set $pools $name (mergeOverwrite (deepCopy $.Values.worker) $overrides) }}
 {{- end }}
+{{- if .Values.kubernetesTasks.enabled }}
+{{- if hasKey .Values.workerPools "k8s" }}{{ fail "workerPools.k8s is reserved for kubernetesTasks.workers" }}{{ end }}
+{{- /* Only k8s tasks, nothing inherited that could add others or keep them out. */}}
+{{- $k8s := mergeOverwrite (deepCopy .Values.worker) (deepCopy .Values.kubernetesTasks.workers) }}
+{{- $_ := set $k8s "taskTypes" (list "k8s") }}
+{{- $_ := set $k8s "labels" dict }}
+{{- $_ := set $k8s "dedicated" false }}
+{{- $_ := set $k8s "passEnv" list }}
+{{- $_ := set $k8s "extraEnv" (.Values.kubernetesTasks.workers.extraEnv | default list) }}
+{{- $_ := set $k8s "autoscaling" (dict "enabled" false) }}
+{{- $_ := set $pools "k8s" $k8s }}
+{{- end }}
 {{- toYaml $pools }}
+{{- end }}
+
+{{/* Whether a pool runs k8s tasks (and so holds Kubernetes credentials): include ... (list $ $pool) */}}
+{{- define "conductor.poolRunsK8s" -}}
+{{- $ := index . 0 }}{{ $pool := index . 1 }}
+{{- $types := $pool.taskTypes | default list }}
+{{- if has "k8s" $types }}
+{{- if not $.Values.kubernetesTasks.enabled }}{{ fail "a pool runs k8s tasks: set kubernetesTasks.enabled" }}{{ end }}
+{{- if or (has "shell" $types) (has "container" $types) }}{{ fail "a pool that runs k8s tasks can't also run shell or container tasks: they could read its Kubernetes credentials" }}{{ end }}
+true
+{{- end }}
 {{- end }}
 
 {{- define "conductor.workerName" -}}
@@ -250,10 +273,13 @@ prometheus.io/path: /metrics
 {{/* The labels a pool's workers advertise, task types included: what autoscaling matches tasks against. */}}
 {{- define "conductor.poolAdvertisedLabels" -}}
 {{- $ := index . 0 }}{{ $name := index . 1 }}{{ $pool := index . 2 }}
-{{- $labels := dict "pool" $name "type.shell" "true" "type.http" "true" }}
+{{- $labels := dict "pool" $name }}
 {{- range $k, $v := $pool.labels }}{{ if not (hasKey $labels $k) }}{{ $_ := set $labels $k (toString $v) }}{{ end }}{{ end }}
-{{- if include "conductor.llmEnabled" $ }}{{ $_ := set $labels "type.llm" "true" }}{{ end }}
-{{- if $.Values.kubernetesTasks.enabled }}{{ $_ := set $labels "type.k8s" "true" }}{{ end }}
+{{- $types := $pool.taskTypes | default (list "shell" "http" "llm") }}
+{{- range $types }}
+{{- if and (eq . "llm") (not (include "conductor.llmEnabled" $)) }}
+{{- else if ne . "container" }}{{ $_ := set $labels (printf "type.%s" .) "true" }}{{ end }}
+{{- end }}
 {{- toJson $labels }}
 {{- end }}
 

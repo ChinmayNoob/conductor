@@ -62,10 +62,12 @@ bin/conductorctl workflow start order_pipeline -input '{"order_id": "A1"}' -wait
 
 Then open the dashboard at http://localhost:8081 and sign in with the same key.
 
-**On Kubernetes** (any cluster; or [kind](https://kind.sigs.k8s.io) with `make kind-up`):
+**On Kubernetes:** `make kind-up` builds the images and runs everything on a local [kind](https://kind.sigs.k8s.io) cluster (API at http://localhost:30081; the key from `./scripts/kind-up.sh --api-key`). On any other cluster, push the images to your registry first (releases will publish them), then:
 
 ```bash
-helm install conductor deploy/helm/conductor --namespace conductor --create-namespace
+docker build -t REGISTRY/conductor:TAG . && docker push REGISTRY/conductor:TAG
+helm install conductor deploy/helm/conductor --namespace conductor --create-namespace \
+  --set image.repository=REGISTRY/conductor --set image.tag=TAG
 kubectl get secret -n conductor conductor-auth -o jsonpath='{.data.api-key}' | base64 -d   # the admin key
 kubectl port-forward -n conductor svc/conductor-api 8081:8081
 ```
@@ -299,7 +301,7 @@ flowchart LR
 - **Secure by default:** mutual TLS between components with a generated CA, generated secrets kept across upgrades, non-root pods with read-only root filesystems, and NetworkPolicies that let each component accept only the connections it needs.
 - **Postgres:** `postgres.mode` is `dev` (one pod, to try it out), `cloudnativepg` (an HA cluster via the [CloudNativePG](https://cloudnative-pg.io) operator) or `external` (a managed database).
 - **Autoscaling:** with `autoscaling.enabled`, [KEDA](https://keda.sh) scales a worker pool on the slots it could use right now (due tasks it can run, plus tasks running on it), down to zero when idle. Pools are listed in `workerPools`; make scale-to-zero pools `dedicated`.
-- **Tasks as pods:** with `kubernetesTasks.enabled`, `k8s` tasks run as their own pods with their own image, resources and service account. They get no privileges by default (non-root, no capabilities, no token); tasks may only use service accounts from `kubernetesTasks.serviceAccounts`. Outputs work as for shell tasks.
+- **Tasks as pods:** with `kubernetesTasks.enabled`, `k8s` tasks run as their own pods with their own image, resources and service account. They get no privileges by default (non-root, no capabilities, no token); tasks may only use service accounts from `kubernetesTasks.serviceAccounts`. Outputs work as for shell tasks. A pool of its own creates the pods; it runs no task code and is the only one holding Kubernetes credentials, so shell tasks elsewhere have none to read.
 - **Operator:** with `operator.enabled`, `Workflow`, `WorkflowRun` and `Schedule` resources are applied to Conductor, so workflows live in Git and ship with `kubectl apply` or Argo CD. See [operator/README.md](operator/README.md).
 - **Monitoring:** pods carry Prometheus scrape annotations; the chart can add a PodMonitor, the alert rules as a PrometheusRule, the Grafana dashboard, or a PodMonitoring for Google Managed Prometheus.
 
@@ -310,7 +312,7 @@ Reference setups: [Terraform for GKE with Cloud SQL](deploy/terraform/gke) and [
 - **API keys:** `CONDUCTOR_API_KEY` creates the first admin key on startup. Other keys are bound to one namespace. Only SHA-256 hashes are stored.
 - **Cluster token:** every gRPC call between components carries `CONDUCTOR_CLUSTER_TOKEN`.
 - **Mutual TLS:** set `CONDUCTOR_TLS_CERT`, `CONDUCTOR_TLS_KEY` and `CONDUCTOR_TLS_CA` (try `./scripts/gen-dev-certs.sh` with `docker-compose.tls.yml`).
-- **Task isolation:** tasks run as an unprivileged user with a minimal environment. Container tasks need a worker with the Docker socket, which is opt-in (`docker compose --profile containers up -d`) because socket access is equivalent to root on the host. On Kubernetes, `k8s` tasks run as their own locked-down pods instead, and workers need only a Role for pods in the task namespace.
+- **Task isolation:** tasks run as an unprivileged user with a minimal environment. Container tasks need a worker with the Docker socket, which is opt-in (`docker compose --profile containers up -d`) because socket access is equivalent to root on the host. On Kubernetes, `k8s` tasks run as their own locked-down pods instead; only the pool that creates them holds a Kubernetes token (a Role for pods in the task namespace), and it runs no task code.
 
 ## Configuration
 
@@ -326,6 +328,7 @@ All settings are environment variables; [.env.example](.env.example) lists them.
 | `CONDUCTOR_WORKER_LABELS` | | e.g. `gpu=true,region=eu` |
 | `CONDUCTOR_WORKER_EXCLUSIVE` | | Labels a task must require to run here (a dedicated worker), e.g. `gpu` |
 | `CONDUCTOR_K8S_TASKS` | `false` | Run `k8s` tasks as pods (workers in a cluster; the chart sets this up) |
+| `CONDUCTOR_WORKER_TASK_TYPES` | | Run only these task types, e.g. `k8s` (default: every type the worker can) |
 | `CONDUCTOR_WORKER_PASS_ENV` | | Worker variables tasks may see, e.g. `AWS_REGION` |
 | `CONDUCTOR_PRIORITY_AGING` | `60s` | Waiting tasks gain one priority level per interval (`0` disables it) |
 | `CONDUCTOR_SHUTDOWN_TIMEOUT` | `25s` | How long a stopping worker lets running tasks finish |

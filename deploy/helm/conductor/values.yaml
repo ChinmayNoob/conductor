@@ -118,8 +118,9 @@ api:
   affinity: {}
   extraEnv: []
 
-# The default worker pool. Every pool runs shell and http tasks, llm tasks
-# when a model is configured, and k8s tasks when kubernetesTasks is enabled.
+# The default worker pool. Every pool runs shell and http tasks, and llm
+# tasks when a model is configured (k8s tasks run in their own pool; see
+# kubernetesTasks).
 worker:
   replicas: 2
   # Tasks each worker runs at once.
@@ -131,6 +132,8 @@ worker:
   # so other work never lands there: for expensive pools, and for pools
   # that scale from zero.
   dedicated: false
+  # Limit the task types the pool runs (shell, http, llm); empty means all.
+  taskTypes: []
   # Worker environment variables tasks may see (nothing else is passed on).
   passEnv: []
   # On shutdown (a rollout, scale-down or node drain) a worker stops taking
@@ -175,17 +178,28 @@ worker:
 #       autoscaling: {enabled: true, maxReplicas: 4}
 workerPools: {}
 
-# k8s tasks: workers run each task as its own pod, with its own image,
-# resources and service account.
+# k8s tasks: each task runs as its own pod, with its own image, resources
+# and service account. They get a worker pool of their own (k8s): workers
+# that only create and watch pods. Those are the only workers holding
+# Kubernetes credentials, since shell tasks run as their worker's user and
+# could read them.
 kubernetesTasks:
   enabled: false
-  # Namespace for task pods; default the release's. The chart gives
-  # workers the RBAC to manage pods there, and nothing else.
+  # Namespace for task pods; default the release's. The chart gives the k8s
+  # pool the RBAC to manage pods there, and nothing else.
   namespace: ""
   # Service accounts tasks may name (they must exist in that namespace).
   # Tasks that name none run as a chart-made account with no permissions
   # and no token.
   serviceAccounts: []
+  # The k8s pool. A worker here does little per task (the pod does the
+  # work), so a few workers with many slots go a long way.
+  workers:
+    replicas: 2
+    slots: 20
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 256Mi}
 
 # Language models, for llm tasks, agents and the operations assistant.
 llm:

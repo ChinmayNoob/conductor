@@ -220,3 +220,16 @@ func TestWorkersScaleOnQueueDepth(t *testing.T) {
 	waitReplicas(func(n int) bool { return n == 0 }, 3*time.Minute, "after the burst")
 	t.Logf("and back to 0 %v after starting", time.Since(start).Round(time.Second))
 }
+
+// TestShellTasksHaveNoKubernetesToken: only the k8s pool holds credentials,
+// and it runs no task code; a shell task finds no token to steal.
+func TestShellTasksHaveNoKubernetesToken(t *testing.T) {
+	kube(t)
+	c := newClient(t)
+	task := waitTask(t, c, submit(t, c, client.TaskRequest{
+		Command: `ls /var/run/secrets/kubernetes.io/serviceaccount/ 2>/dev/null && echo token=found || echo token=none`,
+	}).ID, time.Minute)
+	if task.Status != "COMPLETED" || !strings.Contains(task.Output, "token=none") {
+		t.Fatalf("shell task: %s, output %q", task.Status, task.Output)
+	}
+}

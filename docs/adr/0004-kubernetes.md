@@ -32,8 +32,15 @@ nobody collected.
 no service-link environment variables and no service account token. A task
 may name a service account only from the workers' allow-list; anyone who can
 submit tasks gets what that account can do, so naming any other fails the
-task permanently. Workers get a Role in the task namespace for pods and
-their logs, nothing cluster-wide.
+task permanently.
+
+The workers that create those pods need a token, and a shell task runs as
+its worker's user, so it could read that token and create any pod it liked.
+So k8s tasks get a pool of their own (`CONDUCTOR_WORKER_TASK_TYPES=k8s`):
+workers that run no task code, under the only service account with
+permissions (a Role for pods and their logs in the task namespace, nothing
+cluster-wide). Every other pool mounts no token at all, and the chart
+refuses a pool that would run k8s tasks next to shell or container ones.
 
 **3. `$CONDUCTOR_OUTPUT` is the termination message.** Outputs work the same
 for shell and k8s tasks: key=value lines in the file `$CONDUCTOR_OUTPUT`

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +83,8 @@ type Worker struct {
 	// Exclusive names labels a task must require to run here (a dedicated
 	// worker); each must be one of Labels.
 	Exclusive []string
+	// TaskTypes limits the task types it runs; empty means all it can.
+	TaskTypes []string
 	// PassEnv names worker environment variables that tasks may see.
 	PassEnv      []string
 	DockerSocket string // enables container tasks when Docker answers here
@@ -181,6 +184,12 @@ func Load() (*Config, error) {
 	}
 	c.Worker.Labels, err = parseLabels(os.Getenv("CONDUCTOR_WORKER_LABELS"))
 	collect(wrap("CONDUCTOR_WORKER_LABELS", err))
+	c.Worker.TaskTypes = splitList(os.Getenv("CONDUCTOR_WORKER_TASK_TYPES"))
+	for _, typ := range c.Worker.TaskTypes {
+		if !slices.Contains([]string{"shell", "http", "container", "k8s", "llm"}, typ) {
+			collect(fmt.Errorf("CONDUCTOR_WORKER_TASK_TYPES: unknown task type %q (want shell, http, container, k8s or llm)", typ))
+		}
+	}
 	c.Worker.Exclusive = splitList(os.Getenv("CONDUCTOR_WORKER_EXCLUSIVE"))
 	for _, k := range c.Worker.Exclusive {
 		if _, ok := c.Worker.Labels[k]; !ok && err == nil {

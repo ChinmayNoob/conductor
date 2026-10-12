@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -91,6 +92,11 @@ type Options struct {
 	DockerSocket string
 	// Kube enables Kubernetes tasks, if the worker runs in a cluster.
 	Kube *KubeOptions
+	// Types limits the task types the worker runs (shell, http, container,
+	// k8s, llm); empty means every type it can. A worker holding Kubernetes
+	// credentials should run only k8s tasks: shell tasks run as the
+	// worker's user and could read them.
+	Types []string
 	// LLM enables llm tasks; nil disables them. Prices turn token usage
 	// into cost.
 	LLM         llm.Provider
@@ -120,12 +126,20 @@ func NewServer(opts Options) *Server {
 	if s.labels == nil {
 		s.labels = make(map[string]string)
 	}
-	s.labels[LabelShell] = "true"
-	s.labels[LabelHTTP] = "true"
+	runs := func(typ string) bool { return len(opts.Types) == 0 || slices.Contains(opts.Types, typ) }
+	if runs("shell") {
+		s.labels[LabelShell] = "true"
+	}
+	if runs("http") {
+		s.labels[LabelHTTP] = "true"
+	}
+	if !runs("llm") {
+		s.llm = nil
+	}
 	if s.llm != nil {
 		s.labels[LabelLLM] = "true"
 	}
-	if opts.DockerSocket != "" {
+	if opts.DockerSocket != "" && runs("container") {
 		d := newDocker(opts.DockerSocket)
 		if err := d.Ping(context.Background()); err != nil {
 			s.log.Info("Container tasks disabled: Docker is not reachable", "socket", opts.DockerSocket, "error", err)
@@ -134,7 +148,7 @@ func NewServer(opts Options) *Server {
 			s.labels[LabelContainer] = "true"
 		}
 	}
-	if opts.Kube != nil {
+	if opts.Kube != nil && runs("k8s") {
 		if k, err := inClusterKube(*opts.Kube); err != nil {
 			s.log.Warn("Kubernetes tasks disabled", "error", err)
 		} else {
@@ -189,12 +203,9 @@ func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*
 		return reject("no free slot")
 	case s.running[req.TaskId] != nil:
 		return reject("task is already running here")
-	case req.Type == "container" && s.docker == nil:
-		return reject("container tasks are not available on this worker")
-	case req.Type == "k8s" && s.kube == nil:
-		return reject("k8s tasks are not available on this worker")
-	case req.Type == "llm" && s.llm == nil:
-		return reject("llm tasks are not available on this worker: no language model is configured")
+	case s.labels["type."+taskType(req.Type)] != "true":
+		// It runs exactly the types it advertises.
+		return reject(taskType(req.Type) + " tasks are not available on this worker")
 	}
 
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)

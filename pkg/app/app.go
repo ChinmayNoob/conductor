@@ -189,6 +189,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		Slots:        cfg.Worker.Slots,
 		Labels:       cfg.Worker.Labels,
 		Exclusive:    cfg.Worker.Exclusive,
+		Types:        cfg.Worker.TaskTypes,
 		MaxOutput:    cfg.MaxOutputBytes,
 		PassEnv:      cfg.Worker.PassEnv,
 		DockerSocket: cfg.Worker.DockerSocket,

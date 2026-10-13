@@ -1,0 +1,15 @@
+[
+  {"slug": "overview", "title": "Overview", "summary": "What Conductor is, what it is good at, and how these docs are organised."},
+  {"slug": "quickstart", "title": "Quickstart", "summary": "Run Conductor with Docker Compose, as one process, or on Kubernetes, and run your first task and workflow."},
+  {"slug": "architecture", "title": "Architecture", "summary": "The three components, how a task travels through them, and how leader election, fencing and sagas keep work safe."},
+  {"slug": "concepts", "title": "Core concepts", "summary": "Tasks, attempts, retries, queues, priorities, labels, namespaces and the delivery guarantees behind them."},
+  {"slug": "workflows", "title": "Workflow reference", "summary": "Every field of a workflow definition: inputs, steps, dependencies, expressions, compensation and versioning."},
+  {"slug": "task-types", "title": "Task types", "summary": "shell, http, container, k8s and llm tasks, plus the approval, signal and agent steps: what each runs, where, and what it returns."},
+  {"slug": "ai", "title": "AI features", "summary": "Model calls with budgets, human approvals, durable agents and the operations assistant."},
+  {"slug": "api-cli", "title": "API, CLI and Go SDK", "summary": "The HTTP API, the conductorctl command line and the Go client, with every route and command."},
+  {"slug": "deploying", "title": "Deploying", "summary": "One binary, Docker Compose, or Kubernetes with the Helm chart: databases, TLS, worker pools and autoscaling."},
+  {"slug": "operator", "title": "Kubernetes operator and GitOps", "summary": "Manage workflows, runs and schedules as Kubernetes resources, and ship them with Argo CD."},
+  {"slug": "operations", "title": "Operations", "summary": "High availability, scaling, upgrades, monitoring, troubleshooting and the full configuration reference."},
+  {"slug": "security", "title": "Security", "summary": "Authentication, namespaces, transport security, task isolation and how secrets are kept away from tasks."},
+  {"slug": "faq", "title": "FAQ and comparison", "summary": "Common questions, known limits, and how Conductor compares with Temporal, Airflow, River and Hatchet."}
+]

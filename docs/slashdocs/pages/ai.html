@@ -1,0 +1,113 @@
+    <h2 id="why">Why a workflow engine for AI</h2>
+    <p>Model calls are slow, they fail in odd ways (rate limits, timeouts, malformed answers), and every token costs money. Those are exactly the properties durable workflows handle: retries with back-off, budgets, checkpoints, and a person in the loop when one is needed. In Conductor, a model call is an ordinary task, so it inherits queues, limits, cancellation, tracing and the dashboard without new machinery.</p>
+    <div class="callout">
+      <strong class="label">Ground rules</strong>
+      Model output is never executed directly: drafted workflows need validation and a person to save them. API keys live in the environment, never in definitions or the database. AI features that send data to a model are opt-in per namespace, and everything sent is redacted first.
+    </div>
+
+    <h2 id="setup">Setting up a model</h2>
+    <p>Workers run model calls; the API runs the operations assistant. Give both the same settings:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>OPENAI_API_KEY</code> or <code>CONDUCTOR_LLM_API_KEY</code></td><td>The provider key (the second wins if both are set)</td></tr>
+        <tr><td><code>CONDUCTOR_LLM_BASE_URL</code></td><td>Any Chat Completions API: OpenAI (default), Ollama, vLLM, LiteLLM, Azure OpenAI</td></tr>
+        <tr><td><code>CONDUCTOR_LLM_MODEL</code></td><td>The model for steps that name none</td></tr>
+        <tr><td><code>CONDUCTOR_LLM_TIMEOUT</code></td><td>Per call (default 2m)</td></tr>
+        <tr><td><code>CONDUCTOR_LLM_PRICES</code></td><td>JSON, USD per million tokens: <code>{"gpt-4o-mini": {"input": 0.15, "output": 0.60}}</code>. No prices are built in: without one, tokens are counted but cost stays zero</td></tr>
+        <tr><td><code>CONDUCTOR_AI_MODEL</code></td><td>The assistant's model (default: <code>CONDUCTOR_LLM_MODEL</code>)</td></tr>
+      </tbody>
+    </table></div>
+    <p>Workers with a model advertise <code>type.llm</code>; others never receive model calls. For tests and demos, <code>conductor mock-llm</code> (the <code>mock-llm</code> Compose profile, or <code>mockLLM.enabled</code> in the chart) serves a scripted, free stand-in: point <code>CONDUCTOR_LLM_BASE_URL</code> at it.</p>
+
+    <h2 id="llm">Model calls</h2>
+<pre><code>name: triage
+inputs:
+  ticket: {required: true}
+budget: {max_tokens: 20000, max_cost_usd: 0.50}
+steps:
+  - name: classify
+    llm:
+      prompt: "Classify this support ticket: ${{ inputs.ticket }}"
+      schema:
+        type: object
+        properties: {severity: {type: string, enum: [low, medium, high]}, summary: {type: string}}
+        required: [severity, summary]
+        additionalProperties: false
+  - name: page
+    depends_on: [classify]
+    env: {SEVERITY: "${{ steps.classify.outputs.severity }}"}
+    run: '[ "$SEVERITY" = high ] &amp;&amp; ./page-oncall.sh || echo "no page"'</code></pre>
+    <ul>
+      <li><strong>Structured output.</strong> With a <code>schema</code>, the model must return a matching JSON object, and its top-level fields become outputs that later steps use. Without one, the answer is the <code>text</code> output.</li>
+      <li><strong>Rate limits.</strong> A provider's <code>429</code> with <code>Retry-After</code> sets the minimum delay before the retry. Queues can cap <code>tokens_per_minute</code>, enforced at dispatch.</li>
+      <li><strong>Permanent errors</strong> (an invalid key, an unknown model, a bad request) fail at once instead of burning retries.</li>
+      <li><strong>Standalone:</strong> <code>conductorctl task submit -prompt "Summarize: ..." -model M -schema '{...}'</code>.</li>
+    </ul>
+
+    <h2 id="costs">Costs and budgets</h2>
+    <p>Every model call records its input and output tokens, and its cost when the model is priced. Spend is summed per task, per run and per namespace, and shown on the run page.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Budget</th><th>Set with</th><th>When exceeded</th></tr></thead>
+      <tbody>
+        <tr><td>Per run</td><td><code>budget: {max_tokens, max_cost_usd}</code> in the definition</td><td>The run fails and compensates, like any failure</td></tr>
+        <tr><td>Per agent</td><td><code>agent.budget</code></td><td>The agent step fails</td></tr>
+        <tr><td>Per namespace, per day</td><td><code>conductorctl namespace set NAME -max-llm-tokens N -max-llm-cost USD</code></td><td>New model tasks are refused (HTTP 429), and steps stop starting</td></tr>
+        <tr><td>Per queue, per minute</td><td><code>tokens_per_minute</code> on the queue</td><td>Model tasks wait at dispatch</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="humans">People and other systems in the loop</h2>
+    <p><strong>Approval</strong> steps pause a run until someone decides, with a timeout that approves or rejects by default; rejection compensates. <strong>Signal</strong> steps pause until another system sends data, which becomes the step's outputs. Neither holds a worker while waiting. See <a href="{{link:task-types#approval}}">approval</a> and <a href="{{link:task-types#signal}}">signal</a>.</p>
+<pre><code>conductorctl approvals                                   # what is waiting, across runs
+conductorctl workflow approve RUN sign_off -comment "checked the diff"
+conductorctl workflow signal RUN payment-confirmed -data '{"ref": "pay_123"}'</code></pre>
+
+    <h2 id="agents">Durable agents</h2>
+    <p>An <code>agent</code> step runs a model with tools in a loop. What makes it durable is that the loop is a state machine over tasks: every model call and every tool call is its own task, created exactly once with the key <code>agent:&lt;run&gt;:&lt;turn&gt;:&lt;call&gt;</code>, and the conversation is stored as it grows.</p>
+    <figure class="diagram">
+      <pre class="mermaid">
+sequenceDiagram
+    participant E as coordinator (agent state)
+    participant M as model task (llm worker)
+    participant T as tool tasks (shell workers)
+    E->>M: turn 1: conversation + tool definitions
+    M-->>E: call facts(n=1), facts(n=2)
+    E->>T: two tool tasks, in parallel
+    T-->>E: results stored
+    E->>M: turn 2: conversation + results
+    Note over E,T: the worker dies during turn 2's tool call
+    E->>T: only the unfinished call runs again
+    M-->>E: final answer -> output "answer"
+      </pre>
+      <figcaption>A crash costs at most the call in flight; finished calls are never repeated.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Tools are shell commands.</strong> The model's arguments arrive as <code>$ARG_&lt;NAME&gt;</code> and <code>$TOOL_ARGS</code>, never spliced into the command, so a model can't inject shell code.</li>
+      <li><strong>Limits:</strong> <code>max_turns</code> (default 10), <code>max_tool_calls</code> (50), <code>max_duration</code> (15m), a <code>budget</code>, and per-tool timeouts. Hitting one fails the step, and the run compensates.</li>
+      <li><strong>Tested:</strong> the end-to-end suite kills a worker in the middle of an agent's tool call and checks that the agent finishes with each call run once, except the interrupted one.</li>
+      <li>The dashboard shows an agent's whole conversation, each call, its task and its cost.</li>
+    </ul>
+
+    <h2 id="assistant">The operations assistant</h2>
+    <p>Opt a namespace in with <code>conductorctl namespace set NAME -ai-assist</code>. The assistant advises; it never acts. It doesn't change retries, and it can't save anything.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Feature</th><th>What it does</th><th>Command</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Failure explanations</strong></td><td>When a task fails for good, a rule-based classifier labels it (transient, permanent, needs attention) with a confidence. The model then adds a likely cause and a fix from the redacted error and output. They appear on the failed task in the dashboard.</td><td><code>conductorctl task explain ID</code></td></tr>
+        <tr><td><strong>Ask your cluster</strong></td><td>Answers questions using read-only lookups scoped to the namespace: task counts, tasks, a task, runs, workers, spend.</td><td><code>conductorctl ai ask "why did yesterday's runs fail?"</code></td></tr>
+        <tr><td><strong>Draft a workflow</strong></td><td>Turns a description into YAML, validates it with the real parser (with one repair attempt), dry runs it to show which steps start together, flags risky commands (<code>rm -rf</code>, <code>curl | sh</code>, hard-coded secrets), and asks before saving.</td><td><code>conductorctl ai workflow "fetch A and B in parallel, then merge" -save</code></td></tr>
+      </tbody>
+    </table></div>
+    <h3 id="redaction">What leaves the cluster</h3>
+    <p>Only for namespaces with <code>ai_assist</code> on, and only after redaction: API keys, tokens, JWTs, passwords, credentials in URLs and Conductor keys are masked. The model's reply is redacted again before it is stored. Rules decide the failure class whenever one matches; the model's words never override them.</p>
+
+    <h2 id="quality">Evaluation sets</h2>
+    <p>A labelled set of real-looking failures checks the rule classifier on every test run: when a rule decides, it must be right, and cases meant for the model must not be caught by a rule. When prompts or rules change, CI runs the same set through a real model (if the repository has a key). A separate test checks that no secret reaches a prompt from any field of a task.</p>
+
+    <h2 id="limits">Known limits</h2>
+    <ul>
+      <li>The assistant's own spend is recorded on explanations, but doesn't count against namespace budgets.</li>
+      <li>Identical prompts are not cached; every call reaches the model.</li>
+      <li>Agents' tools are shell commands; there is no MCP client.</li>
+    </ul>

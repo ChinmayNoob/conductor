@@ -1,0 +1,102 @@
+    <h2 id="before">Before you start</h2>
+    <p>You need <strong>Docker</strong> (with Compose v2) and <strong>Go 1.24 or newer</strong> to build the command-line client. Container images are not published yet, so every option below builds Conductor from a checkout of the repository:</p>
+<pre><code>git clone https://github.com/ChinmayNoob/conductor.git
+cd conductor
+go build -o bin/conductorctl ./cmd/conductorctl    # the command-line client</code></pre>
+    <p>Pick one of three ways to run it. All three end with the same API on a local port and the same commands.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Option</th><th>Runs</th><th>Best for</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#compose">Docker Compose</a></td><td>Postgres, two coordinators, the API and three workers, as containers</td><td>Trying everything, including failover</td></tr>
+        <tr><td><a href="#single">One process</a></td><td>Coordinator, API and a worker in one <code>conductor dev</code> process, against any Postgres</td><td>Developing against Conductor</td></tr>
+        <tr><td><a href="#kubernetes">Kubernetes (kind)</a></td><td>The Helm chart on a local three-node cluster, with autoscaling and the operator</td><td>Trying the Kubernetes features</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="compose">Option A: Docker Compose</h2>
+<pre><code>docker compose up -d --build --scale worker=3
+export CONDUCTOR_API_KEY=insecure-dev-api-key       # the development default
+bin/conductorctl workers                            # three healthy workers</code></pre>
+    <p>The API listens on <code>http://localhost:8081</code>, which is also <code>conductorctl</code>'s default (<code>CONDUCTOR_URL</code> changes it). The dashboard is at <a href="http://localhost:8081/ui/">http://localhost:8081/ui/</a>; sign in with the same key.</p>
+    <div class="callout warn">
+      <strong class="label">Development secrets</strong>
+      The Compose file falls back to insecure, well-known values for the cluster token and the API key. Before running it anywhere but your own machine, copy <code>.env.example</code> to <code>.env</code> and set <code>CONDUCTOR_CLUSTER_TOKEN</code> and <code>CONDUCTOR_API_KEY</code>. Components log a warning while they run with development secrets.
+    </div>
+    <p>Optional extras are Compose profiles:</p>
+<pre><code>docker compose --profile containers up -d          # a worker that can run container tasks (mounts the Docker socket)
+docker compose --profile mock-llm up -d            # a scripted stand-in model, for llm and agent steps
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 docker compose --profile observability up -d
+                                                   # Prometheus :9091, Grafana :3000, Jaeger :16686</code></pre>
+
+    <h2 id="single">Option B: one process</h2>
+    <p><code>conductor dev</code> runs the coordinator, the API and one worker in a single process. It needs only a Postgres database; the Compose stack's Postgres on port 5433 works:</p>
+<pre><code>docker compose up -d postgres
+POSTGRES_PORT=5433 go run ./cmd/conductor dev
+export CONDUCTOR_API_KEY=insecure-dev-api-key</code></pre>
+    <p>It creates its schema on start (migrations run automatically, guarded by an advisory lock), generates a random cluster token, and prints the API address and key. Point <code>POSTGRES_HOST</code>, <code>POSTGRES_USER</code>, <code>POSTGRES_PASSWORD</code> and <code>POSTGRES_DB</code> at any other database.</p>
+
+    <h2 id="kubernetes">Option C: Kubernetes on kind</h2>
+    <p>With <a href="https://kind.sigs.k8s.io">kind</a>, <code>kubectl</code> and <code>helm</code> installed:</p>
+<pre><code>make kind-up                                       # or ./scripts/kind-up.sh
+export CONDUCTOR_URL=http://localhost:30081
+export CONDUCTOR_API_KEY=$(./scripts/kind-up.sh --api-key)</code></pre>
+    <p>This creates a three-node cluster, builds the images and loads them into it, installs KEDA, and installs the chart with two coordinators, two API replicas, three workers, a worker pool that scales from zero, Kubernetes tasks, a scripted model and the operator. Delete it all with <code>kind delete cluster --name conductor</code>. <a href="{{link:deploying#kubernetes}}">Deploying</a> covers real clusters.</p>
+
+    <h2 id="first-task">Your first task</h2>
+<pre><code>bin/conductorctl task submit -cmd 'echo "hello from $(hostname)"' -wait</code></pre>
+    <p><code>-wait</code> waits for the result and prints the task: its status (<code>COMPLETED</code>), retries and output. Without <code>-wait</code> you get the task back immediately; <code>-o json</code> makes any command print JSON:</p>
+<pre><code>id=$(bin/conductorctl -o json task submit -cmd 'sleep 5; echo done' | jq -r .id)
+bin/conductorctl task logs $id -f          # follow the output live
+bin/conductorctl task get $id
+bin/conductorctl task list -status COMPLETED -limit 5</code></pre>
+    <p>A failing command is retried with exponential back-off (three retries, 60 seconds apart and doubling, by default). Try one that fails and look at its attempts:</p>
+<pre><code>bin/conductorctl task submit -cmd 'echo trying; exit 1' -retries 2 -retry-delay 1
+bin/conductorctl task attempts &lt;id&gt;       # every attempt, which worker ran it, and why it failed
+bin/conductorctl dlq                        # permanently failed tasks</code></pre>
+
+    <h2 id="first-workflow">Your first workflow</h2>
+    <p>Save this as <code>hello.yaml</code>:</p>
+<pre><code>name: hello
+inputs:
+  name: {required: true}
+steps:
+  - name: greet
+    run: |
+      echo "Hello, $INPUT_NAME"
+      echo "greeting=Hello, $INPUT_NAME" &gt;&gt; "$CONDUCTOR_OUTPUT"
+  - name: shout
+    depends_on: [greet]
+    env:
+      GREETING: "${{ steps.greet.outputs.greeting }}"
+    run: echo "$GREETING" | tr a-z A-Z</code></pre>
+<pre><code>bin/conductorctl workflow apply -f hello.yaml
+bin/conductorctl workflow start hello -input '{"name": "Ada"}' -wait</code></pre>
+    <p>Three things to notice. Inputs reach commands as environment variables (<code>INPUT_NAME</code>), never spliced into the command text. A step publishes outputs by appending <code>key=value</code> lines to the file named by <code>$CONDUCTOR_OUTPUT</code>. A later step reads them through a <code>${{ }}</code> expression in its <code>env</code>, and only a step that depends on it (directly or not) may.</p>
+
+    <h2 id="saga">See a saga undo itself</h2>
+    <p>The bundled <code>order_pipeline</code> workflow validates an order, reserves stock and charges the card in parallel, then ships. Ask it to fail at shipping:</p>
+<pre><code>bin/conductorctl workflow start order_pipeline \
+  -input '{"order_id": "A1", "fail_shipping": "true"}' -wait</code></pre>
+    <p>The run ends <code>FAILED</code>, and both parallel branches show <code>COMPENSATED</code>: the charge was refunded and the reservation released, each compensation seeing its own step's outputs. Open the run in the dashboard to watch it as a diagram, with the failed step and the undo drawn back along the route.</p>
+    <figure class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    V[validate] --> R[reserve_stock] & C[charge_card]
+    R & C --> S[ship]
+    S -. "fails" .-> UC["refund the charge"] & UR["release the reservation"]
+      </pre>
+      <figcaption>The order_pipeline example: when <code>ship</code> fails, both completed branches are compensated.</figcaption>
+    </figure>
+
+    <h2 id="schedule">A schedule</h2>
+<pre><code>bin/conductorctl schedule create hello-hourly -cron '@hourly' -workflow hello -input '{"name": "cron"}'
+bin/conductorctl schedule trigger hello-hourly     # fire it now
+bin/conductorctl schedule list</code></pre>
+
+    <h2 id="next">Next steps</h2>
+    <ul>
+      <li><a href="{{link:concepts}}">Core concepts</a>: what happens to a task between submit and result.</li>
+      <li><a href="{{link:workflows}}">Workflow reference</a>: parallel branches, defaults, retries, compensation, versioning.</li>
+      <li><a href="{{link:task-types}}">Task types</a>: HTTP calls, containers, Kubernetes pods, model calls, approvals and agents.</li>
+      <li><a href="{{link:deploying}}">Deploying</a>: from this laptop to a production cluster.</li>
+    </ul>

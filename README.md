@@ -18,6 +18,8 @@ Postgres is the only dependency.
 ![The dashboard's workflow run page: the failed step, why, and what was undone](docs/images/dashboard-workflow.png)
 
 > **Status:** pre-1.0 and under active development. See [plan.md](plan.md) for the roadmap and [DEVLOG.md](DEVLOG.md) for how it's built, with diagrams.
+>
+> **Documentation:** 13 pages from overview to operations, in [docs/slashdocs](docs/slashdocs), published to [slashdocs](https://github.com/razorpay/slashdocs) with `make docs-publish`.
 
 ## Architecture
 

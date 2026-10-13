@@ -1,0 +1,67 @@
+    <h2 id="principles">Principles</h2>
+    <p>Conductor runs other people's commands, so it is built to be safe by default rather than safe once configured:</p>
+    <ul>
+      <li>Every API request and every call between components is authenticated.</li>
+      <li>Inputs never become code: values reach commands only as environment variables.</li>
+      <li>Tasks run unprivileged, with a minimal environment, and never see Conductor's own secrets.</li>
+      <li>Privileges that are dangerous (the Docker socket, Kubernetes credentials) are opt-in and isolated.</li>
+      <li>Nothing leaves the cluster for a model unless a namespace opts in, and then only redacted.</li>
+    </ul>
+
+    <h2 id="api-keys">API keys</h2>
+    <ul>
+      <li>Clients send <code>Authorization: Bearer &lt;key&gt;</code>. Keys are random (256 bits) with a recognisable <code>cnd_</code> prefix, so secret scanners can find leaked ones.</li>
+      <li>Only a <strong>SHA-256 hash</strong> of each key is stored; the key itself is shown once, when created. Listings show a short prefix.</li>
+      <li><code>CONDUCTOR_API_KEY</code> creates the first admin key on startup. Create scoped keys per team or service and keep the admin key for administration:</li>
+    </ul>
+<pre><code>conductorctl apikey create billing-ci -namespace billing     # acts only in "billing"
+conductorctl apikey create ops -admin                        # any namespace, plus workers, cluster, keys
+conductorctl apikey list
+conductorctl apikey revoke KEY_ID</code></pre>
+    <p>The dashboard signs in with a key and acts with exactly its permissions. Components warn at startup while they use the development defaults (<code>insecure-dev-…</code>).</p>
+
+    <h2 id="namespaces">Namespaces and quotas</h2>
+    <p>A non-admin key sees and touches only its own namespace: its tasks, definitions, runs, schedules and queues. Quotas (<code>max_pending_tasks</code>, <code>max_concurrency</code>, daily model tokens and cost) stop one team from starving or bankrupting another. See <a href="{{link:concepts#namespaces}}">namespaces</a>.</p>
+
+    <h2 id="transport">Transport security</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Link</th><th>Protection</th></tr></thead>
+      <tbody>
+        <tr><td>Clients → API</td><td>TLS at your load balancer or Ingress; API keys on every request</td></tr>
+        <tr><td>API, workers ↔ coordinators</td><td>The cluster token on every gRPC call; with <code>CONDUCTOR_TLS_*</code>, mutual TLS. One certificate, whose SAN is <code>CONDUCTOR_TLS_SERVER_NAME</code>, is both server and client certificate, so workers with dynamic IPs still verify. On by default in the Helm chart, with a generated CA</td></tr>
+        <tr><td>Coordinators, API → Postgres</td><td><code>POSTGRES_SSLMODE</code> (<code>require</code> with CloudNativePG and the external-database defaults)</td></tr>
+        <tr><td>Workers → Postgres</td><td>None: workers never hold database credentials</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="injection">No injection by construction</h2>
+    <p>Workflow inputs, step outputs and model answers are data. They reach shell commands only as environment variables: <code>${{ }}</code> expressions are rejected in <code>run</code> and in agent tool commands, so <code>echo "$INPUT_NAME"</code> prints <code>1; rm -rf /</code> instead of running it. Agents receive the model's tool arguments the same way (<code>$ARG_&lt;NAME&gt;</code>). For <code>k8s</code> tasks, command, args and environment are escaped so Kubernetes' <code>$(VAR)</code> expansion can't read other variables. The end-to-end suite submits a malicious input and checks that nothing it describes ran.</p>
+
+    <h2 id="tasks">Task isolation</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Type</th><th>Runs as</th><th>Isolation</th></tr></thead>
+      <tbody>
+        <tr><td><code>shell</code>, <code>http</code></td><td>The worker's unprivileged user (UID 10001 in the image)</td><td>A minimal environment: no cluster token, no database password, no API key; only variables named in <code>CONDUCTOR_WORKER_PASS_ENV</code> pass through. On Kubernetes, a read-only root filesystem except the working directory and <code>/tmp</code>, no capabilities, and no service account token</td></tr>
+        <tr><td><code>container</code></td><td>A fresh container per attempt, with memory, CPU and network limits</td><td>The worker that starts it holds the Docker socket, which is root-equivalent on the host: opt-in, and best on hosts that run nothing else</td></tr>
+        <tr><td><code>k8s</code></td><td>A fresh pod per attempt, user 65534, no capabilities, no privilege escalation, RuntimeDefault seccomp</td><td>No service account token unless the task names an allowed account; no service-link variables; nothing may connect to it (NetworkPolicy)</td></tr>
+        <tr><td><code>llm</code></td><td>An HTTPS call from the worker</td><td>The provider key stays in the worker's environment, never in definitions, tasks or the database</td></tr>
+      </tbody>
+    </table></div>
+    <h3 id="k8s-credentials">Kubernetes credentials</h3>
+    <p>Creating pods needs a token, and a shell task runs as its worker's user, so it could read any token its worker has. The Helm chart therefore gives Kubernetes tasks a pool of their own that runs only <code>k8s</code> tasks (no task code), and that pool is the only one with a token: a Role limited to pods and their logs in the task namespace. Every other pool mounts none, and the chart refuses a pool mixing <code>k8s</code> with <code>shell</code> or <code>container</code>. Tasks may name only service accounts listed in <code>kubernetesTasks.serviceAccounts</code>; anyone who can submit tasks gets what those accounts can do, so keep the list short and the accounts narrow.</p>
+
+    <h2 id="secrets">Secrets</h2>
+    <ul>
+      <li><strong>Conductor's own</strong> (cluster token, admin key, database password, TLS keys, model keys) live in the environment or Kubernetes Secrets, never in the database or in task definitions.</li>
+      <li><strong>Your tasks' secrets:</strong> don't put them in task <code>env</code> or workflow definitions, which are stored in Postgres and visible to anyone with a key for the namespace. Give the worker pool the secret (a Kubernetes Secret through <code>extraEnv</code>) and allow it through with <code>passEnv</code>; or have tasks fetch it from a secret manager with their own identity.</li>
+      <li><strong>Output</strong> is stored as written. Avoid printing secrets; the operations assistant redacts before anything is sent to a model, but stored output isn't redacted.</li>
+    </ul>
+
+    <h2 id="network">Network policies</h2>
+    <p>The chart's NetworkPolicies (on by default) make each component accept only what it needs: coordinators accept the API and workers, workers accept coordinators, the dev database accepts coordinators and the API (and KEDA's namespace when autoscaling), task pods accept nothing. The API accepts anyone unless <code>networkPolicy.apiFrom</code> restricts it (the operator and <code>helm test</code> stay admitted); <code>/metrics</code> accepts anyone unless <code>networkPolicy.metricsFrom</code> restricts it. Egress is open, since workers call arbitrary HTTP endpoints and the database may be outside the cluster.</p>
+
+    <h2 id="ai">AI features</h2>
+    <p>Model calls you write (<code>llm</code> steps, agents) send what you put in their prompts. The operations assistant sends task data only for namespaces with <code>ai_assist</code> on, after redacting API keys, tokens, JWTs, passwords and credentials in URLs; it can only read (scoped to the namespace) and can't save anything. Drafted workflows are validated and scanned for risky commands, and a person has to save them.</p>
+
+    <h2 id="reporting">Reporting a vulnerability</h2>
+    <p>Until the project publishes a security policy with its open-source launch, report vulnerabilities privately to the maintainer through GitHub, not in a public issue.</p>

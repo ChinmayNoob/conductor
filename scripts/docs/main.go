@@ -311,7 +311,7 @@ func run(cli string, out any, args ...string) error {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()+" "+stdout.String()))
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()+" "+stdout.String()))
 	}
 	if err := json.Unmarshal(stdout.Bytes(), out); err != nil {
 		return errors.Join(fmt.Errorf("unexpected output from %s: %s", cli, stdout.String()), err)

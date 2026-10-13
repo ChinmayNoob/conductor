@@ -1,0 +1,68 @@
+    <h2 id="faq">Frequently asked questions</h2>
+    <dl class="fields">
+      <dt>Is delivery exactly once?</dt>
+      <dd>No, and no system that runs arbitrary side effects can promise that honestly. Delivery is <strong>at least once</strong>: a task whose worker dies is run again. What Conductor does guarantee is that only one result is recorded per task (attempt fencing), that a deposed leader changes nothing (epoch fencing), and that you get the tools to make effects idempotent: a stable <code>CONDUCTOR_TASK_ID</code>, a per-dispatch <code>CONDUCTOR_ATTEMPT</code>, and idempotency keys on submission. See <a href="{{link:concepts#delivery}}">delivery guarantees</a>.</dd>
+
+      <dt>Do I need Kubernetes?</dt>
+      <dd>No. One binary and Postgres are enough (<code>conductor dev</code>, or one process per component), and Docker Compose runs a highly available stack on one host. Kubernetes adds autoscaling, tasks as pods and GitOps.</dd>
+
+      <dt>Which languages can I use?</dt>
+      <dd>Any. Tasks are shell commands, HTTP calls, containers or pods, so your code is whatever those run. Clients use the HTTP API; a Go SDK (<code>pkg/client</code>) and the <code>conductorctl</code> CLI are included.</dd>
+
+      <dt>How fast is it?</dt>
+      <dd>On a laptop with everything in one Docker VM: about 800 no-op tasks per second drained, around 1,000 submissions per second, about 5 ms from submit to dispatch when idle, and under 10 ms dispatch (p50) at 200 tasks per second. Postgres is the limit; see <a href="{{link:operations#scaling}}">scaling</a>.</dd>
+
+      <dt>What happens if Postgres goes down?</dt>
+      <dd>Nothing is dispatched or recorded while it is down. Running tasks keep running, and workers retry reporting their results for up to 30 seconds per report. When Postgres returns, coordinators reconnect and re-elect a leader, and anything whose result was lost is recovered as lost and retried. The chaos suite restarts Postgres under load and checks that nothing is lost.</dd>
+
+      <dt>Can a workflow branch on a condition, or loop?</dt>
+      <dd>Not today: a workflow is a DAG, and every step runs once its dependencies complete. A step can decide to do nothing (exit 0) based on an earlier step's output, and an <code>agent</code> step loops by design. Conditional steps are a candidate for a future release.</dd>
+
+      <dt>How long can a task run?</dt>
+      <dd>As long as its <code>timeout</code> allows. For long tasks, size the workers' shutdown timeout to them, or accept that a deploy or scale-down retries them elsewhere; make them resumable if that matters.</dd>
+
+      <dt>Can teams share one installation?</dt>
+      <dd>Yes: namespaces separate tasks, definitions, runs, schedules, queues and keys, with quotas per namespace. Admin keys span them all.</dd>
+
+      <dt>Where does output go?</dt>
+      <dd>Into Postgres, on the task (1 MB by default, keeping the beginning and the end). Previous attempts keep theirs. Keep large artefacts in object storage and pass references through outputs.</dd>
+
+      <dt>Is the name final?</dt>
+      <dd>No. "Conductor" is already a well-known workflow engine (Netflix Conductor, now Conductor OSS), so the project will be renamed before its open-source launch; the module path, images and docs will follow.</dd>
+
+      <dt>What is the licence?</dt>
+      <dd>Apache 2.0.</dd>
+    </dl>
+
+    <h2 id="comparison">How it compares</h2>
+    <p>Every tool below is good at what it was built for. This is where Conductor fits among them; check each project's own documentation for current details.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Conductor</th><th>Temporal</th><th>Airflow</th><th>River</th><th>Hatchet</th></tr></thead>
+      <tbody>
+        <tr><td><strong>What it is</strong></td><td>A durable task and workflow service</td><td>A durable execution platform</td><td>A data pipeline orchestrator</td><td>A job queue library for Go</td><td>A task orchestration platform</td></tr>
+        <tr><td><strong>Workflows written as</strong></td><td>YAML DAGs of tasks (commands, HTTP, containers, pods, model calls)</td><td>Code in SDK languages, replayed deterministically</td><td>Python DAGs of operators</td><td>Jobs in Go code</td><td>Code in SDK languages</td></tr>
+        <tr><td><strong>Runs on</strong></td><td>Postgres only</td><td>Its server cluster plus a database, optionally a search index</td><td>A metadata database plus an executor (often a broker such as Redis or RabbitMQ, or Kubernetes)</td><td>Your application and its Postgres</td><td>Its server plus Postgres</td></tr>
+        <tr><td><strong>Strongest at</strong></td><td>Reliable jobs, sagas and AI steps with almost no infrastructure; tasks in any language</td><td>Long-running business logic in code, at very large scale, with a mature ecosystem</td><td>Scheduled batch data pipelines, with many integrations</td><td>Enqueueing jobs in the same transaction as your data, inside a Go app</td><td>Developer-friendly durable tasks from application code</td></tr>
+        <tr><td><strong>Choose it over Conductor when</strong></td><td></td><td>You want workflows as code with replay, signals and queries, and can run its cluster</td><td>Your work is data pipelines with dataset scheduling and lineage</td><td>Your jobs live in one Go service and should commit with its data</td><td>You want to define tasks in application code with its SDKs</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout ok">
+      <strong class="label">Conductor in one line</strong>
+      Pick it when you want durable workflows, retries, sagas and AI agents for work in any language, and the only thing you want to operate is Postgres.
+    </div>
+
+    <h2 id="limits">Known limits</h2>
+    <ul>
+      <li>Workflows are DAGs: no conditional steps or loops (agents excepted).</li>
+      <li>Throughput is bounded by one Postgres; the leader does the dispatching, so scaling past a few hundred tasks per second needs a stronger database, not more coordinators.</li>
+      <li>Container images are not published yet; build them from the repository.</li>
+      <li>The assistant's own model spend doesn't count against namespace budgets, and identical prompts aren't cached.</li>
+      <li>Kubernetes tasks run as bare pods (one per attempt), not Jobs; their outputs are limited to 4 KB.</li>
+      <li>The chart's NetworkPolicies restrict ingress only.</li>
+    </ul>
+
+    <h2 id="more">More reading</h2>
+    <ul>
+      <li>In the repository: <code>plan.md</code> (the roadmap), <code>DEVLOG.md</code> (how each phase was built, with diagrams), <code>docs/adr</code> (design decisions), <code>BENCHMARKS.md</code> (numbers and how they were measured).</li>
+      <li>In these docs: start at the <a href="{{link:overview}}">overview</a>, or jump to the <a href="{{link:quickstart}}">quickstart</a>.</li>
+    </ul>

@@ -1,0 +1,191 @@
+    <h2 id="shape">The shape of a definition</h2>
+    <p>A workflow definition is YAML (or JSON) describing a directed acyclic graph of steps. Each step runs one action, optionally after others, and may say how to undo itself.</p>
+<pre><code>name: order_pipeline                 # lowercase letters, digits, '-' or '_'
+description: Reserve, charge, ship.
+inputs:
+  order_id: {required: true}
+  amount: {default: "100"}
+defaults:                            # for every step, unless the step says otherwise
+  retries: 1
+  retry_delay: 2s
+  timeout: 1m
+budget: {max_tokens: 50000}          # optional cap on model spend for the run
+steps:
+  - name: validate
+    run: echo "customer=cus_$INPUT_ORDER_ID" &gt;&gt; "$CONDUCTOR_OUTPUT"
+
+  - name: reserve_stock
+    depends_on: [validate]
+    run: echo "reservation=res_$INPUT_ORDER_ID" &gt;&gt; "$CONDUCTOR_OUTPUT"
+    compensate: echo "releasing $OUTPUT_RESERVATION"
+
+  - name: charge_card
+    depends_on: [validate]
+    env:
+      CUSTOMER: "${{ steps.validate.outputs.customer }}"
+    run: ./charge.sh "$CUSTOMER" "$INPUT_AMOUNT"
+    compensate: ./refund.sh
+
+  - name: ship
+    depends_on: [reserve_stock, charge_card]
+    retries: 0
+    run: ./ship.sh</code></pre>
+<pre><code>conductorctl workflow apply -f order_pipeline.yaml     # a new version only if it changed
+conductorctl workflow start order_pipeline -input '{"order_id": "A1"}' -wait</code></pre>
+    <p>Unknown fields are rejected, so a typo such as <code>depend_on</code> fails loudly instead of silently doing nothing. The whole definition is validated when you apply it: names, the graph, every expression, every step's settings.</p>
+
+    <h2 id="top-level">Top-level fields</h2>
+    <dl class="fields">
+      <dt><code>name</code> (required)</dt><dd>1 to 63 characters: lowercase letters, digits, <code>-</code> or <code>_</code>, starting with a letter or digit. Unique per namespace; applying again creates a new version.</dd>
+      <dt><code>description</code></dt><dd>Shown in listings and the dashboard.</dd>
+      <dt><code>inputs</code></dt><dd>Declared inputs: each may be <code>required: true</code>, have a <code>default</code>, and a <code>description</code>. When inputs are declared, a run may pass only those. Without declarations, any input is accepted.</dd>
+      <dt><code>defaults</code></dt><dd>Step options applied to every step: <code>retries</code>, <code>retry_delay</code>, <code>timeout</code>, <code>priority</code>, <code>queue</code>, <code>labels</code>.</dd>
+      <dt><code>budget</code></dt><dd><code>max_tokens</code> and/or <code>max_cost_usd</code> for model calls across the run. Going over fails the run, which compensates like any failure.</dd>
+      <dt><code>steps</code> (required)</dt><dd>At least one step.</dd>
+    </dl>
+
+    <h2 id="inputs">Inputs</h2>
+    <p>A run's inputs reach every step as environment variables named <code>INPUT_&lt;NAME&gt;</code> (upper-cased), and expressions can use them as <code>${{ inputs.name }}</code>. Strings pass through as they are; numbers, booleans, lists and objects become their JSON text.</p>
+<pre><code>inputs:
+  user_id: {required: true, description: The customer}
+  region: {default: eu}
+  dry_run: {default: "false"}</code></pre>
+    <p>Starting a run without a required input, or with an undeclared one, is refused with HTTP 400 before anything runs.</p>
+
+    <h2 id="steps">Steps</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>required</td><td>Unique in the workflow; same rules as the workflow name</td></tr>
+        <tr><td><code>depends_on</code></td><td>none</td><td>Steps that must complete first. Steps with no dependencies start immediately; independent steps run in parallel</td></tr>
+        <tr><td><code>type</code></td><td><code>shell</code></td><td><code>shell</code>, <code>http</code>, <code>container</code>, <code>k8s</code>, <code>llm</code>, <code>approval</code>, <code>signal</code> or <code>agent</code></td></tr>
+        <tr><td><code>run</code></td><td></td><td>The shell command (shell steps)</td></tr>
+        <tr><td><code>http</code>, <code>container</code>, <code>k8s</code>, <code>llm</code>, <code>approval</code>, <code>signal</code>, <code>agent</code></td><td></td><td>The settings of that type, and only of that type (see <a href="{{link:task-types}}">task types</a>)</td></tr>
+        <tr><td><code>env</code></td><td></td><td>Environment variables for the step; values may use expressions</td></tr>
+        <tr><td><code>compensate</code></td><td>none</td><td>How to undo the step: a shell command string, or a full action</td></tr>
+        <tr><td><code>retries</code></td><td>2</td><td>Retries after the first attempt</td></tr>
+        <tr><td><code>retry_delay</code></td><td>5s</td><td>Base delay, doubling per attempt, at most an hour</td></tr>
+        <tr><td><code>timeout</code></td><td>5m</td><td>Per attempt</td></tr>
+        <tr><td><code>priority</code></td><td>5</td><td>1 (most urgent) to 10</td></tr>
+        <tr><td><code>queue</code></td><td><code>default</code></td><td>The queue the step's task goes to</td></tr>
+        <tr><td><code>labels</code></td><td></td><td>Labels a worker must have to run the step</td></tr>
+      </tbody>
+    </table></div>
+    <p>Durations are Go durations (<code>90s</code>, <code>5m</code>, <code>1h30m</code>) or whole seconds (<code>90</code>). Precedence is: built-in defaults, then the workflow's <code>defaults</code>, then the step's own settings.</p>
+
+    <h2 id="expressions">Expressions</h2>
+    <p>Values computed at run time are written <code>${{ … }}</code>. Three references exist:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Expression</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>${{ inputs.NAME }}</code></td><td>A run input</td></tr>
+        <tr><td><code>${{ steps.STEP.outputs.KEY }}</code></td><td>An output of an earlier step; <code>STEP</code> must be a dependency, direct or indirect</td></tr>
+        <tr><td><code>${{ workflow.id }}</code></td><td>The run's ID</td></tr>
+      </tbody>
+    </table></div>
+    <p>Expressions are allowed in <code>env</code> values, <code>http.url</code>, <code>http.body</code> and headers, <code>container.command</code>, <code>k8s.command</code> and <code>k8s.args</code>, <code>llm.prompt</code> and <code>llm.system</code>, <code>approval.message</code>, and <code>agent.prompt</code> and <code>agent.system</code>.</p>
+    <div class="callout warn">
+      <strong class="label">Never in <code>run</code></strong>
+      Expressions are rejected in shell commands (<code>run</code>) and in agent tool commands. Put the value in <code>env</code> and use <code>$VARIABLE</code> in the command instead. Values then reach the shell only as data, so an input like <code>1; rm -rf /</code> can never be interpreted as code. This is the design, not a limitation: there is no injection to defend against.
+    </div>
+<pre><code>- name: notify
+  depends_on: [charge_card]
+  env:
+    CHARGE: "${{ steps.charge_card.outputs.charge_id }}"
+    RUN: "${{ workflow.id }}"
+  run: ./notify.sh "$CHARGE" "$RUN"</code></pre>
+
+    <h2 id="outputs">Outputs</h2>
+    <p>A step publishes outputs by appending <code>key=value</code> lines to the file named by <code>$CONDUCTOR_OUTPUT</code>; later lines win. Keys are letters, digits, <code>_</code> and <code>-</code>, starting with a letter or <code>_</code>. Other steps read them through <code>${{ steps.STEP.outputs.KEY }}</code>, and the step's own compensation sees them as <code>OUTPUT_&lt;KEY&gt;</code>.</p>
+<pre><code>run: |
+  id=$(./create_reservation.sh)
+  echo "reservation=$id" &gt;&gt; "$CONDUCTOR_OUTPUT"</code></pre>
+    <p>Other types produce outputs too: an <code>http</code> step returns <code>status</code> and <code>body</code>, an <code>llm</code> step <code>text</code> or its schema's fields, an approval <code>comment</code> and <code>decided_by</code>, a signal its payload's fields, an agent <code>answer</code>. Outputs are limited to 64 KB per step (4 KB for <code>k8s</code> steps).</p>
+
+    <h2 id="compensation">Compensation</h2>
+    <p>When a step fails for good, or the run is cancelled, Conductor cancels the steps still running, skips the ones not yet started, and runs the compensation of every completed step, in <strong>reverse dependency order</strong>: a step is undone only after everything that depended on it has been undone.</p>
+<pre><code>compensate: ./refund.sh "$OUTPUT_CHARGE_ID"          # shorthand: a shell command
+
+compensate:                                          # or any action
+  type: http
+  http:
+    method: POST
+    url: https://payments.internal/refunds
+    body: '{"charge": "${{ steps.charge_card.outputs.charge_id }}"}'</code></pre>
+    <ul>
+      <li>A compensation runs with the step's queue, labels and retry settings, and sees the step's outputs as <code>OUTPUT_&lt;KEY&gt;</code>.</li>
+      <li>Steps without <code>compensate</code> are left as they are.</li>
+      <li>A compensation that fails after its retries marks the step <code>COMPENSATION_FAILED</code>; the run still ends <code>FAILED</code>, and the dashboard shows what could not be undone.</li>
+      <li>Make compensations idempotent, like any task: they are delivered at least once.</li>
+    </ul>
+
+    <h2 id="statuses">Run and step statuses</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Run status</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>RUNNING</code></td><td>Steps are running or waiting</td></tr>
+        <tr><td><code>COMPENSATING</code></td><td>A step failed (or a cancel was requested); completed steps are being undone</td></tr>
+        <tr><td><code>COMPLETED</code></td><td>Every step completed</td></tr>
+        <tr><td><code>FAILED</code></td><td>A step failed and compensation has finished</td></tr>
+        <tr><td><code>CANCELLED</code></td><td>Cancelled and compensated</td></tr>
+      </tbody>
+    </table></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Step status</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>PENDING</code></td><td>Waiting for its dependencies</td></tr>
+        <tr><td><code>RUNNING</code></td><td>Its task is queued or running, or it is waiting for an approval or signal</td></tr>
+        <tr><td><code>COMPLETED</code>, <code>FAILED</code>, <code>CANCELLED</code></td><td>How its task ended</td></tr>
+        <tr><td><code>SKIPPED</code></td><td>Never ran, because the run failed first</td></tr>
+        <tr><td><code>COMPENSATING</code>, <code>COMPENSATED</code>, <code>COMPENSATION_FAILED</code></td><td>Its undo is running, finished, or failed</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="versions">Versions</h2>
+    <p>Applying a definition stores it as a new version only if it differs from the latest one. A run takes a snapshot of the version it starts with, so changing a workflow never affects runs in flight. Start an older version explicitly when you need to:</p>
+<pre><code>conductorctl workflow defs                         # names and latest versions
+conductorctl workflow show order_pipeline -version 3
+conductorctl workflow start order_pipeline -version 3 -input '{"order_id": "B7"}'</code></pre>
+
+    <h2 id="running">Running and controlling runs</h2>
+<pre><code>conductorctl workflow start NAME [-input JSON] [-version N] [-key IDEMPOTENCY_KEY] [-wait]
+conductorctl workflow get RUN_ID                  # status, each step, outputs, errors
+conductorctl workflow watch RUN_ID                # follow it until it finishes
+conductorctl workflow cancel RUN_ID               # cancel running steps, compensate completed ones
+conductorctl workflow list -limit 20</code></pre>
+    <p>A run started with an idempotency key (<code>-key</code>) is created once: starting it again with the same key returns the first run. The dashboard draws each run as a live diagram: green steps done, the failed step marked with its error, and compensation drawn back along the route.</p>
+
+    <h2 id="validation">Validation rules</h2>
+    <ul>
+      <li>Step names are unique; every <code>depends_on</code> names an existing step, listed once.</li>
+      <li>The graph has no cycles. A cycle is reported with its path, e.g. <code>a -&gt; b -&gt; a</code>.</li>
+      <li>Each step has the settings of its type and no others: a shell step can't have <code>http</code>, an <code>http</code> step needs <code>http.url</code>, and so on.</li>
+      <li>Expressions refer to declared inputs, to steps that are dependencies, or to <code>workflow.id</code>.</li>
+      <li><code>env</code> names are valid environment variable names.</li>
+      <li>Retries, delays and timeouts aren't negative; priority is 1 to 10; queue names follow the naming rule.</li>
+    </ul>
+    <p>Every problem is reported at once, so one <code>apply</code> shows everything to fix.</p>
+
+    <h2 id="patterns">Patterns</h2>
+    <h3 id="fan-out">Fan out and in</h3>
+<pre><code>steps:
+  - {name: fetch_a, run: ./fetch.sh a}
+  - {name: fetch_b, run: ./fetch.sh b}
+  - {name: fetch_c, run: ./fetch.sh c}
+  - name: merge
+    depends_on: [fetch_a, fetch_b, fetch_c]      # starts when all three completed
+    run: ./merge.sh</code></pre>
+    <h3 id="approval-gate">A human gate</h3>
+<pre><code>  - name: approve_refund
+    depends_on: [assess]
+    type: approval
+    approval:
+      message: "Refund ${{ steps.assess.outputs.amount }} to ${{ inputs.customer }}?"
+      timeout: 24h
+      on_timeout: reject        # rejecting fails the step, and completed steps are compensated</code></pre>
+    <h3 id="routing">Routing a step to special workers</h3>
+<pre><code>  - name: render
+    labels: {pool: gpu}          # only the dedicated gpu pool
+    queue: rendering             # which may have its own concurrency limit
+    timeout: 30m
+    run: ./render.sh</code></pre>

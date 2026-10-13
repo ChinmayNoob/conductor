@@ -1,0 +1,129 @@
+    <h2 id="summary">At a glance</h2>
+    <p>Every step of a workflow, and every task, has a <code>type</code>. Five types run as tasks on workers; three are workflow-only steps that wait or orchestrate.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Type</th><th>Runs</th><th>Where</th><th>Outputs</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#shell"><code>shell</code></a> (default)</td><td>A command with <code>sh -c</code></td><td>Any worker</td><td>Lines written to <code>$CONDUCTOR_OUTPUT</code></td></tr>
+        <tr><td><a href="#http"><code>http</code></a></td><td>One HTTP request</td><td>Any worker</td><td><code>status</code>, <code>body</code></td></tr>
+        <tr><td><a href="#container"><code>container</code></a></td><td>A Docker container, to completion</td><td>Workers with the Docker socket</td><td>None (output is the container's logs)</td></tr>
+        <tr><td><a href="#k8s"><code>k8s</code></a></td><td>A Kubernetes pod per attempt</td><td>The Kubernetes task pool</td><td>Lines written to <code>$CONDUCTOR_OUTPUT</code> (4 KB)</td></tr>
+        <tr><td><a href="#llm"><code>llm</code></a></td><td>One model call</td><td>Workers with a model configured</td><td><code>text</code>, or the schema's fields</td></tr>
+        <tr><td><a href="#approval"><code>approval</code></a> (steps only)</td><td>Nothing: waits for a person</td><td>No worker</td><td><code>comment</code>, <code>decided_by</code></td></tr>
+        <tr><td><a href="#signal"><code>signal</code></a> (steps only)</td><td>Nothing: waits for a system</td><td>No worker</td><td>The signal's fields</td></tr>
+        <tr><td><a href="#agent"><code>agent</code></a> (steps only)</td><td>A model with tools, in a loop</td><td>Model calls on model workers, tools on shell workers</td><td><code>answer</code></td></tr>
+      </tbody>
+    </table></div>
+    <p>Workers advertise a <code>type.&lt;name&gt;</code> label for each type they can run, and a task is only dispatched to a worker that advertises its type. A step has the settings of its own type and no others; mixing them (say, <code>run</code> and <code>http</code>) is rejected.</p>
+
+    <h2 id="shell">shell</h2>
+<pre><code>- name: backup
+  run: |
+    pg_dump "$DATABASE" | gzip &gt; /backups/$(date +%F).sql.gz
+    echo "file=/backups/$(date +%F).sql.gz" &gt;&gt; "$CONDUCTOR_OUTPUT"
+  env: {DATABASE: "${{ inputs.database }}"}
+  timeout: 30m</code></pre>
+    <p>The command runs with <code>sh -c</code> on the worker, as the worker's unprivileged user, in the minimal task environment. Cancellation and timeouts kill its whole process group. As a standalone task: <code>conductorctl task submit -cmd '...'</code>.</p>
+
+    <h2 id="http">http</h2>
+<pre><code>- name: notify
+  type: http
+  http:
+    method: POST                                  # GET (default), POST, PUT, PATCH, DELETE, HEAD
+    url: https://hooks.example.com/orders/${{ inputs.order_id }}
+    headers: {Authorization: "Bearer ${{ steps.login.outputs.token }}"}
+    body: '{"status": "shipped"}'                  # Content-Type defaults to application/json
+    expect_status: [200, 202]                      # default: any 2xx</code></pre>
+    <p>The task succeeds when the response status is expected. Its outputs are <code>status</code> and <code>body</code> (when the body fits in 64 KB), and its output is the status line plus the body. URL, body and headers may use expressions. Standalone: <code>conductorctl task submit -url URL -method POST -body '{...}' -header K=V</code>.</p>
+
+    <h2 id="container">container</h2>
+<pre><code>- name: transcode
+  type: container
+  container:
+    image: jrottenberg/ffmpeg:6.1-alpine
+    command: ["-i", "${{ inputs.source }}", "/out/video.mp4"]
+    memory: 512m          # k, m or g
+    cpus: 1.5
+    network: none         # bridge (default) or none</code></pre>
+    <p>Runs a Docker container to completion on a worker that can reach the Docker daemon (<code>CONDUCTOR_DOCKER_SOCKET</code>), pulling the image if needed, and removes it afterwards, also when cancelled. The task's environment is passed in; the output is the container's logs. Because access to the Docker socket is equivalent to root on the host, such workers are opt-in (<code>docker compose --profile containers</code>). On Kubernetes, use <code>k8s</code> instead.</p>
+
+    <h2 id="k8s">k8s</h2>
+<pre><code>- name: report
+  type: k8s
+  k8s:
+    image: ghcr.io/acme/reports:1.4
+    command: [python, -m, reports]                 # replaces the image's entrypoint
+    args: [build, "${{ inputs.day }}"]
+    cpu: 500m                                      # request and limit
+    memory: 512Mi                                  # request and limit
+    service_account: reports-reader                # optional; must be allowed
+    node_selector: {cloud.google.com/gke-spot: "true"}
+    run_as_user: 1000                              # optional; default 65534</code></pre>
+    <p>Each attempt runs as its own pod, created by the Kubernetes task pool through the Kubernetes API. The worker watches the pod, streams its logs live, and deletes it when the task finishes, times out or is cancelled.</p>
+    <ul>
+      <li><strong>Least privilege by default:</strong> user 65534, no capabilities, no privilege escalation, the RuntimeDefault seccomp profile, no service-link variables, and no service account token. A task may name only a service account the chart allows (<code>kubernetesTasks.serviceAccounts</code>); naming another fails it permanently.</li>
+      <li><strong>Verbatim strings:</strong> command, args and environment reach the container exactly as written; Kubernetes' <code>$(VAR)</code> expansion is escaped away.</li>
+      <li><strong>Outputs</strong> use the same <code>$CONDUCTOR_OUTPUT</code> contract as shell steps. Inside the pod that file is the container's termination message, which the kubelet keeps up to 4 KB; larger outputs fail the task rather than arrive truncated.</li>
+      <li><strong>Failing fast:</strong> an invalid image name fails permanently; an image that can't be pulled, or a configuration error, fails the attempt. A timeout says when the pod was never scheduled (for example "0/3 nodes have a GPU").</li>
+      <li><strong>Cleanup:</strong> task pods are owned by the worker's pod, stop by themselves a minute past their timeout, and are swept up if a worker dies.</li>
+    </ul>
+    <p>Standalone: <code>conductorctl task submit -type k8s -image alpine:3.20 -memory 64Mi -- echo hello</code>. Enable it with <code>kubernetesTasks.enabled</code> in the chart (see <a href="{{link:deploying#k8s-tasks}}">Deploying</a>).</p>
+
+    <h2 id="llm">llm</h2>
+<pre><code>- name: classify
+  type: llm
+  llm:
+    model: gpt-4o-mini                             # default: CONDUCTOR_LLM_MODEL
+    system: You triage support tickets.
+    prompt: "Ticket: ${{ inputs.ticket }}"
+    schema:                                        # optional: a JSON Schema object
+      type: object
+      properties: {severity: {type: string, enum: [low, high]}, team: {type: string}}
+      required: [severity, team]
+      additionalProperties: false
+    max_tokens: 300
+    temperature: 0</code></pre>
+    <p>One call to a Chat Completions API (OpenAI, or any compatible server: Ollama, vLLM, LiteLLM, Azure OpenAI). Without a schema the answer is the <code>text</code> output; with one, the model must answer with a matching JSON object and its top-level fields become outputs. Token usage and cost are recorded per task. Rate limits honour <code>Retry-After</code>, and permanent errors (a bad key, an unknown model) skip the retries. Details in <a href="{{link:ai#llm}}">AI features</a>.</p>
+
+    <h2 id="approval">approval</h2>
+<pre><code>- name: sign_off
+  type: approval
+  approval:
+    message: "Ship order ${{ inputs.order_id }}?"
+    timeout: 24h
+    on_timeout: reject            # reject (default) or approve</code></pre>
+    <p>The run pauses at this step without holding a worker until someone approves or rejects it: <code>conductorctl workflow approve|reject RUN STEP -comment "..."</code>, the dashboard's Approvals page, or the API. Approving completes the step with outputs <code>comment</code> and <code>decided_by</code> (the API key's name, or <code>timeout</code>). Rejecting fails it, so completed steps are compensated. <code>conductorctl approvals</code> lists what is waiting.</p>
+
+    <h2 id="signal">signal</h2>
+<pre><code>- name: wait_for_payment
+  type: signal
+  signal:
+    name: payment-confirmed
+    timeout: 2h                   # then the step fails</code></pre>
+    <p>The run pauses until another system sends the named signal to it:</p>
+<pre><code>conductorctl workflow signal RUN_ID payment-confirmed -data '{"amount": "42.00", "ref": "pay_123"}'
+curl -X POST -H "Authorization: Bearer $KEY" -d '{"amount": "42.00"}' \
+  $CONDUCTOR_URL/v1/workflows/RUN_ID/signals/payment-confirmed</code></pre>
+    <p>The payload's top-level fields become the step's outputs. A signal sent before the run reaches the step is kept for it, so the sender doesn't need to know where the run is.</p>
+
+    <h2 id="agent">agent</h2>
+<pre><code>- name: investigate
+  type: agent
+  agent:
+    prompt: Find out why checkout latency rose this morning, and say what to do.
+    system: You are an SRE. Be concise.
+    model: gpt-4o-mini
+    max_turns: 8                  # model calls (default 10, at most 100)
+    max_tool_calls: 30            # default 50
+    max_duration: 10m             # default 15m
+    budget: {max_cost_usd: 0.25}
+    tools:
+      - name: recent_errors
+        description: The last errors from a service's log
+        parameters:
+          type: object
+          properties: {service: {type: string}}
+          required: [service]
+        run: tail -n 50 "/var/log/$ARG_SERVICE.log"
+        timeout: 1m               # default 2m</code></pre>
+    <p>The model calls tools in a loop until it answers; the answer is the <code>answer</code> output. Every model call is an <code>llm</code> task and every tool call is a shell task, each created exactly once with its own idempotency key, so if a worker dies mid-run the agent resumes from the last finished call and only the call in flight runs again.</p>
+    <p>A tool's arguments arrive as environment variables, never in the command line: each top-level argument as <code>$ARG_&lt;NAME&gt;</code>, all of them as JSON in <code>$TOOL_ARGS</code>, with <code>$TOOL_NAME</code> and <code>$TOOL_CALL_ID</code>. The step's <code>env</code>, inputs and run variables are available too. The tool's output is what the model sees. The dashboard shows the whole conversation and every call.</p>

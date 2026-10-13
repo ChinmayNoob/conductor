@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}} · Conductor docs</title>
+<style>
+  :root {
+    --bg: #ffffff; --surface: #f6f7f9; --surface-2: #eef0f4; --ink: #15181e; --muted: #5b6372;
+    --line: #dde1e8; --accent: #2f5bd8; --accent-ink: #ffffff; --code-bg: #f3f4f7;
+    --note: #2f5bd8; --warn: #b26a00; --ok: #1f7a4d; --danger: #b42318;
+    --note-bg: #edf2ff; --warn-bg: #fff6e5; --ok-bg: #eaf7f0; --danger-bg: #fdecea;
+  }
+  :root[data-slashdocs-theme="dark"] {
+    --bg: #0f1218; --surface: #161a22; --surface-2: #1d222c; --ink: #e6eaf2; --muted: #9aa3b2;
+    --line: #2a303c; --accent: #7aa2ff; --accent-ink: #0f1218; --code-bg: #171b23;
+    --note: #7aa2ff; --warn: #f0b14a; --ok: #5ccf94; --danger: #ff8a7a;
+    --note-bg: #162038; --warn-bg: #2a2112; --ok-bg: #11261c; --danger-bg: #2c1614;
+  }
+  html { color-scheme: light; }
+  :root[data-slashdocs-theme="dark"] { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  a { color: var(--accent); }
+  .layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 40px; max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 20px 16px 48px; } }
+  nav.docs { font-size: 14px; position: sticky; top: 16px; align-self: start; }
+  @media (max-width: 900px) { nav.docs { position: static; } }
+  nav.docs .brand { font-weight: 700; font-size: 15px; margin-bottom: 12px; display: block; color: var(--ink); text-decoration: none; }
+  nav.docs ol { list-style: none; margin: 0; padding: 0; }
+  nav.docs li a { display: block; padding: 5px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+  nav.docs li a:hover { background: var(--surface-2); color: var(--ink); }
+  nav.docs li a[aria-current="page"] { background: var(--surface-2); color: var(--ink); font-weight: 600; }
+  main { min-width: 0; }
+  header.page { border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 28px; }
+  header.page .eyebrow { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  header.page h1 { font-size: 34px; line-height: 1.2; margin: 6px 0 10px; }
+  header.page p.summary { font-size: 18px; color: var(--muted); margin: 0; max-width: 72ch; }
+  .toc { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; margin: 0 0 32px; font-size: 14px; }
+  .toc strong { display: block; margin-bottom: 6px; }
+  .toc ol { margin: 0; padding-left: 20px; columns: 2; column-gap: 32px; }
+  @media (max-width: 700px) { .toc ol { columns: 1; } }
+  h2 { font-size: 25px; margin: 44px 0 12px; padding-top: 4px; border-top: 1px solid var(--line); padding-top: 28px; }
+  h3 { font-size: 19px; margin: 28px 0 8px; }
+  h4 { font-size: 16px; margin: 20px 0 6px; }
+  p, li { max-width: 78ch; }
+  code { font: 0.9em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; }
+  pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+  .table-wrap { overflow-x: auto; margin: 14px 0 20px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { background: var(--surface); font-weight: 600; }
+  td code, th code { white-space: nowrap; }
+  .callout { border-left: 4px solid var(--note); background: var(--note-bg); border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 18px 0; }
+  .callout.warn { border-color: var(--warn); background: var(--warn-bg); }
+  .callout.ok { border-color: var(--ok); background: var(--ok-bg); }
+  .callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  .callout > :first-child { margin-top: 0; } .callout > :last-child { margin-bottom: 0; }
+  .callout strong.label { display: block; margin-bottom: 2px; }
+  figure.diagram { margin: 20px 0 26px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  figure.diagram figcaption { font-size: 13.5px; color: var(--muted); margin-top: 10px; }
+  pre.mermaid { background: none; border: 0; padding: 0; margin: 0; text-align: center; white-space: pre; }
+  pre.mermaid:not([data-processed]) { text-align: left; color: var(--muted); font-size: 12.5px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 16px 0 24px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--surface); }
+  .card h4 { margin: 0 0 6px; }
+  .card p { margin: 0; font-size: 14.5px; color: var(--muted); }
+  .card a { text-decoration: none; }
+  .pager { display: flex; justify-content: space-between; gap: 12px; margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 15px; }
+  .pager a { text-decoration: none; }
+  footer.meta { margin-top: 24px; font-size: 13px; color: var(--muted); }
+  kbd { font: 0.85em ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; }
+  dl.fields dt { font-weight: 600; margin-top: 12px; }
+  dl.fields dt code { font-weight: 600; }
+  dl.fields dd { margin: 2px 0 0 0; color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <nav class="docs" aria-label="Conductor documentation">
+    <a class="brand" href="{{HOME}}">Conductor docs</a>
+    <ol>
+{{NAV}}
+    </ol>
+  </nav>
+  <main>
+    <header class="page">
+      <div class="eyebrow">Conductor documentation · {{NUMBER}} of {{TOTAL}}</div>
+      <h1>{{TITLE}}</h1>
+      <p class="summary">{{SUMMARY}}</p>
+    </header>
+    <div class="toc"><strong>On this page</strong><ol>
+{{TOC}}
+    </ol></div>
+{{CONTENT}}
+    <div class="pager">{{PAGER}}</div>
+    <footer class="meta">Built from <code>docs/slashdocs/pages/{{SLUG}}.html</code> in the Conductor repository at {{REVISION}}.</footer>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<script>
+  // Render diagrams in the reader's theme, and again when it changes. The
+  // diagram source stays readable if the script can't load.
+  (function () {
+    var blocks = Array.prototype.slice.call(document.querySelectorAll("pre.mermaid"));
+    blocks.forEach(function (b) { if (!b.dataset.source) b.dataset.source = b.textContent; });
+    function theme() { return document.documentElement.getAttribute("data-slashdocs-theme") === "dark" ? "dark" : "default"; }
+    function render() {
+      if (!window.mermaid) return;
+      blocks.forEach(function (b) { b.removeAttribute("data-processed"); b.textContent = b.dataset.source; });
+      window.mermaid.initialize({ startOnLoad: false, theme: theme(), securityLevel: "strict", flowchart: { htmlLabels: false } });
+      window.mermaid.run({ nodes: blocks }).catch(function () {});
+    }
+    render();
+    window.addEventListener("slashdocs:theme", render);
+  })();
+</script>
+</body>
+</html>

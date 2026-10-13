@@ -8,7 +8,7 @@ COMPOSE             ?= docker compose
 WORKERS             ?= 3
 
 .PHONY: help build test test-db lint fmt proto up down logs e2e chaos bench clean \
-        operator operator-generate helm-lint kind-up kind-down e2e-k8s
+        operator operator-generate helm-lint kind-up kind-down e2e-k8s docs docs-publish
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -79,6 +79,14 @@ kind-down: ## Delete the kind cluster
 e2e-k8s: kind-up ## Run the end-to-end suite on the kind cluster
 	E2E_PLATFORM=kubernetes E2E_API_URL=http://localhost:30081 E2E_API_KEY=$$(./scripts/kind-up.sh --api-key) \
 		E2E_LLM=mock go test -tags e2e -count=1 -v -timeout 40m ./test/e2e/
+
+# --- Documentation ---
+
+docs: ## Build the documentation pages into docs/slashdocs/dist
+	go run ./scripts/docs build
+
+docs-publish: ## Publish the documentation to slashdocs (SLASHDOCS_SERVER, default localhost:8080)
+	go run ./scripts/docs publish
 
 clean: ## Remove build output
 	rm -rf bin

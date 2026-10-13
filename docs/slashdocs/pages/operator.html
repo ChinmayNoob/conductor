@@ -1,0 +1,138 @@
+    <h2 id="why">Workflows as Kubernetes resources</h2>
+    <p>The operator lets workflows, runs and schedules live in Git next to the rest of your manifests and ship with <code>kubectl apply</code>, Argo CD or Flux. It watches three resource kinds in the <code>conductor.dev/v1alpha1</code> API group and applies them to Conductor through the HTTP API, the same way <code>conductorctl</code> would. It never touches the database.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Kind</th><th>Short name</th><th>Does</th><th>On delete</th></tr></thead>
+      <tbody>
+        <tr><td><code>Workflow</code></td><td><code>cwf</code></td><td>Keeps a definition applied; a changed spec becomes a new version</td><td>Leaves the definition's versions, which past runs refer to</td></tr>
+        <tr><td><code>WorkflowRun</code></td><td><code>cwr</code></td><td>Starts one run, exactly once, and follows it until it finishes</td><td>Cancels it if unfinished (and compensates), unless <code>keepRunningOnDelete</code></td></tr>
+        <tr><td><code>Schedule</code></td><td><code>csch</code></td><td>Keeps a cron schedule applied, history included</td><td>Deletes the schedule</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="install">Installing</h2>
+<pre><code>helm upgrade --install conductor deploy/helm/conductor -n conductor --set operator.enabled=true \
+  --set operator.image.repository=REGISTRY/conductor-operator --set operator.image.tag=TAG</code></pre>
+    <p>The chart installs the CustomResourceDefinitions (kept on uninstall, since deleting a CRD deletes every resource of its kind), a ClusterRole limited to these three kinds (or Roles in <code>operator.watchNamespaces</code> only), leader election, and the operator itself, which uses the bootstrap admin key. Several replicas can run; one leads.</p>
+    <h3 id="namespaces">Which Conductor namespace</h3>
+    <p>Each resource goes to the Conductor namespace named after its <strong>Kubernetes</strong> namespace, which the operator creates if needed: resources in <code>team-a</code> land in Conductor's <code>team-a</code>. Same-named resources in two Kubernetes namespaces therefore never collide. <code>spec.conductorNamespace</code> picks another; <code>operator.defaultNamespace</code> sends every resource that names none to one Conductor namespace (then keep names unique across Kubernetes namespaces).</p>
+
+    <h2 id="workflow">Workflow</h2>
+<pre><code>apiVersion: conductor.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: nightly-report
+spec:
+  definition:                 # exactly what `conductorctl workflow apply` takes
+    inputs:
+      day: {default: yesterday}
+    steps:
+      - name: build
+        type: k8s
+        k8s: {image: ghcr.io/acme/reports:1.4, args: [build, "${{ inputs.day }}"], memory: 512Mi}
+      - name: publish
+        depends_on: [build]
+        run: ./publish.sh "$REPORT"
+        env: {REPORT: "${{ steps.build.outputs.report }}"}</code></pre>
+    <dl class="fields">
+      <dt><code>spec.definition</code></dt><dd>The workflow definition (see the <a href="{{link:workflows}}">reference</a>). Its <code>name</code> defaults to the resource's name. Conductor validates it; problems show in the <code>Ready</code> condition.</dd>
+      <dt><code>spec.conductorNamespace</code></dt><dd>Optional, as above.</dd>
+      <dt><code>status.name</code>, <code>status.version</code></dt><dd>The definition in Conductor and its current version.</dd>
+    </dl>
+
+    <h2 id="workflowrun">WorkflowRun</h2>
+<pre><code>apiVersion: conductor.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: nightly-report-backfill-0901
+spec:
+  workflow: nightly-report     # the definition's name in Conductor
+  version: 0                   # 0 = the latest
+  input: {day: "2026-09-01"}
+  keepRunningOnDelete: false</code></pre>
+    <ul>
+      <li><strong>Exactly once.</strong> The run is started with the resource's UID as its idempotency key, so a lost status update or an operator restart can't start a second run. A finished WorkflowRun, including one that could never start, is never started again.</li>
+      <li><strong>Immutable.</strong> The spec can't change (a validation rule refuses it); create another WorkflowRun to run again.</li>
+      <li><strong>Any order.</strong> If its workflow doesn't exist yet, it waits (<code>Ready=False</code>, reason <code>Waiting</code>) and checks again.</li>
+      <li><strong>Status</strong> follows the run: <code>runID</code>, <code>phase</code> (<code>RUNNING</code>, <code>COMPENSATING</code>, <code>COMPLETED</code>, <code>FAILED</code>, <code>CANCELLED</code>), <code>steps</code>, <code>error</code>, <code>startTime</code>, <code>completionTime</code>. Unfinished runs are checked every few seconds (<code>--poll-interval</code>).</li>
+    </ul>
+
+    <h2 id="schedule">Schedule</h2>
+<pre><code>apiVersion: conductor.dev/v1alpha1
+kind: Schedule
+metadata:
+  name: nightly-report
+spec:
+  cron: "0 3 * * *"            # or @hourly, @every 30s
+  timezone: Europe/Berlin      # default UTC
+  misfirePolicy: run_once      # skip (default), run_once or catch_up
+  suspend: false
+  workflow: {name: nightly-report, input: {day: yesterday}}
+  # or a task instead of a workflow:
+  # task: {command: "./cleanup.sh", queue: maintenance}</code></pre>
+    <ul>
+      <li>Exactly one of <code>workflow</code> and <code>task</code> (a validation rule checks). A <code>task</code> is decoded strictly: a misspelled field is an error, not silently dropped.</li>
+      <li>Applied with <code>PUT /v1/schedules/{name}</code>, which keeps the schedule's run history and pending run unless the timing changed. <code>suspend: true</code> pauses it; resuming starts from now.</li>
+      <li>A schedule of a workflow that doesn't exist yet waits for it.</li>
+      <li><strong>Status:</strong> <code>nextRunTime</code>, <code>lastRunTime</code>, <code>lastRunID</code>, <code>lastError</code>, refreshed on every resync (<code>--resync</code>, 5 minutes).</li>
+      <li>Moving it to another Conductor namespace removes it from the old one first, so it can't keep firing there.</li>
+    </ul>
+
+    <h2 id="status">Reading status</h2>
+<pre><code>$ kubectl get cwf,cwr,csch
+NAME                                    VERSION   READY   AGE
+workflow.conductor.dev/nightly-report   3         True    2d
+
+NAME                                                     WORKFLOW         PHASE       AGE
+workflowrun.conductor.dev/nightly-report-backfill-0901   nightly-report   COMPLETED   5m
+
+NAME                                    CRON        SUSPENDED   NEXT RUN               READY
+schedule.conductor.dev/nightly-report   0 3 * * *               2026-10-13T01:00:00Z   True</code></pre>
+    <p>Every resource has a <code>Ready</code> condition:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Reason</th><th>Meaning</th><th>What happens</th></tr></thead>
+      <tbody>
+        <tr><td><code>Applied</code> / <code>Started</code></td><td>In Conductor, as specified</td><td>Re-applied on every resync, repairing drift</td></tr>
+        <tr><td><code>Invalid</code></td><td>Conductor rejected the spec; the message says why</td><td>Not retried until the spec changes</td></tr>
+        <tr><td><code>Waiting</code></td><td>A run or schedule whose workflow doesn't exist yet</td><td>Checked again every 10 seconds</td></tr>
+        <tr><td><code>Unreachable</code></td><td>Conductor's API failed</td><td>Retried with back-off</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="argocd">GitOps with Argo CD</h2>
+    <p><code>deploy/argocd</code> is an app-of-apps that installs Conductor and the workflows that run on it, in order:</p>
+    <figure class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    ROOT["conductor-root<br/>(deploy/argocd/apps)"] --> S["wave 0: conductor-secrets<br/>cert-manager CA + certificate"]
+    ROOT --> C["wave 1: conductor<br/>the chart: CloudNativePG, KEDA, operator"]
+    ROOT --> W["wave 2: conductor-workflows<br/>Workflow + Schedule resources"]
+    W -. "applied by the operator" .-> API["Conductor API"]
+      </pre>
+      <figcaption>Sync waves make the secrets exist before Conductor, and Conductor before its workflows.</figcaption>
+    </figure>
+<pre><code>kubectl patch configmap argocd-cm -n argocd --type merge --patch-file deploy/argocd/health.yaml
+kubectl create namespace conductor
+kubectl create secret generic conductor-auth -n conductor \
+  --from-literal=cluster-token=$(openssl rand -hex 32) --from-literal=api-key=cnd_$(openssl rand -hex 32)
+kubectl apply -n argocd -f deploy/argocd/root.yaml</code></pre>
+    <ul>
+      <li><strong>Bring your own secrets.</strong> Argo CD renders charts with <code>helm template</code>, where the chart can't read back secrets it generated, so it would make new ones on every sync. The example sets <code>auth.existingSecret</code> (created once, or from a secret manager with External Secrets) and <code>tls.existingSecret</code> (from cert-manager), and uses CloudNativePG rather than the dev database.</li>
+      <li><strong>Health checks</strong> (<code>health.yaml</code>) teach Argo CD the operator's resources: a Workflow or Schedule is Healthy once applied and Degraded if rejected; a WorkflowRun is Progressing while it runs, Healthy when it completed, Degraded when it failed or was cancelled.</li>
+      <li><strong>KEDA owns replicas</strong> of autoscaled pools; the Application ignores differences in <code>/spec/replicas</code>.</li>
+      <li>A workflow change is then a pull request: edit the file, merge, and the operator applies the new version. Runs already in flight keep the version they started with.</li>
+    </ul>
+    <p>The example was run end to end on kind: the chart synced from the repository onto CloudNativePG, the operator applied the workflow and schedule, and firing the schedule scaled a worker pool from zero and ran a pod step whose output fed the next step.</p>
+
+    <h2 id="flags">Operator flags</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Flag</th><th>Environment</th><th>Default</th></tr></thead>
+      <tbody>
+        <tr><td><code>--conductor-url</code></td><td><code>CONDUCTOR_URL</code></td><td><code>http://localhost:8081</code> (the chart points it at the API Service)</td></tr>
+        <tr><td></td><td><code>CONDUCTOR_API_KEY</code></td><td>Required; an admin key to create namespaces and act in them</td></tr>
+        <tr><td><code>--default-namespace</code></td><td><code>CONDUCTOR_NAMESPACE</code></td><td>Empty: each Kubernetes namespace maps to its own</td></tr>
+        <tr><td><code>--watch-namespaces</code></td><td><code>WATCH_NAMESPACES</code></td><td>All namespaces</td></tr>
+        <tr><td><code>--poll-interval</code></td><td></td><td><code>5s</code>: how often unfinished runs are checked</td></tr>
+        <tr><td><code>--resync</code></td><td></td><td><code>5m</code>: how often Workflows and Schedules are re-applied</td></tr>
+        <tr><td><code>--leader-elect</code></td><td></td><td>On in the chart</td></tr>
+      </tbody>
+    </table></div>

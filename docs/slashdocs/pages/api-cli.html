@@ -1,0 +1,163 @@
+    <h2 id="auth">Authentication and conventions</h2>
+    <ul>
+      <li>Every <code>/v1</code> route needs <code>Authorization: Bearer &lt;api key&gt;</code>. Keys are created with <code>conductorctl apikey create</code>; the first admin key comes from <code>CONDUCTOR_API_KEY</code> on startup.</li>
+      <li>A key acts in its own namespace. <strong>Admin</strong> keys may act in another by sending <code>X-Conductor-Namespace: NAME</code>.</li>
+      <li>Bodies are JSON (workflow definitions may also be YAML). Errors are <code>{"error": "message"}</code> with a meaningful status: 400 invalid, 401 no or bad key, 403 not allowed, 404 not found, 409 conflict (already finished, already exists), 429 over a quota or budget.</li>
+      <li>Creating something returns 201; an idempotent repeat (same idempotency key, unchanged definition, existing schedule on PUT) returns 200.</li>
+      <li>The API is versioned under <code>/v1</code>. <code>GET /health</code> needs no key and reports whether the API can reach its database.</li>
+    </ul>
+<pre><code>export CONDUCTOR_URL=http://localhost:8081 CONDUCTOR_API_KEY=cnd_...
+curl -s -H "Authorization: Bearer $CONDUCTOR_API_KEY" \
+     -d '{"command": "echo hi", "priority": 2}' $CONDUCTOR_URL/v1/tasks</code></pre>
+
+    <h2 id="tasks">Tasks</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Route</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /v1/tasks</code></td><td>Submit a task (fields in <a href="{{link:concepts#tasks}}">core concepts</a>, type settings in <a href="{{link:task-types}}">task types</a>)</td></tr>
+        <tr><td><code>GET /v1/tasks</code></td><td>List, newest first. Filters: <code>status</code>, <code>queue</code>, <code>q</code> (search), <code>workflow_id</code>, <code>before</code> (RFC 3339, for paging), <code>limit</code></td></tr>
+        <tr><td><code>GET /v1/tasks/{id}</code></td><td>One task, with output and outputs</td></tr>
+        <tr><td><code>GET /v1/tasks/{id}/logs</code></td><td>Output; <code>?follow=true</code> streams it live, across retries, until the task finishes; <code>offset</code> resumes</td></tr>
+        <tr><td><code>GET /v1/tasks/{id}/attempts</code></td><td>Every attempt: worker, timing, error, output</td></tr>
+        <tr><td><code>POST /v1/tasks/{id}/cancel</code></td><td>Cancel; kills it if running (409 if already finished)</td></tr>
+        <tr><td><code>POST /v1/tasks/{id}/requeue</code></td><td>Give a permanently failed task a fresh set of retries</td></tr>
+        <tr><td><code>GET /v1/dead-letter</code></td><td>Permanently failed tasks</td></tr>
+        <tr><td><code>GET /v1/stats</code>, <code>GET /v1/stats/timeline?minutes=60</code></td><td>Counts by status; tasks created per minute by current status</td></tr>
+        <tr><td><code>GET /v1/tasks/{id}/explanation</code>, <code>POST …/explain</code></td><td>The assistant's explanation of a failure (needs <code>ai_assist</code>)</td></tr>
+      </tbody>
+    </table></div>
+<pre><code>POST /v1/tasks
+{
+  "type": "http",
+  "http": {"method": "POST", "url": "https://hooks.example.com/x", "body": "{\"ok\": true}"},
+  "queue": "webhooks",
+  "max_retries": 5,
+  "retry_delay_seconds": 10,
+  "timeout_seconds": 30,
+  "idempotency_key": "order-A1-webhook"
+}</code></pre>
+
+    <h2 id="workflows">Workflow definitions and runs</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Route</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>PUT /v1/workflow-definitions</code> (or <code>POST</code>)</td><td>Apply a definition, YAML or JSON body; a new version only if it changed</td></tr>
+        <tr><td><code>GET /v1/workflow-definitions</code></td><td>List definitions and their latest versions</td></tr>
+        <tr><td><code>GET /v1/workflow-definitions/{name}</code></td><td>One definition; <code>?version=N</code>, <code>?format=yaml</code></td></tr>
+        <tr><td><code>POST /v1/workflows</code></td><td>Start a run: <code>{"workflow": NAME, "version": 0, "input": {...}, "idempotency_key": "..."}</code></td></tr>
+        <tr><td><code>GET /v1/workflows</code></td><td>List runs; <code>status</code>, <code>workflow</code>, <code>limit</code></td></tr>
+        <tr><td><code>GET /v1/workflows/{id}</code></td><td>A run with every step, outputs, waits and model spend</td></tr>
+        <tr><td><code>POST /v1/workflows/{id}/cancel</code></td><td>Cancel running steps and compensate</td></tr>
+        <tr><td><code>POST /v1/workflows/{id}/steps/{step}/approve</code>, <code>…/reject</code></td><td>Decide an approval step; body <code>{"comment": "..."}</code></td></tr>
+        <tr><td><code>POST /v1/workflows/{id}/signals/{name}</code></td><td>Send a signal; the JSON body becomes the step's outputs</td></tr>
+        <tr><td><code>GET /v1/approvals</code></td><td>Approval steps waiting for a decision</td></tr>
+        <tr><td><code>GET /v1/agent-runs/{id}</code></td><td>An agent's conversation, calls and their tasks</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="schedules">Schedules, queues and the assistant</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Route</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /v1/schedules</code></td><td>Create: <code>name</code>, <code>cron</code>, <code>timezone</code>, <code>misfire_policy</code>, <code>enabled</code>, and <code>task</code> or <code>workflow</code> (409 if it exists)</td></tr>
+        <tr><td><code>PUT /v1/schedules/{name}</code></td><td>Create or replace; keeps the run history, and the next run unless the timing changed</td></tr>
+        <tr><td><code>GET /v1/schedules</code>, <code>GET</code>/<code>DELETE /v1/schedules/{name}</code></td><td>List, read (with the next three run times), delete</td></tr>
+        <tr><td><code>POST /v1/schedules/{name}/pause</code>, <code>/resume</code>, <code>/trigger</code></td><td>Pause, resume from now, fire now</td></tr>
+        <tr><td><code>GET /v1/queues</code>, <code>PUT</code>/<code>DELETE /v1/queues/{name}</code></td><td>Queues with live counts; set or clear limits and pause</td></tr>
+        <tr><td><code>POST /v1/ai/ask</code>, <code>POST /v1/ai/workflow</code></td><td>Ask the assistant; draft a workflow (needs <code>ai_assist</code>)</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="admin">Administration (admin keys)</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Route</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /v1/workers</code></td><td>Workers: address, labels, slots, running tasks, health</td></tr>
+        <tr><td><code>GET /v1/cluster</code></td><td>The leader, its epoch, and every coordinator</td></tr>
+        <tr><td><code>POST</code>/<code>GET /v1/namespaces</code>, <code>PUT /v1/namespaces/{name}</code></td><td>Create, list, set quotas and <code>ai_assist</code></td></tr>
+        <tr><td><code>POST</code>/<code>GET /v1/api-keys</code>, <code>DELETE /v1/api-keys/{id}</code></td><td>Create (the key is returned once), list (prefixes only), revoke</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="cli">conductorctl</h2>
+    <p>The command-line client covers the whole API. Global flags: <code>-url</code> (or <code>CONDUCTOR_URL</code>, default <code>http://localhost:8081</code>), <code>-api-key</code> (or <code>CONDUCTOR_API_KEY</code>), <code>-n NAMESPACE</code> for admin keys, and <code>-o json</code> for machine-readable output.</p>
+<pre><code># tasks
+conductorctl task submit -cmd "echo hi" [-env K=V] [-label K=V] [-queue Q] [-priority N]
+                         [-retries N] [-retry-delay S] [-timeout S] [-delay S] [-key K] [-wait]
+conductorctl task submit -type http -url URL [-method POST] [-body JSON] [-header K=V]
+conductorctl task submit -type container -image alpine:3.20 [-- command args...]
+conductorctl task submit -type k8s -image alpine:3.20 [-cpu 500m] [-memory 256Mi]
+                         [-service-account SA] [-- command args...]
+conductorctl task submit -prompt "Summarize: ..." [-model M] [-system S] [-schema JSON]
+conductorctl task get|cancel|requeue ID
+conductorctl task logs ID [-f]
+conductorctl task attempts ID
+conductorctl task explain ID
+conductorctl task list [-status S] [-queue Q] [-limit N]
+conductorctl dlq
+conductorctl stats
+
+# workflows
+conductorctl workflow apply -f file.yaml
+conductorctl workflow defs
+conductorctl workflow show NAME [-version N]
+conductorctl workflow start NAME [-input JSON] [-version N] [-key K] [-wait]
+conductorctl workflow get|watch|cancel ID
+conductorctl workflow approve|reject ID STEP [-comment C]
+conductorctl workflow signal ID NAME [-data JSON]
+conductorctl workflow list [-limit N]
+conductorctl approvals
+
+# schedules
+conductorctl schedule create NAME -cron "*/5 * * * *" [-tz Asia/Kolkata] [-misfire skip|run_once|catch_up]
+                         (-cmd "..." [task flags] | -workflow NAME [-input JSON])
+conductorctl schedule list
+conductorctl schedule get|delete|pause|resume|trigger NAME
+
+# assistant (needs a model and ai_assist on the namespace)
+conductorctl ai workflow "describe it" [-save]
+conductorctl ai ask "question"
+
+# queues, workers, administration
+conductorctl queue list
+conductorctl queue set NAME [-concurrency N] [-rate N -per SECONDS] [-pause]
+conductorctl queue delete NAME
+conductorctl workers
+conductorctl cluster
+conductorctl namespace create|set NAME [-max-pending N] [-max-concurrency N]
+                         [-max-llm-tokens N] [-max-llm-cost USD] [-ai-assist]
+conductorctl namespace list
+conductorctl apikey create NAME [-namespace NS] [-admin]
+conductorctl apikey list
+conductorctl apikey revoke ID</code></pre>
+
+    <h2 id="sdk">Go SDK</h2>
+    <p>The <code>pkg/client</code> package wraps the whole API with typed requests and responses. It is what <code>conductorctl</code> and the Kubernetes operator use.</p>
+<pre><code>import "github.com/ChinmayNoob/conductor/pkg/client"
+
+c := client.New("http://localhost:8081", os.Getenv("CONDUCTOR_API_KEY"))
+
+// A task, waited for.
+task, err := c.SubmitTask(ctx, client.TaskRequest{Command: "make report", Queue: "reports", MaxRetries: client.Retries(5)})
+task, err = c.WaitForTask(ctx, task.ID)
+
+// A workflow run, once per order however often this code runs.
+wf, err := c.StartWorkflow(ctx, client.WorkflowRequest{
+    Workflow: "order_pipeline", Input: map[string]any{"order_id": "A1"}, IdempotencyKey: "order-A1",
+})
+wf, err = c.WaitForWorkflow(ctx, wf.ID)
+fmt.Println(wf.Status, wf.Step("charge_card").Outputs["charge"])
+
+// Another namespace (admin keys).
+teamA := c.WithNamespace("team-a")</code></pre>
+    <p>Errors from the API are <code>*client.APIError</code> values with the status code; <code>client.IsNotFound(err)</code> and <code>client.StatusCode(err)</code> test them. Other methods cover definitions (<code>ApplyDefinition</code>), approvals and signals (<code>ApproveStep</code>, <code>Signal</code>), schedules (<code>CreateSchedule</code>, <code>PutSchedule</code>), queues, workers, namespaces and API keys.</p>
+
+    <h2 id="dashboard">The dashboard</h2>
+    <p>The API serves a web dashboard at <code>/ui/</code> (<code>/</code> redirects there), built into the binary. Sign in with an API key; it acts with that key's permissions, and admin keys can switch namespaces. Pages:</p>
+    <ul>
+      <li><strong>Overview:</strong> waiting and running work, the last hour's outcomes, queues, recent failures, active runs.</li>
+      <li><strong>Tasks</strong> and a task's page: search and filter, every attempt, live output, outputs, the assistant's explanation of a failure.</li>
+      <li><strong>Workflow runs:</strong> a live diagram of the run; the failed step, why, and what was compensated, in one banner; approvals and signals; agent conversations and model spend.</li>
+      <li><strong>Approvals, workers, schedules, queues, the dead-letter queue</strong>, and an <strong>assistant</strong> page for questions and drafted workflows.</li>
+    </ul>
+    <p>Actions: cancel tasks and runs, requeue from the dead-letter queue, pause or resume queues and schedules, run a schedule now, approve or reject, send a signal.</p>

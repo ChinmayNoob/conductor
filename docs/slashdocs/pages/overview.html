@@ -1,0 +1,74 @@
+    <h2 id="what">What Conductor is</h2>
+    <p>Conductor is a self-hosted engine for running background work reliably: single tasks, multi-step workflows, scheduled jobs and AI agents. You describe the work; Conductor queues it, hands it to workers, retries it when it fails, undoes completed steps when a later one cannot succeed, and keeps a record of every attempt.</p>
+    <p>Its defining choice is that <strong>Postgres is the only dependency</strong>. There is no Kafka, Redis, etcd or ZooKeeper to run: the queue, the workflow state, leader election and the wake-up signals all live in one Postgres database, using <code>SELECT … FOR UPDATE SKIP LOCKED</code>, advisory locks and <code>LISTEN/NOTIFY</code>. If you already operate Postgres, you can operate Conductor.</p>
+    <div class="callout">
+      <strong class="label">In one sentence</strong>
+      Durable workflows, retries, sagas and AI agents, on nothing but Postgres, set up in five minutes.
+    </div>
+
+    <h2 id="features">What it does</h2>
+    <div class="grid">
+      <div class="card"><h4>Tasks</h4><p>Shell commands, HTTP calls, containers, Kubernetes pods and model calls, with retries, exponential back-off, timeouts, priorities, delays and cancellation that kills the whole process tree.</p></div>
+      <div class="card"><h4>Workflows</h4><p>DAGs written in YAML: steps run in parallel where they can, pass outputs to each other, and compensate (undo) in reverse order when a later step fails. Each run keeps the definition version it started with.</p></div>
+      <div class="card"><h4>Scheduling</h4><p>Cron schedules with time zones and a misfire policy; queues with concurrency and rate limits; priority aging so nothing starves; label-based routing to the right workers.</p></div>
+      <div class="card"><h4>AI steps</h4><p>Model calls with token and cost budgets, approval steps that wait for a person, signals from other systems, and agents whose every model and tool call is a checkpointed task.</p></div>
+      <div class="card"><h4>High availability</h4><p>Several coordinators with automatic leader election through Postgres; every write is fenced by an epoch and every result by an attempt number, so a stale leader or worker can never change anything.</p></div>
+      <div class="card"><h4>Observability</h4><p>A web dashboard with live workflow diagrams, Prometheus metrics on every process, OpenTelemetry traces from the API call into the task, live task output and the history of every attempt.</p></div>
+      <div class="card"><h4>Kubernetes</h4><p>A Helm chart for a highly available cluster, worker pools that scale on queue depth down to zero, tasks that run as their own locked-down pods, and an operator for GitOps.</p></div>
+      <div class="card"><h4>Secure by default</h4><p>API keys stored as hashes, namespaces with quotas, mutual TLS between components, tasks that run unprivileged with a minimal environment, and inputs that can never become shell code.</p></div>
+    </div>
+
+    <h2 id="how">How it works, briefly</h2>
+    <figure class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    C["conductorctl · Go SDK · dashboard · operator"] -- "HTTP + API key" --> API["api"]
+    API -- "gRPC" --> CO["coordinator (leader)"]
+    SB["coordinator (standby)"] -. "takes over if the leader dies" .-> CO
+    CO -- "dispatch" --> W1["worker"]
+    CO -- "dispatch" --> W2["worker"]
+    W1 & W2 -- "results, heartbeats" --> CO
+    API & CO --> PG[("Postgres")]
+      </pre>
+      <figcaption>Clients talk to the API; one elected coordinator claims due tasks from Postgres and dispatches them to workers; standbys wait to take over.</figcaption>
+    </figure>
+    <p>The <strong>API</strong> authenticates requests and records tasks and workflow runs in Postgres. The <strong>coordinator</strong> that holds the leadership lock claims due tasks, sends them to <strong>workers</strong> with free capacity, records results, drives workflows forward and fires schedules. Workers run tasks and report back. Everything a coordinator knows can be rebuilt from Postgres, which is what makes failover safe. The <a href="{{link:architecture}}">architecture page</a> goes through each step.</p>
+
+    <h2 id="guarantees">Guarantees, honestly stated</h2>
+    <ul>
+      <li><strong>At-least-once delivery.</strong> A task whose worker dies is run again elsewhere, so a task can run more than once. Every attempt gets <code>CONDUCTOR_TASK_ID</code> and <code>CONDUCTOR_ATTEMPT</code>, and submissions take an idempotency key, so side effects can be made safe. See <a href="{{link:concepts#delivery}}">delivery guarantees</a>.</li>
+      <li><strong>No lost work.</strong> Killing a worker, the leader coordinator, both coordinators, or restarting Postgres loses no task and leaves none stuck; a nightly chaos suite checks exactly this.</li>
+      <li><strong>Stale actors change nothing.</strong> A deposed leader cannot write (epoch fencing), and a report from an old attempt, say from a worker that was partitioned away, is ignored (attempt fencing).</li>
+      <li><strong>Compensation runs where it should, and only there.</strong> When a workflow fails, every completed step with a compensation is undone, in reverse dependency order.</li>
+    </ul>
+
+    <h2 id="when">When to use it, and when not</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Good fit</th><th>Look elsewhere</th></tr></thead>
+      <tbody>
+        <tr><td>Background jobs that must not be lost: emails, exports, billing runs, syncs</td><td>Sub-millisecond job queues at hundreds of thousands per second (a dedicated broker will win)</td></tr>
+        <tr><td>Multi-step processes that need undo: orders, bookings, provisioning</td><td>Workflows written as long-running code with replay (Temporal's model)</td></tr>
+        <tr><td>Scheduled jobs that should run once per slot, even across restarts</td><td>Data pipelines that need a dataset-aware scheduler and lineage (Airflow, Dagster)</td></tr>
+        <tr><td>AI agents and model calls that are slow, flaky and expensive</td><td>Stream processing</td></tr>
+        <tr><td>Teams that want one dependency they already run: Postgres</td><td>Environments where Postgres is not an option</td></tr>
+      </tbody>
+    </table></div>
+    <p>The <a href="{{link:faq#comparison}}">comparison</a> covers Temporal, Airflow, River and Hatchet in more detail.</p>
+
+    <h2 id="map">Where to go next</h2>
+    <div class="grid">
+      <div class="card"><h4><a href="{{link:quickstart}}">Quickstart</a></h4><p>Running in five minutes, with a first task and a first workflow.</p></div>
+      <div class="card"><h4><a href="{{link:concepts}}">Core concepts</a></h4><p>Tasks, attempts, retries, queues, labels, namespaces.</p></div>
+      <div class="card"><h4><a href="{{link:workflows}}">Workflow reference</a></h4><p>Every field of the YAML, with examples.</p></div>
+      <div class="card"><h4><a href="{{link:task-types}}">Task types</a></h4><p>shell, http, container, k8s, llm, approval, signal, agent.</p></div>
+      <div class="card"><h4><a href="{{link:ai}}">AI features</a></h4><p>Budgets, approvals, durable agents, the operations assistant.</p></div>
+      <div class="card"><h4><a href="{{link:api-cli}}">API, CLI and SDK</a></h4><p>Every route and command.</p></div>
+      <div class="card"><h4><a href="{{link:deploying}}">Deploying</a></h4><p>Compose, one binary, Kubernetes and the Helm chart.</p></div>
+      <div class="card"><h4><a href="{{link:operator}}">Operator and GitOps</a></h4><p>Workflows as Kubernetes resources; Argo CD.</p></div>
+      <div class="card"><h4><a href="{{link:operations}}">Operations</a></h4><p>HA, scaling, upgrades, monitoring, troubleshooting, configuration.</p></div>
+      <div class="card"><h4><a href="{{link:security}}">Security</a></h4><p>Keys, TLS, isolation, secrets.</p></div>
+    </div>
+
+    <h2 id="status">Project status</h2>
+    <p>Conductor is pre-1.0 and developed in public phases: a working scheduler with sagas, production basics (CI, migrations, auth, TLS), a real scheduler (YAML DAGs, cron, queues, task types), distributed-systems depth (HA, fencing, benchmarks, chaos tests), observability and a dashboard, AI-native execution, and Kubernetes. The open-source launch (a new name, releases with published images, a docs site) is next. Container images are not published yet: build them from the repository, as the <a href="{{link:quickstart}}">quickstart</a> does.</p>
+    <p>The repository holds the roadmap (<code>plan.md</code>), an engineering log with diagrams of how each phase was built (<code>DEVLOG.md</code>), and design decision records (<code>docs/adr</code>).</p>

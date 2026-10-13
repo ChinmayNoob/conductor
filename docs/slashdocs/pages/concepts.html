@@ -1,0 +1,119 @@
+    <h2 id="tasks">Tasks</h2>
+    <p>A <strong>task</strong> is one unit of work: a shell command, an HTTP call, a container, a Kubernetes pod or a model call (see <a href="{{link:task-types}}">task types</a>). You submit it on its own, or a workflow, schedule or agent creates it for you. Either way it goes through the same queue, retries and limits.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>type</code></td><td><code>shell</code></td><td>What runs it: <code>shell</code>, <code>http</code>, <code>container</code>, <code>k8s</code> or <code>llm</code></td></tr>
+        <tr><td><code>command</code></td><td></td><td>The shell command (shell tasks), run with <code>sh -c</code></td></tr>
+        <tr><td><code>env</code></td><td></td><td>Extra environment variables for the task</td></tr>
+        <tr><td><code>labels</code></td><td></td><td>Labels a worker must have to run it, e.g. <code>{"gpu": "true"}</code></td></tr>
+        <tr><td><code>queue</code></td><td><code>default</code></td><td>The queue, which may have limits</td></tr>
+        <tr><td><code>priority</code></td><td>5</td><td>1 (most urgent) to 10</td></tr>
+        <tr><td><code>max_retries</code></td><td>3</td><td>Retries after the first attempt</td></tr>
+        <tr><td><code>retry_delay_seconds</code></td><td>60</td><td>Base delay; attempt <em>n</em> waits <code>delay × 2<sup>n</sup></code>, at most an hour</td></tr>
+        <tr><td><code>timeout_seconds</code></td><td>300</td><td>The attempt is killed after this long</td></tr>
+        <tr><td><code>delay_seconds</code>, <code>scheduled_at</code></td><td>now</td><td>Run later</td></tr>
+        <tr><td><code>idempotency_key</code></td><td></td><td>A second submission with the same key returns the first task instead of creating another</td></tr>
+      </tbody>
+    </table></div>
+    <p>Workflow steps have their own defaults (two retries, five seconds apart, a five-minute timeout), set per workflow with <code>defaults:</code>; see the <a href="{{link:workflows}}">workflow reference</a>.</p>
+
+    <h2 id="lifecycle">Lifecycle and attempts</h2>
+    <figure class="diagram">
+      <pre class="mermaid">
+stateDiagram-v2
+    [*] --> QUEUED: submitted
+    QUEUED --> STARTED: dispatched to a worker (attempt n+1)
+    STARTED --> COMPLETED: exit 0 / success
+    STARTED --> QUEUED: failed, retries left (after back-off)
+    STARTED --> FAILED: failed, no retries left, or a permanent error
+    QUEUED --> CANCELLED: cancelled
+    STARTED --> CANCELLED: cancelled (process killed)
+    FAILED --> QUEUED: requeued from the dead-letter queue
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+      </pre>
+      <figcaption>Task statuses. Every dispatch is a new attempt with a new number.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Attempts.</strong> Every dispatch increments the task's attempt number. Only a report for the current attempt is accepted. Earlier attempts are kept in the attempt history with their worker, timing, error and output: <code>conductorctl task attempts &lt;id&gt;</code>.</li>
+      <li><strong>Back-off.</strong> Attempt <em>n</em> of a failing task waits <code>retry_delay × 2<sup>n</sup></code>, capped at one hour. A model provider's <code>Retry-After</code> sets a minimum.</li>
+      <li><strong>Permanent errors</strong> skip the remaining retries: an invalid task spec, an image that can't exist, a rejected service account, a bad model key or unknown model.</li>
+      <li><strong>Lost tasks.</strong> A task whose worker stops heartbeating, or that runs past its timeout plus 30 seconds without a result, fails as lost and goes through the normal retry path.</li>
+      <li><strong>Cancellation</strong> of a queued task removes it from the queue; of a running task, kills its whole process group (or deletes its pod). A late report from the cancelled attempt is ignored.</li>
+      <li><strong>Dead-letter queue.</strong> Permanently failed tasks are listed with <code>conductorctl dlq</code>; <code>task requeue &lt;id&gt;</code> gives one a fresh set of retries, keeping its history.</li>
+    </ul>
+
+    <h2 id="environment">What a task sees</h2>
+    <p>Tasks run in a <strong>minimal environment</strong>, not the worker's: a sane <code>PATH</code>, <code>HOME</code>, <code>TMPDIR</code> and locale, the task's own <code>env</code>, and variables Conductor sets. Worker secrets such as the cluster token or database password are never visible; a worker may pass named variables through on purpose (<code>CONDUCTOR_WORKER_PASS_ENV</code>).</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>CONDUCTOR_TASK_ID</code></td><td>The task's ID</td></tr>
+        <tr><td><code>CONDUCTOR_ATTEMPT</code></td><td>The attempt number, unique per dispatch: use <code>TASK_ID</code> + <code>ATTEMPT</code> to de-duplicate side effects</td></tr>
+        <tr><td><code>CONDUCTOR_RETRY</code></td><td>How many retries came before this attempt</td></tr>
+        <tr><td><code>CONDUCTOR_OUTPUT</code></td><td>A file: <code>key=value</code> lines written to it become the task's <strong>outputs</strong> (up to 64 KB; 4 KB for k8s tasks)</td></tr>
+        <tr><td><code>TRACEPARENT</code></td><td>The W3C trace context, when tracing is on, so your code can join the trace</td></tr>
+        <tr><td><code>CONDUCTOR_WORKFLOW_ID</code>, <code>CONDUCTOR_STEP</code></td><td>In workflow steps: the run and the step</td></tr>
+        <tr><td><code>INPUT_&lt;NAME&gt;</code>, <code>OUTPUT_&lt;KEY&gt;</code></td><td>In workflow steps: the run's inputs; in a compensation, its own step's outputs</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Output</strong> (stdout and stderr, interleaved) is captured up to 1 MB by default; beyond that the beginning and the end are kept, since errors usually show up at the end. It can be followed live while the task runs.</p>
+
+    <h2 id="delivery">Delivery guarantees</h2>
+    <p>Conductor delivers tasks <strong>at least once</strong>. If a worker dies mid-task, Conductor cannot know whether the task's side effects happened, so it runs the task again elsewhere. Design side effects to be safe to repeat:</p>
+    <ul>
+      <li>Use <code>CONDUCTOR_TASK_ID</code> (stable across retries) as an idempotency key for the systems you call: a payment provider's idempotency header, a unique constraint, an upsert.</li>
+      <li>Submit with an <code>idempotency_key</code> so a client retry doesn't create a second task. The second submission returns the first task with HTTP 200 instead of 201.</li>
+      <li>Workflow runs and schedules use the same mechanism internally: a schedule slot fires once, and an agent's tool call is created once per call.</li>
+    </ul>
+    <div class="callout">
+      <strong class="label">What is guaranteed</strong>
+      A task is never lost and never stuck: it ends <code>COMPLETED</code>, <code>FAILED</code> or <code>CANCELLED</code>. Only one result is recorded per task (attempt fencing). It may <em>run</em> more than once.
+    </div>
+
+    <h2 id="queues">Queues</h2>
+    <p>Every task belongs to a queue (<code>default</code> unless set). Queues exist implicitly; give one settings to limit it:</p>
+<pre><code>conductorctl queue set emails -concurrency 5 -rate 100 -per 60   # at most 5 at once, 100 per minute
+conductorctl queue set emails -pause                             # stop dispatching; submissions still queue
+conductorctl queue list</code></pre>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Setting</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>concurrency_limit</code></td><td>At most this many of the queue's tasks run at once</td></tr>
+        <tr><td><code>rate_limit</code> per <code>rate_period_seconds</code></td><td>At most this many dispatches per sliding window</td></tr>
+        <tr><td><code>tokens_per_minute</code></td><td>For <code>llm</code> tasks: at most this many model tokens dispatched per minute</td></tr>
+        <tr><td><code>paused</code></td><td>Nothing is dispatched until resumed</td></tr>
+      </tbody>
+    </table></div>
+    <p>Limits are enforced inside the dispatch query, also within one batch, so they hold exactly even under load.</p>
+
+    <h2 id="priority">Priority and aging</h2>
+    <p>Priority runs from 1 (most urgent) to 10. Strict priority would let a steady stream of urgent tasks starve everything else, so waiting tasks <strong>age</strong>: a task gains one priority level per aging interval (60 seconds by default, <code>CONDUCTOR_PRIORITY_AGING</code>). Concretely, tasks are ordered by <code>scheduled_at + priority × interval</code>: a priority-9 task that has waited nine minutes goes before a priority-1 task submitted just now. Set the interval to <code>0</code> for strict priority.</p>
+
+    <h2 id="labels">Labels and worker pools</h2>
+    <p>Workers advertise <strong>labels</strong>: their own (<code>CONDUCTOR_WORKER_LABELS=gpu=true,region=eu</code>) plus one per task type they can run (<code>type.shell</code>, <code>type.http</code>, <code>type.container</code>, <code>type.k8s</code>, <code>type.llm</code>). A task runs only on a worker that has every label it requires, including its type's. Tasks that require labels no worker has simply wait.</p>
+    <p>A <strong>dedicated</strong> worker also names labels a task must require to run there (<code>CONDUCTOR_WORKER_EXCLUSIVE=pool</code>), like a Kubernetes taint. Without it, a worker with <code>gpu=true</code> would also run every plain task. In the Helm chart, each worker pool gets a <code>pool=&lt;name&gt;</code> label, and a <code>dedicated</code> pool takes only tasks with <code>labels: {pool: &lt;name&gt;}</code>.</p>
+<pre><code>conductorctl task submit -cmd './train.sh' -label gpu=true          # any worker with gpu=true
+conductorctl task submit -cmd './train.sh' -label pool=gpu          # only the dedicated gpu pool</code></pre>
+    <p>A worker can also be limited to some task types (<code>CONDUCTOR_WORKER_TASK_TYPES=k8s</code>). The chart uses this for the pool that runs Kubernetes tasks, which then runs no task code of its own.</p>
+
+    <h2 id="namespaces">Namespaces</h2>
+    <p>Namespaces isolate teams. Each has its own tasks, workflow definitions, runs, schedules, queues and API keys. A key belongs to one namespace; <strong>admin</strong> keys may act in any (<code>X-Conductor-Namespace</code>, or <code>conductorctl -n</code>). <code>default</code> always exists.</p>
+<pre><code>conductorctl namespace create team-a -max-pending 1000 -max-concurrency 20
+conductorctl apikey create team-a-ci -namespace team-a       # prints the key once
+conductorctl -n team-a task list</code></pre>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Quota</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_pending_tasks</code></td><td>Submissions beyond this many waiting tasks are refused (HTTP 429)</td></tr>
+        <tr><td><code>max_concurrency</code></td><td>At most this many of the namespace's tasks run at once</td></tr>
+        <tr><td><code>max_llm_tokens_per_day</code>, <code>max_llm_cost_per_day</code></td><td>Model spend per day; over it, model tasks and runs stop</td></tr>
+        <tr><td><code>ai_assist</code></td><td>Opt in to the operations assistant, which sends redacted failures to a model</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="workflows">Workflows, schedules and waits</h2>
+    <p>A <strong>workflow definition</strong> is a named, versioned DAG of steps written in YAML. A <strong>workflow run</strong> executes one version with some inputs; each step becomes a task (or a wait). If a step fails for good, completed steps are <strong>compensated</strong>: their undo actions run in reverse order, like a saga. See the <a href="{{link:workflows}}">workflow reference</a>.</p>
+    <p>A <strong>schedule</strong> starts a task or a workflow on a cron expression in a time zone, once per slot, with a misfire policy for slots missed while Conductor was down.</p>
+    <p><strong>Approval</strong> and <strong>signal</strong> steps pause a run until a person approves or rejects, or another system sends data, holding no worker meanwhile. <strong>Agent</strong> steps let a model call tools in a loop, each call a checkpointed task. See <a href="{{link:ai}}">AI features</a>.</p>

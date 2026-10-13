@@ -1,0 +1,148 @@
+    <h2 id="components">Components</h2>
+    <p>Conductor is one binary, <code>conductor</code>, with a subcommand per component. Run them as separate processes (Compose, Kubernetes) or all together with <code>conductor dev</code>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Component</th><th>Role</th><th>State</th><th>Talks to</th></tr></thead>
+      <tbody>
+        <tr><td><strong>api</strong><br><code>conductor api</code></td><td>HTTP API and dashboard on <code>:8081</code>. Authenticates API keys, validates and stores tasks, runs and schedules, reads state for queries, and forwards commands (cancel, approve, signal) to the coordinator.</td><td>Stateless; scale freely</td><td>Postgres, the coordinator (gRPC)</td></tr>
+        <tr><td><strong>coordinator</strong><br><code>conductor coordinator</code></td><td>The scheduler. The leader claims due tasks, dispatches them to workers, records results and retries, drives workflow DAGs and agents, fires schedules, and recovers work from dead workers. Standbys wait to take over and redirect callers to the leader.</td><td>In memory, rebuilt from Postgres on takeover</td><td>Postgres, workers (gRPC)</td></tr>
+        <tr><td><strong>worker</strong><br><code>conductor worker</code></td><td>Runs tasks in a clean environment: shell commands, HTTP calls, containers, Kubernetes pods, model calls. Reports results and heartbeats. Drains on shutdown.</td><td>Only the tasks it is running</td><td>The coordinator (gRPC); never the database</td></tr>
+        <tr><td><strong>Postgres</strong></td><td>The single source of truth: tasks, attempts, workflow runs, definitions, schedules, queues, namespaces, API keys, the leadership record.</td><td>Everything durable</td><td></td></tr>
+        <tr><td><strong>operator</strong> (optional)</td><td>Applies <code>Workflow</code>, <code>WorkflowRun</code> and <code>Schedule</code> Kubernetes resources through the HTTP API.</td><td>Kubernetes resources</td><td>The API</td></tr>
+      </tbody>
+    </table></div>
+    <p>Workers never receive database credentials. Everything between components is gRPC, authenticated with a shared cluster token and, optionally (by default on Kubernetes), mutual TLS.</p>
+    <figure class="diagram">
+      <pre class="mermaid">
+flowchart LR
+    CLI["conductorctl / Go SDK / curl / dashboard"] -- "HTTP + API key" --> API
+    subgraph cluster [Conductor cluster]
+        API["api<br/>HTTP :8081"] -- "gRPC + cluster token (+mTLS)" --> COORD["coordinator (leader)<br/>gRPC :8080"]
+        STANDBY["coordinator (standby)"] -. "redirects to the leader" .-> COORD
+        COORD -- "dispatch / cancel" --> W1["worker :9000"]
+        COORD -- "dispatch / cancel" --> W2["worker :9000"]
+        W1 & W2 -- "heartbeats + results" --> COORD
+    end
+    API -- "reads, writes" --> PG[("PostgreSQL")]
+    COORD -- "queue, workflows, schedules" --> PG
+    STANDBY -. "campaigns for leadership" .-> PG
+      </pre>
+      <figcaption>Every process also serves Prometheus metrics and health probes on <code>:9090</code>.</figcaption>
+    </figure>
+
+    <h2 id="journey">A task's journey</h2>
+    <figure class="diagram">
+      <pre class="mermaid">
+sequenceDiagram
+    participant C as client
+    participant A as api
+    participant P as Postgres
+    participant L as coordinator (leader)
+    participant W as worker
+    C->>A: POST /v1/tasks
+    A->>P: INSERT task (QUEUED) + NOTIFY
+    A-->>C: 201 task
+    P-->>L: notification: work is due
+    L->>P: claim due tasks (FOR UPDATE SKIP LOCKED, fenced by epoch)
+    L->>W: SubmitTask(task, attempt n)
+    W-->>L: accepted
+    W->>W: run the command
+    W->>L: UpdateTaskStatus(attempt n, result, outputs)
+    L->>P: record the result (only for attempt n, fenced by epoch)
+    L->>L: advance the workflow, if any
+      </pre>
+      <figcaption>Submission to result. The leader learns about new work from a notification, not by polling; a safety-net check every few seconds catches anything missed.</figcaption>
+    </figure>
+    <ol>
+      <li><strong>Submit.</strong> The API validates the task, applies namespace quotas, and inserts it as <code>QUEUED</code>. A trigger sends a <code>NOTIFY</code> so the leader wakes immediately. (Writes the leader makes itself, such as workflow steps, retries and schedule runs, wake its dispatcher directly instead: <code>NOTIFY</code> serializes commits, so the leader avoids it on its hot path.)</li>
+      <li><strong>Claim.</strong> The leader works out the free slots on its workers and the distinct label sets they have, then claims up to that many due tasks in one statement: <code>SELECT … FOR UPDATE SKIP LOCKED</code> ordered by a precomputed dispatch key (priority with aging, then due time). The same statement enforces queue concurrency limits, queue rate limits, token-per-minute limits, namespace concurrency limits, and the rule that some free worker must have every label the task requires. Claiming increments the task's <code>attempt</code>.</li>
+      <li><strong>Dispatch.</strong> Each claimed task goes to a worker that accepts it (has its labels, is not draining, has a free slot), round-robin by worker ID, over gRPC. A worker that refuses or can't be reached gets the task requeued.</li>
+      <li><strong>Run.</strong> The worker runs the task with a minimal environment, captures its output (capped, keeping the beginning and the end), and keeps it readable live for <code>task logs -f</code>.</li>
+      <li><strong>Report.</strong> The worker reports the result for its attempt. The leader records it only if the attempt still matches; a report for an old attempt is counted as stale and ignored.</li>
+      <li><strong>Retry or finish.</strong> A failure with retries left goes back to <code>QUEUED</code> with a delay of <code>retry_delay × 2<sup>attempt</sup></code> (capped at an hour), or later if a model provider sent <code>Retry-After</code>. Permanent failures and exhausted retries end <code>FAILED</code> and appear in the dead-letter queue. The previous attempt's worker, timing, error and output are kept in the attempt history.</li>
+    </ol>
+
+    <h2 id="leadership">Leader election</h2>
+    <p>Run two or more coordinators. Each campaigns once a second for a Postgres advisory lock with <code>pg_try_advisory_lock</code>; the one holding it is the leader. Advisory locks belong to a database session, so when the leader dies, its connection closes, the lock is released, and a standby acquires it within about a second.</p>
+    <ul>
+      <li><strong>Takeover.</strong> The new leader bumps the <strong>epoch</strong> in the <code>coordinator_leader</code> row, then rebuilds its view from Postgres: workers from the <code>workers</code> table, in-flight tasks from the <code>tasks</code> table. Work in flight keeps running on workers and reports to the new leader.</li>
+      <li><strong>Finding the leader.</strong> Standbys answer every call with a "not the leader" error naming the leader's address. The client library (used by the API and workers) follows the redirect, and while an election is in progress it cycles through the configured coordinator addresses until one answers as leader.</li>
+      <li><strong>Liveness.</strong> The leader updates a heartbeat on its row; a leader whose heartbeat is older than five seconds is not advertised to clients.</li>
+    </ul>
+
+    <h2 id="fencing">Fencing: stale actors change nothing</h2>
+    <p>Two kinds of actor can be wrong without knowing it: a leader that has been deposed but hasn't noticed yet, and a worker that was partitioned away while its task was retried elsewhere. Conductor fences both.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Fence</th><th>How</th><th>Stops</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Epoch</strong></td><td>Every write the leader makes re-checks its epoch under a share lock on the leader row, in the same statement or transaction. A new leader's epoch bump waits for those locks; once it commits, the old leader's writes fail.</td><td>A deposed leader dispatching or recording anything</td></tr>
+        <tr><td><strong>Attempt</strong></td><td>Each dispatch increments the task's attempt number and sends it to the worker. A result is recorded only <code>WHERE attempt = n</code>.</td><td>A late report from an old attempt overwriting the current one</td></tr>
+      </tbody>
+    </table></div>
+    <p>The chaos suite partitions a worker mid-task, waits for the task to be retried as attempt 2, heals the partition, and checks that attempt 1's report is ignored and attempt 2's output is the one recorded.</p>
+
+    <h2 id="failures">When things fail</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Failure</th><th>Detection</th><th>Recovery</th></tr></thead>
+      <tbody>
+        <tr><td>A worker dies</td><td>No heartbeat for 30 s (workers send one every 10 s)</td><td>Its tasks fail as "task lost" and go through the normal retry or compensation path</td></tr>
+        <tr><td>A task never reports</td><td>Running past its timeout plus a 30 s grace</td><td>Failed as lost, then retried</td></tr>
+        <tr><td>The leader dies</td><td>Its advisory lock is released with its session</td><td>A standby takes over in about a second; nothing in flight is lost</td></tr>
+        <tr><td>Postgres restarts or the connection drops</td><td>Failed statements; the leader loses its lock</td><td>Coordinators reconnect and re-elect; workers keep results until a coordinator accepts them (up to 30 s per report)</td></tr>
+        <tr><td>A worker is stopped (deploy, scale-down)</td><td>SIGTERM</td><td>It stops taking tasks, tells the coordinator it is draining, and lets running tasks finish for the shutdown timeout; tasks still running then are killed and retried elsewhere</td></tr>
+        <tr><td>A worker is partitioned</td><td>Missed heartbeats</td><td>Its tasks are retried elsewhere; its late reports are fenced out</td></tr>
+      </tbody>
+    </table></div>
+    <p>The nightly chaos suite runs a steady load of tasks and sagas through each of these (plus Postgres latency injected with Toxiproxy) and then checks the invariants: no task lost, none stuck, every workflow terminal, compensation run exactly where required.</p>
+
+    <h2 id="workflows">How workflows run</h2>
+    <p>A workflow run is a snapshot of its definition plus a row per step. The coordinator's <strong>reconciler</strong> is a pure function of that state: given which steps completed, failed or are waiting, it decides what to start next. It runs when a step's task finishes, and a periodic sweep re-runs it for every active run, so a missed event can never strand a run.</p>
+    <figure class="diagram">
+      <pre class="mermaid">
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> COMPLETED: every step completed
+    RUNNING --> COMPENSATING: a step failed, or the run was cancelled
+    COMPENSATING --> FAILED: compensations finished (failure)
+    COMPENSATING --> CANCELLED: compensations finished (cancel)
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
+      </pre>
+      <figcaption>Workflow run statuses.</figcaption>
+    </figure>
+    <ul>
+      <li>A step starts once all its <code>depends_on</code> steps completed; independent branches run in parallel.</li>
+      <li>When a step fails for good (or the run is cancelled), running steps are cancelled and every completed step with a compensation is undone, in <strong>reverse dependency order</strong>. Each compensation sees its own step's outputs.</li>
+      <li><strong>Approval</strong> and <strong>signal</strong> steps are waits, not tasks: they hold no worker while they wait for a person or a system, and a timeout decides what happens if nobody answers.</li>
+      <li><strong>Agent</strong> steps are state machines over tasks: each model call and each tool call is its own task with an idempotency key, so a crash resumes from the last finished call.</li>
+      <li>Because the run keeps the definition snapshot it started with, applying a new version never changes runs already in flight.</li>
+    </ul>
+
+    <h2 id="schedules">How schedules fire</h2>
+    <p>Schedules live in Postgres with their next run time. The leader claims due schedules with <code>FOR UPDATE SKIP LOCKED</code>, starts the task or workflow, and records the next run in the same transaction, so a run time fires at most once even across restarts and failovers. When the leader was down at a run time, the schedule's misfire policy decides: <code>skip</code> it, <code>run_once</code> to catch up with a single run, or <code>catch_up</code> on every missed slot.</p>
+
+    <h2 id="data">What Postgres holds</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Table</th><th>Holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>tasks</code></td><td>Every task: type, spec, environment, label requirements, queue, priority, status, current attempt, result, output, model usage</td></tr>
+        <tr><td><code>task_attempts</code></td><td>Earlier attempts of retried tasks: worker, timing, error, output</td></tr>
+        <tr><td><code>workflow_definitions</code></td><td>Versioned definitions, per namespace</td></tr>
+        <tr><td><code>workflows</code>, <code>workflow_steps</code></td><td>Runs with their definition snapshot, and per-step status, task, outputs and waits</td></tr>
+        <tr><td><code>schedules</code></td><td>Cron, time zone, misfire policy, target, next and last run</td></tr>
+        <tr><td><code>queues</code>, <code>namespaces</code></td><td>Limits and quotas</td></tr>
+        <tr><td><code>api_keys</code></td><td>SHA-256 hashes of keys, their namespace and whether they are admin</td></tr>
+        <tr><td><code>workers</code>, <code>coordinator_leader</code></td><td>Workers as last reported; the leader, its epoch and heartbeat</td></tr>
+        <tr><td>agent and AI tables</td><td>Agent runs and their calls; failure explanations</td></tr>
+      </tbody>
+    </table></div>
+    <p>Migrations are embedded in the binary, applied on startup under an advisory lock, and forward-only. The schema also carries <code>conductor_slot_demand()</code>, which autoscalers call to read queue depth (see <a href="{{link:deploying#autoscaling}}">autoscaling</a>).</p>
+
+    <h2 id="decisions">Design decisions</h2>
+    <ul>
+      <li><strong>Push dispatch, scheduling in the leader</strong> (ADR 0001): workers never hold database credentials, and the per-task cost is Postgres work either way.</li>
+      <li><strong>A dashboard of plain JavaScript modules</strong> embedded in the binary (ADR 0002): no build step, nothing to deploy separately.</li>
+      <li><strong>AI calls are ordinary tasks</strong> (ADR 0003): they inherit retries, limits, cancellation and tracing.</li>
+      <li><strong>Kubernetes as a home, not a dependency</strong> (ADR 0004): task pods through a small REST client, autoscaling from a SQL function, an operator that only uses the HTTP API.</li>
+    </ul>
+    <p>The records are in <code>docs/adr</code> in the repository; <code>DEVLOG.md</code> tells the story of each phase with diagrams.</p>

@@ -1,0 +1,156 @@
+    <h2 id="ha">High availability</h2>
+    <ul>
+      <li><strong>Coordinators:</strong> run at least two, on different machines. One leads through a Postgres advisory lock; standbys take over within about a second of the leader's death (0.5 to 1.6 s in the end-to-end suite, on Compose and Kubernetes). Nothing in flight is lost: workers keep running their tasks and report to the new leader.</li>
+      <li><strong>API:</strong> stateless; run two or more behind a load balancer. On Kubernetes it delays shutdown until endpoints stop routing to it.</li>
+      <li><strong>Workers:</strong> run enough to survive losing one; tasks of a dead worker are retried elsewhere after 30 seconds without heartbeats.</li>
+      <li><strong>Postgres</strong> is the one component everything depends on. Make it highly available the way you do for other Postgres databases: CloudNativePG, a managed service with a standby, or Patroni. A Postgres restart is survived (the chaos suite restarts it under load), but nothing is dispatched while it is down.</li>
+    </ul>
+<pre><code>conductorctl cluster           # the leader, its epoch, and every coordinator (admin)
+conductorctl workers           # every worker: address, labels, slots, running, health</code></pre>
+
+    <h2 id="scaling">Scaling and capacity</h2>
+    <p>Throughput is bounded by Postgres, not by workers: each task costs the leader about four writes (insert, a share of a batch claim, started, finished). On a laptop (everything in one Docker VM), measured with <code>conductor-bench</code>:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Measure</th><th>1 worker (4 slots)</th><th>10 workers</th><th>50 workers</th></tr></thead>
+      <tbody>
+        <tr><td>Drain (no-op tasks/s)</td><td>151</td><td><strong>808</strong></td><td>697</td></tr>
+        <tr><td>Ingest (submissions/s)</td><td>1,010</td><td>1,077</td><td>1,159</td></tr>
+        <tr><td>Idle dispatch, p50</td><td>6.4 ms</td><td>4.7 ms</td><td>4.4 ms</td></tr>
+        <tr><td>At 200 tasks/s: dispatch p50 / p99</td><td>over capacity</td><td>9.4 / 34 ms</td><td>59 / 519 ms</td></tr>
+        <tr><td>Four-step diamond workflows, p50</td><td>2.2 s</td><td>0.98 s</td><td>0.98 s</td></tr>
+      </tbody>
+    </table></div>
+    <p>Read these as a floor: Postgres, coordinators, the API, up to 50 workers and the load generator shared one laptop's CPUs. Sustained rates with ingest and dispatch together sit between 200 and 400 tasks/s on that machine; a dedicated database raises everything. <code>make bench</code> (or <code>scripts/bench.sh</code>) reproduces the numbers on yours.</p>
+    <ul>
+      <li><strong>More slots, not just more workers.</strong> A worker runs <code>CONDUCTOR_WORKER_SLOTS</code> tasks at once. For tasks that mostly wait (HTTP calls, model calls, k8s pods), give workers many slots.</li>
+      <li><strong>Autoscale on demand</strong> on Kubernetes with KEDA (<a href="{{link:deploying#autoscaling}}">deploying</a>).</li>
+      <li><strong>Protect Postgres</strong> with queue concurrency and rate limits rather than by starving workers.</li>
+      <li><strong>Keep outputs small:</strong> output is stored on the task row (1 MB by default, <code>CONDUCTOR_MAX_OUTPUT_BYTES</code>).</li>
+    </ul>
+
+    <h2 id="upgrades">Upgrades</h2>
+    <ul>
+      <li><strong>Migrations</strong> are embedded in the binary and applied on startup, under an advisory lock so starting several components at once is safe. They are forward-only: back up the database before upgrading, and roll back by restoring it.</li>
+      <li><strong>Rolling restarts are safe.</strong> Coordinators: start the new one before stopping the old (the chart surges); if the leader stops, a standby takes over. Workers: SIGTERM makes them drain; tasks that don't finish within the shutdown timeout are killed and retried. API: stateless.</li>
+      <li><strong>Workflow runs in flight</strong> keep the definition version they started with; applying new definitions never affects them.</li>
+      <li>The end-to-end suite restarts every component under load (<code>TestRollingRestartLosesNothing</code>) and requires that no task or run is lost and no API request fails.</li>
+    </ul>
+
+    <h2 id="monitoring">Metrics</h2>
+    <p>Every process serves Prometheus metrics on <code>:9090/metrics</code> (<code>CONDUCTOR_METRICS_LISTEN</code>; <code>off</code> disables it). State gauges are computed when scraped, so they cost nothing in between. Cluster-wide gauges come only from the leader; take <code>max</code> across coordinators.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Metric</th><th>From</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>conductor_leader</code>, <code>conductor_leader_epoch</code></td><td>coordinators</td><td>1 on the leader; its epoch</td></tr>
+        <tr><td><code>conductor_leader_elections_total</code></td><td>coordinators</td><td>Times this coordinator became leader</td></tr>
+        <tr><td><code>conductor_workers{state}</code>, <code>conductor_slots{state}</code></td><td>leader</td><td>Workers by health; slots, total and busy</td></tr>
+        <tr><td><code>conductor_queue_tasks{namespace,queue,state}</code></td><td>leader</td><td>Unfinished tasks: ready, delayed, paused, running</td></tr>
+        <tr><td><code>conductor_queue_oldest_ready_seconds</code></td><td>leader</td><td>How long the oldest due task has waited</td></tr>
+        <tr><td><code>conductor_tasks_dispatched_total</code></td><td>leader</td><td>Tasks handed to workers</td></tr>
+        <tr><td><code>conductor_task_results_total{result}</code></td><td>leader</td><td>Attempts by outcome: completed, failed, retried, stale</td></tr>
+        <tr><td><code>conductor_tasks_lost_total</code></td><td>leader</td><td>Tasks given up on because their worker died or never reported</td></tr>
+        <tr><td><code>conductor_dispatch_failures_total</code></td><td>leader</td><td>Dispatches a worker refused or couldn't be reached for</td></tr>
+        <tr><td><code>conductor_dispatch_latency_seconds</code></td><td>leader</td><td>From due to claimed</td></tr>
+        <tr><td><code>conductor_task_turnaround_seconds</code></td><td>leader</td><td>From dispatch to result</td></tr>
+        <tr><td><code>conductor_workflows_finished_total{status}</code>, <code>conductor_workflow_compensations_total</code></td><td>leader</td><td>Runs by final status; compensations started</td></tr>
+        <tr><td><code>conductor_schedule_runs_total</code></td><td>leader</td><td>Schedule runs started</td></tr>
+        <tr><td><code>conductor_llm_tokens_total{model,direction}</code>, <code>conductor_llm_cost_usd_total{model}</code></td><td>leader</td><td>Model usage and spend</td></tr>
+        <tr><td><code>conductor_worker_slots</code>, <code>conductor_worker_tasks_running</code></td><td>workers</td><td>This worker's capacity and load</td></tr>
+        <tr><td><code>conductor_worker_task_duration_seconds{type,result}</code></td><td>workers</td><td>How long tasks ran</td></tr>
+        <tr><td><code>conductor_worker_report_failures_total</code></td><td>workers</td><td>Results a worker couldn't deliver</td></tr>
+        <tr><td><code>conductor_http_requests_total{route,code}</code>, <code>conductor_http_request_duration_seconds</code></td><td>API</td><td>Requests by route and status; latency</td></tr>
+      </tbody>
+    </table></div>
+    <h3 id="alerts">Alerts and dashboards</h3>
+    <p>The repository ships alert rules (<code>observability/alerts.yml</code>; on Kubernetes, <code>metrics.prometheusRule.enabled</code>) and a provisioned Grafana dashboard (<code>metrics.grafanaDashboard.enabled</code>, or the Compose <code>observability</code> profile):</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Alert</th><th>Fires when</th></tr></thead>
+      <tbody>
+        <tr><td><code>ConductorNoLeader</code></td><td>No coordinator leads for 30 s: nothing is being dispatched</td></tr>
+        <tr><td><code>ConductorNoHealthyWorkers</code></td><td>No healthy workers for a minute</td></tr>
+        <tr><td><code>ConductorQueueBackingUp</code></td><td>Due tasks in a queue have waited over a minute for two minutes</td></tr>
+        <tr><td><code>ConductorFailureRateHigh</code></td><td>More than 20% of attempts fail for five minutes</td></tr>
+        <tr><td><code>ConductorTasksLost</code></td><td>Any task was lost in the last ten minutes</td></tr>
+      </tbody>
+    </table></div>
+    <h3 id="tracing">Traces and logs</h3>
+    <p>Set <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> to export OpenTelemetry traces over OTLP gRPC (the standard <code>OTEL_*</code> variables apply). A task's trace runs from the HTTP request, through its wait in the queue (the trace context is stored on the task), the dispatch and the worker, into the task itself, which receives <code>TRACEPARENT</code>. A workflow's steps share their run's trace. Logs are structured (<code>CONDUCTOR_LOG_FORMAT=json</code> or <code>text</code>) and carry task, workflow and worker IDs.</p>
+    <h3 id="health">Health endpoints</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Endpoint</th><th>Port</th><th>Healthy when</th></tr></thead>
+      <tbody>
+        <tr><td><code>/healthz</code></td><td>9090, every component</td><td>The process runs (liveness)</td></tr>
+        <tr><td><code>/readyz</code></td><td>9090, every component</td><td>Coordinators and the API: the database answers. Workers: a coordinator acknowledged a recent heartbeat, and they aren't draining</td></tr>
+        <tr><td><code>/health</code></td><td>8081, API</td><td>The API reaches its database (no key needed)</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="troubleshooting">Troubleshooting</h2>
+    <dl class="fields">
+      <dt>A task stays <code>QUEUED</code></dt>
+      <dd>Check, in order: is there a leader (<code>conductorctl cluster</code>)? Does any healthy worker have every label the task requires, including its type (<code>conductorctl workers</code>; for <code>k8s</code> and <code>llm</code> tasks, is such a worker configured)? Is the queue paused or at its concurrency or rate limit (<code>conductorctl queue list</code>)? Is the namespace at its concurrency quota? Is it scheduled for later (<code>scheduled_at</code>)? A dedicated pool takes only tasks that require its <code>pool</code> label.</dd>
+      <dt>A task failed</dt>
+      <dd><code>conductorctl task attempts ID</code> shows every attempt's worker, error and output; <code>task logs ID</code> the last one. With <code>ai_assist</code>, <code>task explain ID</code> suggests a cause and fix. Fix it, then <code>task requeue ID</code> for a fresh set of retries.</dd>
+      <dt>Tasks are "lost"</dt>
+      <dd>A worker stopped heartbeating (crash, OOM kill, network) or a task ran past its timeout plus 30 s. Lost tasks are retried; look at the worker's logs and restarts, and at task timeouts.</dd>
+      <dt>A run is stuck <code>RUNNING</code></dt>
+      <dd>It is usually waiting: an approval (<code>conductorctl approvals</code>), a signal, or a step whose task is queued (see above). The run page shows which.</dd>
+      <dt>No leader</dt>
+      <dd>Coordinators can't reach Postgres, or none is running. Check their logs and <code>/readyz</code>.</dd>
+      <dt>"not the leader" errors in logs</dt>
+      <dd>Normal during an election: clients follow the redirect. Persistent ones mean clients can't reach the leader's advertised address (<code>CONDUCTOR_COORDINATOR_ADVERTISE_ADDR</code>).</dd>
+      <dt>A k8s task fails with ImagePullBackOff, or times out "never scheduled"</dt>
+      <dd>The image or its pull secret is wrong, or no node fits the pod's resources and node selector. The error says which.</dd>
+    </dl>
+
+    <h2 id="backup">Backup and restore</h2>
+    <p>Postgres holds everything: tasks and their history, definitions, runs, schedules, keys. Back it up like any production database (CloudNativePG or managed-service backups with point-in-time recovery, or <code>pg_dump</code>). After a restore, start the coordinators: the leader rebuilds its state from the database, and tasks that were running at backup time are recovered as lost and retried.</p>
+
+    <h2 id="configuration">Configuration reference</h2>
+    <p>Every setting is an environment variable; all components read the same set and use what they need. <code>.env.example</code> in the repository lists them with comments.</p>
+    <h3 id="config-core">Database, network, security</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>POSTGRES_HOST</code>, <code>_PORT</code>, <code>_USER</code>, <code>_PASSWORD</code>, <code>_DB</code></td><td><code>localhost</code>, <code>5432</code>, <code>postgres</code>, <code>postgres</code>, <code>taskscheduler</code></td><td>The database (coordinators and the API)</td></tr>
+        <tr><td><code>POSTGRES_SSLMODE</code></td><td><code>disable</code></td><td><code>require</code> and stricter modes for TLS to the database</td></tr>
+        <tr><td><code>CONDUCTOR_CLUSTER_TOKEN</code></td><td>required</td><td>Shared secret on every gRPC call between components</td></tr>
+        <tr><td><code>CONDUCTOR_API_KEY</code></td><td></td><td>The bootstrap admin API key, stored hashed on startup</td></tr>
+        <tr><td><code>CONDUCTOR_TLS_CERT</code>, <code>_KEY</code>, <code>_CA</code></td><td></td><td>TLS for gRPC; with a CA, mutual TLS</td></tr>
+        <tr><td><code>CONDUCTOR_TLS_SERVER_NAME</code></td><td><code>conductor</code></td><td>The name every component's certificate carries</td></tr>
+        <tr><td><code>CONDUCTOR_COORDINATOR_ADDR</code></td><td><code>localhost:8080</code></td><td>Where the API and workers reach coordinators (comma-separated)</td></tr>
+        <tr><td><code>CONDUCTOR_COORDINATOR_LISTEN</code>, <code>_ADVERTISE_ADDR</code></td><td><code>:8080</code>, this machine</td><td>Where a coordinator listens, and the address standbys redirect to</td></tr>
+        <tr><td><code>CONDUCTOR_API_LISTEN</code></td><td><code>:8081</code></td><td>The API's address</td></tr>
+        <tr><td><code>CONDUCTOR_METRICS_LISTEN</code></td><td><code>:9090</code></td><td>Metrics and probes; <code>off</code> disables</td></tr>
+      </tbody>
+    </table></div>
+    <h3 id="config-workers">Workers</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>CONDUCTOR_WORKER_LISTEN</code>, <code>_ADVERTISE_ADDR</code></td><td><code>:9000</code>, this machine's IP</td><td>Where the coordinator dials the worker</td></tr>
+        <tr><td><code>CONDUCTOR_WORKER_ID</code></td><td>derived</td><td>A hash of host name and address unless set</td></tr>
+        <tr><td><code>CONDUCTOR_WORKER_SLOTS</code></td><td><code>2</code></td><td>Tasks run at once</td></tr>
+        <tr><td><code>CONDUCTOR_WORKER_LABELS</code></td><td></td><td><code>gpu=true,region=eu</code>; the <code>type.</code> prefix is reserved</td></tr>
+        <tr><td><code>CONDUCTOR_WORKER_EXCLUSIVE</code></td><td></td><td>Labels a task must require to run here (a dedicated worker)</td></tr>
+        <tr><td><code>CONDUCTOR_WORKER_TASK_TYPES</code></td><td>all it can</td><td>Limit the task types it runs</td></tr>
+        <tr><td><code>CONDUCTOR_WORKER_PASS_ENV</code></td><td></td><td>Worker variables tasks may see</td></tr>
+        <tr><td><code>CONDUCTOR_DOCKER_SOCKET</code></td><td><code>/var/run/docker.sock</code></td><td>Enables container tasks when Docker answers there</td></tr>
+        <tr><td><code>CONDUCTOR_K8S_TASKS</code></td><td><code>false</code></td><td>Run k8s tasks as pods (in a cluster)</td></tr>
+        <tr><td><code>CONDUCTOR_K8S_NAMESPACE</code>, <code>_SERVICE_ACCOUNT</code>, <code>_SERVICE_ACCOUNTS</code>, <code>_INSTANCE</code></td><td>the worker's namespace, <code>default</code>, none, <code>conductor</code></td><td>Where task pods run, as which accounts, and which installation they belong to</td></tr>
+        <tr><td><code>CONDUCTOR_POD_NAME</code>, <code>CONDUCTOR_POD_UID</code></td><td></td><td>The worker's own pod (downward API), which owns its task pods</td></tr>
+        <tr><td><code>CONDUCTOR_SHUTDOWN_TIMEOUT</code></td><td><code>25s</code></td><td>How long a stopping worker lets running tasks finish</td></tr>
+      </tbody>
+    </table></div>
+    <h3 id="config-behaviour">Behaviour, observability, models</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>CONDUCTOR_PRIORITY_AGING</code></td><td><code>60s</code></td><td>Waiting tasks gain a priority level per interval; <code>0</code> is strict priority</td></tr>
+        <tr><td><code>CONDUCTOR_MAX_OUTPUT_BYTES</code></td><td>1 MiB</td><td>Output kept per task (beginning and end)</td></tr>
+        <tr><td><code>CONDUCTOR_MAX_REQUEST_BYTES</code></td><td>1 MiB</td><td>Largest accepted request body</td></tr>
+        <tr><td><code>CONDUCTOR_LOG_LEVEL</code>, <code>_FORMAT</code></td><td><code>info</code>, <code>text</code></td><td><code>debug</code> to <code>error</code>; <code>text</code> or <code>json</code></td></tr>
+        <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>off</td><td>Export traces</td></tr>
+        <tr><td><code>OPENAI_API_KEY</code> / <code>CONDUCTOR_LLM_API_KEY</code>, <code>CONDUCTOR_LLM_BASE_URL</code>, <code>_MODEL</code>, <code>_TIMEOUT</code>, <code>_PRICES</code>, <code>CONDUCTOR_AI_MODEL</code></td><td></td><td>Models; see <a href="{{link:ai#setup}}">AI features</a></td></tr>
+      </tbody>
+    </table></div>

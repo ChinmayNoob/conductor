@@ -1,0 +1,67 @@
+# Values for the end-to-end suite on kind (see scripts/kind-up.sh). Small
+# resource requests so everything fits on a laptop.
+image:
+  repository: conductor
+  tag: dev
+  pullPolicy: Never
+
+api:
+  service:
+    type: NodePort
+    nodePort: 30081
+  autoscaling:
+    enabled: false
+  replicas: 2
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+
+coordinator:
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+
+# The suite expects 3 shell workers with 2 slots each, like the Compose stack.
+worker:
+  replicas: 3
+  slots: 2
+  shutdownTimeoutSeconds: 25
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+
+# A dedicated pool that scales from zero on queue depth: only tasks with
+# labels {pool: burst} run there (TestWorkersScaleOnQueueDepth).
+workerPools:
+  burst:
+    dedicated: true
+    slots: 2
+    autoscaling:
+      enabled: true
+      minReplicas: 0
+      maxReplicas: 3
+      pollingInterval: 5
+      cooldownPeriod: 20
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 10
+
+kubernetesTasks:
+  enabled: true
+  serviceAccounts: [conductor-e2e-reader]
+
+mockLLM:
+  enabled: true
+
+postgres:
+  dev:
+    resources:
+      requests: {cpu: 50m, memory: 128Mi}
+
+logging:
+  format: text
+
+# Workflow, WorkflowRun and Schedule resources (TestOperator...).
+operator:
+  enabled: true
+  image:
+    repository: conductor-operator
+    tag: dev
+    pullPolicy: Never

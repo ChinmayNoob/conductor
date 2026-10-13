@@ -23,10 +23,11 @@ var (
 
 // Template describes a task. For a shell task, Command is run with `sh -c`.
 type Template struct {
-	Type              string                  `json:"type,omitempty"` // shell (default), http, container, llm
+	Type              string                  `json:"type,omitempty"` // shell (default), http, container, k8s, llm
 	Command           string                  `json:"command,omitempty"`
 	HTTP              *workflow.HTTPSpec      `json:"http,omitempty"`
 	Container         *workflow.ContainerSpec `json:"container,omitempty"`
+	K8s               *workflow.K8sSpec       `json:"k8s,omitempty"`
 	LLM               *workflow.LLMSpec       `json:"llm,omitempty"`
 	Env               map[string]string       `json:"env,omitempty"`
 	Labels            map[string]string       `json:"labels,omitempty"` // a worker must have all of these
@@ -54,9 +55,6 @@ func (t *Template) Validate() error {
 		if strings.TrimSpace(t.Command) == "" {
 			add("command is required for shell tasks")
 		}
-		if t.HTTP != nil || t.Container != nil || t.LLM != nil {
-			add("shell tasks cannot have http, container or llm settings")
-		}
 	case workflow.TypeHTTP:
 		if t.HTTP == nil || t.HTTP.URL == "" {
 			add("http tasks need http.url")
@@ -64,17 +62,20 @@ func (t *Template) Validate() error {
 			!slices.Contains([]string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}, m) {
 			add("unsupported HTTP method %q", t.HTTP.Method)
 		}
-		if t.Container != nil {
-			add("http tasks cannot have container settings")
-		}
 	case workflow.TypeContainer:
 		if t.Container == nil || t.Container.Image == "" {
 			add("container tasks need container.image")
 		} else if n := t.Container.Network; n != "" && n != "bridge" && n != "none" {
 			add("container.network must be bridge or none")
 		}
-		if t.HTTP != nil {
-			add("container tasks cannot have http settings")
+	case workflow.TypeK8s:
+		if t.K8s == nil {
+			add("k8s tasks need k8s.image")
+		} else if err := workflow.ValidateK8s(t.K8s); err != nil {
+			add("%v", err)
+		}
+		if t.Command != "" {
+			add("k8s tasks take k8s.command and k8s.args, not command")
 		}
 	case workflow.TypeLLM:
 		if t.LLM == nil || strings.TrimSpace(t.LLM.Prompt) == "" {
@@ -82,11 +83,27 @@ func (t *Template) Validate() error {
 		} else if err := workflow.ValidateLLM(t.LLM); err != nil {
 			add("%v", err)
 		}
-		if t.HTTP != nil || t.Container != nil || t.Command != "" {
-			add("llm tasks cannot have a command, http or container settings")
+		if t.Command != "" {
+			add("llm tasks cannot have a command")
 		}
 	default:
-		add("unknown type %q (want shell, http, container or llm)", t.Type)
+		add("unknown type %q (want shell, http, container, k8s or llm)", t.Type)
+	}
+	// Each type takes its own settings, and only those.
+	var others []string
+	for _, s := range []struct {
+		typ string
+		set bool
+	}{
+		{workflow.TypeHTTP, t.HTTP != nil}, {workflow.TypeContainer, t.Container != nil},
+		{workflow.TypeK8s, t.K8s != nil}, {workflow.TypeLLM, t.LLM != nil},
+	} {
+		if s.set && s.typ != t.typ() {
+			others = append(others, s.typ)
+		}
+	}
+	if len(others) > 0 {
+		add("%s tasks cannot have %s settings", t.typ(), strings.Join(others, " or "))
 	}
 
 	if t.Queue != "" && !queueRe.MatchString(t.Queue) {
@@ -150,6 +167,9 @@ func (t *Template) NewTask(namespace string) (db.NewTask, error) {
 	case workflow.TypeContainer:
 		spec = t.Container
 		n.Data = strings.TrimSpace(t.Container.Image + " " + strings.Join(t.Container.Command, " "))
+	case workflow.TypeK8s:
+		spec = t.K8s
+		n.Data = workflow.K8sSummary(t.K8s)
 	case workflow.TypeLLM:
 		spec = t.LLM
 		n.Data = workflow.LLMSummary(t.LLM)

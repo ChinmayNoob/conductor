@@ -1,0 +1,219 @@
+{{- $fullname := include "conductor.fullname" . }}
+{{- $pools := include "conductor.workerPools" . | fromYaml }}
+{{- $generic := list }}
+{{- range $name, $p := $pools }}
+{{- if and $p.autoscaling.enabled (not (include "conductor.poolDedicated" $p)) }}{{ $generic = append $generic $name }}{{ end }}
+{{- end }}
+{{- if gt (len $generic) 1 }}
+{{- fail (printf "worker pools %s all autoscale and take any task, so each would scale up for the same tasks: make all but one dedicated" (join ", " $generic)) }}
+{{- end }}
+{{- range $name, $p := $pools }}
+{{- $deploy := include "conductor.workerName" (list $ $name) }}
+{{- $runsK8s := include "conductor.poolRunsK8s" (list $ $p) }}
+{{- $labels := merge (dict "pool" $name) ($p.labels | default dict) }}
+{{- $pairs := list }}
+{{- range $k, $v := $labels }}{{ $pairs = append $pairs (printf "%s=%v" $k $v) }}{{ end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $deploy }}
+  labels:
+    {{- include "conductor.componentLabels" (list $ "worker") | nindent 4 }}
+    conductor.dev/pool: {{ $name }}
+spec:
+  {{- if not $p.autoscaling.enabled }}
+  replicas: {{ $p.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list $ "worker") | nindent 6 }}
+      conductor.dev/pool: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "conductor.componentLabels" (list $ "worker") | nindent 8 }}
+        conductor.dev/pool: {{ $name }}
+      annotations:
+        {{- include "conductor.metricsAnnotations" $ | nindent 8 }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") $ | sha256sum | trunc 16 }}
+        {{- with $p.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- if $runsK8s }}
+      # Only this pool talks to the Kubernetes API, and runs no task code.
+      serviceAccountName: {{ $fullname }}-task-runner
+      automountServiceAccountToken: true
+      {{- else }}
+      serviceAccountName: {{ $fullname }}-worker
+      automountServiceAccountToken: false
+      {{- end }}
+      # Running tasks get shutdownTimeoutSeconds to finish.
+      terminationGracePeriodSeconds: {{ add $p.shutdownTimeoutSeconds 15 }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "conductor.componentSelector" (list $ "worker") | nindent 14 }}
+              conductor.dev/pool: {{ $name }}
+      containers:
+        - name: worker
+          image: {{ include "conductor.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: [worker]
+          env:
+            {{- include "conductor.clusterEnv" $ | nindent 12 }}
+            {{- include "conductor.llmEnv" $ | nindent 12 }}
+            # The coordinator dials workers at their pod IP.
+            - name: CONDUCTOR_WORKER_ADVERTISE_ADDR
+              value: "$(POD_IP):9000"
+            - name: CONDUCTOR_WORKER_SLOTS
+              value: {{ $p.slots | quote }}
+            - name: CONDUCTOR_WORKER_LABELS
+              value: {{ join "," $pairs | quote }}
+            {{- if include "conductor.poolDedicated" $p }}
+            - name: CONDUCTOR_WORKER_EXCLUSIVE
+              value: pool
+            {{- end }}
+            {{- with $p.taskTypes }}
+            - name: CONDUCTOR_WORKER_TASK_TYPES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with $p.passEnv }}
+            - name: CONDUCTOR_WORKER_PASS_ENV
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: CONDUCTOR_SHUTDOWN_TIMEOUT
+              value: "{{ $p.shutdownTimeoutSeconds }}s"
+            - name: CONDUCTOR_POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: CONDUCTOR_POD_UID
+              valueFrom:
+                fieldRef: {fieldPath: metadata.uid}
+            {{- if $runsK8s }}
+            - name: CONDUCTOR_K8S_TASKS
+              value: "true"
+            - name: CONDUCTOR_K8S_NAMESPACE
+              value: {{ include "conductor.taskNamespace" $ | quote }}
+            - name: CONDUCTOR_K8S_SERVICE_ACCOUNT
+              value: {{ $fullname }}-task
+            # Cleanup only touches this release's task pods.
+            - name: CONDUCTOR_K8S_INSTANCE
+              value: {{ $fullname }}
+            {{- with $.Values.kubernetesTasks.serviceAccounts }}
+            - name: CONDUCTOR_K8S_SERVICE_ACCOUNTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with $p.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - {name: grpc, containerPort: 9000}
+            - {name: metrics, containerPort: 9090}
+          {{- include "conductor.probes" $ | nindent 10 }}
+          resources:
+            {{- toYaml $p.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $.Values.securityContext | nindent 12 }}
+          volumeMounts:
+            # Tasks may write to their working directory and /tmp.
+            - {name: tmp, mountPath: /tmp}
+            - {name: home, mountPath: /home/conductor}
+            {{- include "conductor.tlsVolumeMount" $ | nindent 12 }}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+        - {name: home, emptyDir: {}}
+        {{- include "conductor.tlsVolume" $ | nindent 8 }}
+      {{- with $p.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $p.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $p.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if $p.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $deploy }}
+  labels:
+    {{- include "conductor.componentLabels" (list $ "worker") | nindent 4 }}
+    conductor.dev/pool: {{ $name }}
+spec:
+  maxUnavailable: {{ $p.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list $ "worker") | nindent 6 }}
+      conductor.dev/pool: {{ $name }}
+{{- end }}
+{{- if $p.autoscaling.enabled }}
+---
+# Scale the pool on demand for its slots: tasks it could run that are due,
+# plus tasks running on it (see conductor_slot_demand), divided by slots.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $deploy }}
+  labels:
+    {{- include "conductor.componentLabels" (list $ "worker") | nindent 4 }}
+    conductor.dev/pool: {{ $name }}
+spec:
+  scaleTargetRef:
+    name: {{ $deploy }}
+  minReplicaCount: {{ $p.autoscaling.minReplicas }}
+  maxReplicaCount: {{ $p.autoscaling.maxReplicas }}
+  pollingInterval: {{ $p.autoscaling.pollingInterval }}
+  cooldownPeriod: {{ $p.autoscaling.cooldownPeriod }}
+  {{- with $p.autoscaling.behavior }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        {{- toYaml . | nindent 8 }}
+  {{- end }}
+  triggers:
+    - type: postgresql
+      metadata:
+        host: {{ include "conductor.dbHostFQDN" $ | quote }}
+        port: {{ include "conductor.dbPort" $ | quote }}
+        userName: {{ include "conductor.dbUser" $ | quote }}
+        dbName: {{ $.Values.postgres.database | quote }}
+        sslmode: {{ include "conductor.dbSSLMode" $ | quote }}
+        {{- $exclusive := ternary (dict "pool" $name) dict (eq (include "conductor.poolDedicated" $p) "true") }}
+        query: {{ printf "SELECT conductor_slot_demand('%s'::jsonb, '%s'::jsonb)" (include "conductor.poolAdvertisedLabels" (list $ $name $p) | replace "'" "''") (toJson $exclusive | replace "'" "''") | quote }}
+        targetQueryValue: {{ $p.slots | quote }}
+        activationTargetQueryValue: "0"
+      authenticationRef:
+        name: {{ $fullname }}-postgres-auth
+{{- end }}
+{{- end }}
+{{- if include "conductor.anyPoolAutoscales" . }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ $fullname }}-postgres-auth
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: {{ include "conductor.dbPasswordSecret" . }}
+      key: {{ include "conductor.dbPasswordKey" . }}
+{{- end }}

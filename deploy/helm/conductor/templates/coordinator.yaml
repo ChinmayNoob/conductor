@@ -1,0 +1,106 @@
+{{- $fullname := include "conductor.fullname" . }}
+{{- $c := .Values.coordinator }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-coordinator
+  labels:
+    {{- include "conductor.componentLabels" (list . "coordinator") | nindent 4 }}
+spec:
+  replicas: {{ $c.replicas }}
+  # Bring the new pod up before stopping an old one: if the old one led, a
+  # standby is ready to take over.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "coordinator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "conductor.componentLabels" (list . "coordinator") | nindent 8 }}
+      annotations:
+        {{- include "conductor.metricsAnnotations" . | nindent 8 }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
+        {{- with $c.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "conductor.spread" (list . "coordinator") | nindent 6 }}
+      containers:
+        - name: coordinator
+          image: {{ include "conductor.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [coordinator]
+          env:
+            {{- include "conductor.clusterEnv" . | nindent 12 }}
+            {{- include "conductor.dbEnv" . | nindent 12 }}
+            # Standbys redirect callers here when this coordinator leads.
+            - name: CONDUCTOR_COORDINATOR_ADVERTISE_ADDR
+              value: "$(POD_IP):8080"
+            {{- with $c.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - {name: grpc, containerPort: 8080}
+            - {name: metrics, containerPort: 9090}
+          {{- include "conductor.probes" . | nindent 10 }}
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            {{- include "conductor.tlsVolumeMount" . | nindent 12 }}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+        {{- include "conductor.tlsVolume" . | nindent 8 }}
+      {{- with $c.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $c.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# Callers reach any coordinator here; standbys point them to the leader.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-coordinator
+  labels:
+    {{- include "conductor.componentLabels" (list . "coordinator") | nindent 4 }}
+spec:
+  selector:
+    {{- include "conductor.componentSelector" (list . "coordinator") | nindent 4 }}
+  ports:
+    - {name: grpc, port: 8080, targetPort: grpc, appProtocol: grpc}
+    - {name: metrics, port: 9090, targetPort: metrics}
+{{- if $c.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-coordinator
+  labels:
+    {{- include "conductor.componentLabels" (list . "coordinator") | nindent 4 }}
+spec:
+  minAvailable: {{ $c.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "coordinator") | nindent 6 }}
+{{- end }}

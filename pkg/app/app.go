@@ -63,6 +63,8 @@ func RunCoordinator(ctx context.Context, cfg *config.Config) error {
 		PriorityAging: cfg.PriorityAging,
 	})
 	prometheus.MustRegister(srv.Collector())
+	// Standbys are ready too: they redirect callers to the leader.
+	metrics.AddReadyCheck("database", database.Ping)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	// Standbys turn every call away, pointing at the leader.
 	grpcServer := grpc.NewServer(append(serverOpts, grpc.ChainUnaryInterceptor(srv.LeaderOnly))...)
@@ -122,6 +124,7 @@ func RunAPI(ctx context.Context, cfg *config.Config) error {
 
 	srv := api.NewServer(database, coord, cfg.MaxRequestBytes)
 	srv.SetAssistant(assistant)
+	metrics.AddReadyCheck("database", database.Ping)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	httpServer := &http.Server{
 		Addr:              cfg.APIListen,
@@ -171,7 +174,8 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	}
 	id := cfg.Worker.ID
 	if id == 0 {
-		id = worker.ID(address)
+		hostname, _ := os.Hostname()
+		id = worker.ID(hostname, address)
 	}
 	slog.SetDefault(slog.Default().With("worker_id", id))
 
@@ -184,14 +188,18 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 		Address:      address,
 		Slots:        cfg.Worker.Slots,
 		Labels:       cfg.Worker.Labels,
+		Exclusive:    cfg.Worker.Exclusive,
+		Types:        cfg.Worker.TaskTypes,
 		MaxOutput:    cfg.MaxOutputBytes,
 		PassEnv:      cfg.Worker.PassEnv,
 		DockerSocket: cfg.Worker.DockerSocket,
+		Kube:         kubeOptions(cfg.Worker.K8s),
 		LLM:          provider,
 		LLMPrices:    prices,
 		Coordinator:  coord,
 	})
 	prometheus.MustRegister(w.Collector())
+	metrics.AddReadyCheck("coordinator", w.Ready)
 	metrics.Serve(ctx, cfg.MetricsListen)
 	grpcServer := grpc.NewServer(serverOpts...)
 	grpcapi.RegisterWorkerServiceServer(grpcServer, w)
@@ -206,7 +214,7 @@ func RunWorker(ctx context.Context, cfg *config.Config) error {
 	go w.RunHeartbeats(heartbeatCtx)
 
 	slog.Info("Worker listening", "addr", lis.Addr().String(), "advertise", address,
-		"slots", cfg.Worker.Slots, "labels", w.Labels())
+		"slots", cfg.Worker.Slots, "labels", w.Labels(), "exclusive", cfg.Worker.Exclusive)
 	err = serveUntilDone(ctx, func() error { return grpcServer.Serve(lis) })
 
 	slog.Info("Shutting down")
@@ -350,6 +358,17 @@ func gracefulStop(s *grpc.Server, timeout time.Duration) {
 	case <-done:
 	case <-time.After(timeout):
 		s.Stop()
+	}
+}
+
+// kubeOptions returns the Kubernetes task settings, or nil when they're off.
+func kubeOptions(c config.K8s) *worker.KubeOptions {
+	if !c.Enabled {
+		return nil
+	}
+	return &worker.KubeOptions{
+		Namespace: c.Namespace, ServiceAccount: c.ServiceAccount, ServiceAccounts: c.ServiceAccounts,
+		PodName: c.PodName, PodUID: c.PodUID, Instance: c.Instance,
 	}
 }
 

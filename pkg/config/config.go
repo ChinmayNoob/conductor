@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -79,9 +80,29 @@ type Worker struct {
 	AdvertiseAddr string // host:port the coordinator dials; empty means auto-detect
 	Slots         int    // tasks run at once
 	Labels        map[string]string
+	// Exclusive names labels a task must require to run here (a dedicated
+	// worker); each must be one of Labels.
+	Exclusive []string
+	// TaskTypes limits the task types it runs; empty means all it can.
+	TaskTypes []string
 	// PassEnv names worker environment variables that tasks may see.
 	PassEnv      []string
 	DockerSocket string // enables container tasks when Docker answers here
+	K8s          K8s
+}
+
+// K8s configures Kubernetes tasks (type k8s), which run as pods. Only
+// workers running in a cluster can enable them.
+type K8s struct {
+	Enabled         bool
+	Namespace       string   // for task pods; default the worker's own
+	ServiceAccount  string   // for tasks that name none (no token mounted)
+	ServiceAccounts []string // others tasks may name
+	// The worker's own pod (from the downward API), which owns its tasks' pods.
+	PodName string
+	PodUID  string
+	// Instance names the installation, scoping task pod cleanup.
+	Instance string
 }
 
 // TLS secures gRPC between components. All components share one certificate
@@ -116,6 +137,14 @@ func Load() (*Config, error) {
 			AdvertiseAddr: os.Getenv("CONDUCTOR_WORKER_ADVERTISE_ADDR"),
 			DockerSocket:  env("CONDUCTOR_DOCKER_SOCKET", "/var/run/docker.sock"),
 			PassEnv:       splitList(os.Getenv("CONDUCTOR_WORKER_PASS_ENV")),
+			K8s: K8s{
+				Namespace:       os.Getenv("CONDUCTOR_K8S_NAMESPACE"),
+				ServiceAccount:  os.Getenv("CONDUCTOR_K8S_SERVICE_ACCOUNT"),
+				ServiceAccounts: splitList(os.Getenv("CONDUCTOR_K8S_SERVICE_ACCOUNTS")),
+				PodName:         os.Getenv("CONDUCTOR_POD_NAME"),
+				PodUID:          os.Getenv("CONDUCTOR_POD_UID"),
+				Instance:        os.Getenv("CONDUCTOR_K8S_INSTANCE"),
+			},
 		},
 		ClusterToken: os.Getenv("CONDUCTOR_CLUSTER_TOKEN"),
 		APIKey:       os.Getenv("CONDUCTOR_API_KEY"),
@@ -158,6 +187,20 @@ func Load() (*Config, error) {
 	}
 	c.Worker.Labels, err = parseLabels(os.Getenv("CONDUCTOR_WORKER_LABELS"))
 	collect(wrap("CONDUCTOR_WORKER_LABELS", err))
+	c.Worker.TaskTypes = splitList(os.Getenv("CONDUCTOR_WORKER_TASK_TYPES"))
+	for _, typ := range c.Worker.TaskTypes {
+		if !slices.Contains([]string{"shell", "http", "container", "k8s", "llm"}, typ) {
+			collect(fmt.Errorf("CONDUCTOR_WORKER_TASK_TYPES: unknown task type %q (want shell, http, container, k8s or llm)", typ))
+		}
+	}
+	c.Worker.Exclusive = splitList(os.Getenv("CONDUCTOR_WORKER_EXCLUSIVE"))
+	for _, k := range c.Worker.Exclusive {
+		if _, ok := c.Worker.Labels[k]; !ok && err == nil {
+			collect(fmt.Errorf("CONDUCTOR_WORKER_EXCLUSIVE: %q is not one of the worker's labels (CONDUCTOR_WORKER_LABELS)", k))
+		}
+	}
+	c.Worker.K8s.Enabled, err = strconv.ParseBool(env("CONDUCTOR_K8S_TASKS", "false"))
+	collect(wrap("CONDUCTOR_K8S_TASKS", err))
 
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		collect(fmt.Errorf("CONDUCTOR_LOG_FORMAT must be text or json, got %q", c.LogFormat))

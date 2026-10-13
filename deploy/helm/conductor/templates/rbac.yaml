@@ -1,0 +1,96 @@
+{{- $fullname := include "conductor.fullname" . }}
+# Coordinators and the API never call the Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-worker
+  labels:
+    {{- include "conductor.componentLabels" (list . "worker") | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+{{- if .Values.kubernetesTasks.enabled }}
+{{- $tasksNS := include "conductor.taskNamespace" . }}
+---
+# The k8s pool's workers run k8s tasks as pods in the task namespace: they
+# may manage pods there, and do nothing else. No other pool has a token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-task-runner
+  labels:
+    {{- include "conductor.componentLabels" (list . "worker") | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-task-runner
+  namespace: {{ $tasksNS }}
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-task-runner
+  namespace: {{ $tasksNS }}
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-task-runner
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-task-runner
+    namespace: {{ .Release.Namespace }}
+---
+# What task pods run as unless they name an allowed account: no
+# permissions, and no token mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-task
+  namespace: {{ $tasksNS }}
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+{{- if .Values.networkPolicy.enabled }}
+---
+# Nothing needs to connect to a task pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-tasks
+  namespace: {{ $tasksNS }}
+  labels:
+    {{- include "conductor.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: conductor.dev/task-id, operator: Exists}
+  policyTypes: [Ingress]
+{{- end }}
+{{- end }}

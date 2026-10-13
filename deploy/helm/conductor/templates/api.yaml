@@ -1,0 +1,181 @@
+{{- $fullname := include "conductor.fullname" . }}
+{{- $a := .Values.api }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-api
+  labels:
+    {{- include "conductor.componentLabels" (list . "api") | nindent 4 }}
+spec:
+  {{- if not $a.autoscaling.enabled }}
+  replicas: {{ $a.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "conductor.componentLabels" (list . "api") | nindent 8 }}
+      annotations:
+        {{- include "conductor.metricsAnnotations" . | nindent 8 }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
+        {{- with $a.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}
+      automountServiceAccountToken: false
+      # preStop's delay plus the server's own shutdown (25s).
+      terminationGracePeriodSeconds: 40
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "conductor.spread" (list . "api") | nindent 6 }}
+      containers:
+        - name: api
+          image: {{ include "conductor.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [api]
+          env:
+            {{- include "conductor.clusterEnv" . | nindent 12 }}
+            {{- include "conductor.dbEnv" . | nindent 12 }}
+            {{- include "conductor.llmEnv" . | nindent 12 }}
+            {{- with .Values.llm.assistantModel }}
+            - name: CONDUCTOR_AI_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: CONDUCTOR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "conductor.authSecret" . }}
+                  key: api-key
+            {{- with $a.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: 8081}
+            - {name: metrics, containerPort: 9090}
+          # Keep serving until load balancers have stopped sending new
+          # requests here; only then shut down.
+          lifecycle:
+            preStop:
+              exec:
+                command: [sleep, "5"]
+          {{- include "conductor.probes" . | nindent 10 }}
+          resources:
+            {{- toYaml $a.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            {{- include "conductor.tlsVolumeMount" . | nindent 12 }}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+        {{- include "conductor.tlsVolume" . | nindent 8 }}
+      {{- with $a.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $a.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $a.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-api
+  labels:
+    {{- include "conductor.componentLabels" (list . "api") | nindent 4 }}
+  {{- with $a.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $a.service.type }}
+  selector:
+    {{- include "conductor.componentSelector" (list . "api") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $a.service.port }}
+      targetPort: http
+      {{- if and (eq $a.service.type "NodePort") $a.service.nodePort }}
+      nodePort: {{ $a.service.nodePort }}
+      {{- end }}
+    - {name: metrics, port: 9090, targetPort: metrics}
+{{- if $a.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullname }}-api
+  labels:
+    {{- include "conductor.componentLabels" (list . "api") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullname }}-api
+  minReplicas: {{ $a.autoscaling.minReplicas }}
+  maxReplicas: {{ $a.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if $a.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-api
+  labels:
+    {{- include "conductor.componentLabels" (list . "api") | nindent 4 }}
+spec:
+  minAvailable: {{ $a.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "api") | nindent 6 }}
+{{- end }}
+{{- if $a.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-api
+  labels:
+    {{- include "conductor.componentLabels" (list . "api") | nindent 4 }}
+  {{- with $a.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $a.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with $a.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ $a.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-api
+                port: {name: http}
+{{- end }}

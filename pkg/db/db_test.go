@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -77,7 +78,7 @@ func must[T any](t *testing.T) func(T, error) T {
 }
 
 // shellWorkers is the label set of a plain worker.
-var shellWorkers = PickOptions{WorkerLabels: []map[string]string{{"type.shell": "true"}}}
+var shellWorkers = PickOptions{Workers: []WorkerMatch{{Labels: map[string]string{"type.shell": "true"}}}}
 
 // create inserts a shell task, letting the caller adjust it first.
 func create(t *testing.T, db *DB, data string, adjust ...func(*NewTask)) *Task {
@@ -264,9 +265,38 @@ func TestPickMatchesWorkerLabels(t *testing.T) {
 	if got := pick(t, db); got != nil {
 		t.Fatalf("a plain worker got the GPU task")
 	}
-	withGPU := PickOptions{WorkerLabels: []map[string]string{{"type.shell": "true"}, {"type.shell": "true", "gpu": "true"}}}
+	withGPU := PickOptions{Workers: []WorkerMatch{
+		{Labels: map[string]string{"type.shell": "true"}},
+		{Labels: map[string]string{"type.shell": "true", "gpu": "true"}},
+	}}
 	if got := pick(t, db, withGPU); got == nil || got.ID != gpu.ID {
 		t.Fatalf("a GPU worker got %v, want the GPU task", got)
+	}
+}
+
+func TestPickHonorsExclusiveLabels(t *testing.T) {
+	db := testDB(t)
+	// A dedicated GPU pool: its workers take only tasks that ask for it.
+	dedicated := PickOptions{Workers: []WorkerMatch{{
+		Labels:    map[string]string{"type.shell": "true", "pool": "gpu"},
+		Exclusive: map[string]string{"pool": "gpu"},
+	}}}
+	plain := create(t, db, "plain")
+	if got := pick(t, db, dedicated); got != nil {
+		t.Fatalf("a dedicated worker took %q, which doesn't ask for its pool", got.Data)
+	}
+	meant := create(t, db, "for the pool", func(n *NewTask) { n.Requirements["pool"] = "gpu" })
+	if got := pick(t, db, dedicated); got == nil || got.ID != meant.ID {
+		t.Fatalf("a dedicated worker got %v, want the task meant for it", got)
+	}
+	if got := pick(t, db); got == nil || got.ID != plain.ID {
+		t.Fatalf("a plain worker got %v, want the plain task", got)
+	}
+
+	if (WorkerMatch{Labels: dedicated.Workers[0].Labels}).Accepts(map[string]string{"type.shell": "true"}) != true ||
+		dedicated.Workers[0].Accepts(map[string]string{"type.shell": "true"}) ||
+		!dedicated.Workers[0].Accepts(map[string]string{"type.shell": "true", "pool": "gpu"}) {
+		t.Fatal("WorkerMatch.Accepts disagrees with the pick query")
 	}
 }
 
@@ -634,6 +664,52 @@ func TestSchedules(t *testing.T) {
 	}
 }
 
+func TestPutSchedule(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	put := func(s Schedule) (*Schedule, bool) {
+		t.Helper()
+		s.Namespace, s.Name, s.Timezone, s.MisfirePolicy = "default", "nightly", "UTC", "skip"
+		if s.Target == nil {
+			s.Target = json.RawMessage(`{"task": {"command": "echo"}}`)
+		}
+		out, created, err := db.PutSchedule(ctx, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out, created
+	}
+	first := time.Now().Add(time.Hour).Truncate(time.Second)
+
+	s, created := put(Schedule{Cron: "0 3 * * *", Enabled: true, NextRunAt: first})
+	if !created || !s.NextRunAt.Equal(first) {
+		t.Fatalf("first put: created=%v next=%v", created, s.NextRunAt)
+	}
+	id := uuid.New()
+	if err := db.RecordScheduleRun(ctx, s.ID, first, true, &id, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same timing, new target: the pending run and the history stay.
+	s, created = put(Schedule{Cron: "0 3 * * *", Enabled: true, NextRunAt: first.Add(time.Hour),
+		Target: json.RawMessage(`{"task": {"command": "date"}}`)})
+	if created || !s.NextRunAt.Equal(first) || s.LastRunID == nil || *s.LastRunID != id ||
+		!strings.Contains(string(s.Target), "date") {
+		t.Fatalf("update keeping the timing: created=%v %+v", created, s)
+	}
+	// New timing: the next run moves.
+	if s, _ = put(Schedule{Cron: "0 4 * * *", Enabled: true, NextRunAt: first.Add(time.Hour)}); !s.NextRunAt.Equal(first.Add(time.Hour)) {
+		t.Fatalf("cron change kept next run %v", s.NextRunAt)
+	}
+	// Pausing keeps it; resuming starts from the given time.
+	if s, _ = put(Schedule{Cron: "0 4 * * *", Enabled: false, NextRunAt: first}); s.Enabled || !s.NextRunAt.Equal(first.Add(time.Hour)) {
+		t.Fatalf("pause: %+v", s)
+	}
+	if s, _ = put(Schedule{Cron: "0 4 * * *", Enabled: true, NextRunAt: first.Add(2 * time.Hour)}); !s.Enabled || !s.NextRunAt.Equal(first.Add(2*time.Hour)) {
+		t.Fatalf("resume: %+v", s)
+	}
+}
+
 func TestAPIKeys(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
@@ -892,5 +968,68 @@ func TestExplanations(t *testing.T) {
 	}
 	if got := must[*Explanation](t)(db.GetExplanation(ctx, optedOut.ID)); got != nil {
 		t.Fatalf("explanation for an unexplained task: %+v", got)
+	}
+}
+
+func TestSlotDemand(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	demand := func(labels string) int64 {
+		t.Helper()
+		var n int64
+		if err := db.q.QueryRowContext(ctx, `SELECT conductor_slot_demand($1::jsonb)`, labels).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	burst := `{"type.shell": "true", "pool": "burst"}`
+	if n := demand(burst); n != 0 {
+		t.Fatalf("empty database: demand %d", n)
+	}
+
+	must[*Queue](t)(db.UpsertQueue(ctx, Queue{Namespace: "default", Name: "held", Paused: true}))
+	for _, w := range []WorkerRecord{
+		{ID: 7, Address: "10.0.0.7:9000", Labels: StringMap{"type.shell": "true", "pool": "burst"}, Slots: 2, Status: "healthy"},
+		{ID: 8, Address: "10.0.0.8:9000", Labels: StringMap{"type.shell": "true"}, Slots: 2, Status: "healthy"},
+	} {
+		if err := db.UpsertWorker(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two tasks start: one on a burst worker, one elsewhere.
+	for _, worker := range []int64{7, 8} {
+		task := create(t, db, "running")
+		pick(t, db)
+		must[bool](t)(db.MarkTaskStarted(ctx, task.ID, att(t, db, task.ID), worker))
+	}
+	create(t, db, "ready")
+	create(t, db, "ready too")
+	create(t, db, "later", func(n *NewTask) { n.ScheduledAt = time.Now().Add(time.Hour) })
+	create(t, db, "held", func(n *NewTask) { n.Queue = "held" })
+	create(t, db, "needs a gpu", func(n *NewTask) { n.Requirements["gpu"] = "true" })
+
+	// Burst workers could take the 2 ready tasks, and run 1.
+	if n := demand(burst); n != 3 {
+		t.Errorf("burst pool demand = %d, want 3", n)
+	}
+	// Any shell worker could take the same 2, and the pool runs both.
+	if n := demand(`{"type.shell": "true"}`); n != 4 {
+		t.Errorf("shell pool demand = %d, want 4", n)
+	}
+	if n := demand(`{"type.shell": "true", "gpu": "true"}`); n != 3 {
+		t.Errorf("gpu pool demand = %d, want 3 (2 ready, 1 gpu)", n)
+	}
+	if n := demand(`{"type.http": "true"}`); n != 0 {
+		t.Errorf("http-only pool demand = %d, want 0", n)
+	}
+
+	// A dedicated pool counts only the tasks that ask for it.
+	create(t, db, "for burst", func(n *NewTask) { n.Requirements["pool"] = "burst" })
+	var n int64
+	if err := db.q.QueryRowContext(ctx, `SELECT conductor_slot_demand($1::jsonb, '{"pool": "burst"}')`, burst).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("dedicated burst pool demand = %d, want 2 (1 ready for it, 1 running on it)", n)
 	}
 }

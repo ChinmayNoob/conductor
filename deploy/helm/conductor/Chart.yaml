@@ -1,0 +1,18 @@
+apiVersion: v2
+name: conductor
+description: A Postgres-only durable workflow engine for background jobs and AI agents
+type: application
+version: 0.1.0
+appVersion: "dev"
+home: https://github.com/ChinmayNoob/conductor
+sources:
+  - https://github.com/ChinmayNoob/conductor
+keywords:
+  - workflow
+  - durable-execution
+  - task-queue
+  - saga
+  - postgres
+maintainers:
+  - name: Chinmay Sawant
+kubeVersion: ">=1.27.0-0"

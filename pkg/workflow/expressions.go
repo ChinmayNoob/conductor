@@ -151,6 +151,7 @@ type TaskSpec struct {
 	Command    string // shell command, or a summary for other types
 	HTTP       *HTTPSpec
 	Container  *ContainerSpec
+	K8s        *K8sSpec
 	LLM        *LLMSpec
 	Wait       *WaitSpec  // approval and signal steps: no task
 	Agent      *AgentSpec // agent steps: a run of model and tool tasks
@@ -278,6 +279,21 @@ func (d *Definition) resolve(s *Step, a Action, ownOutputs map[string]string, c 
 		}
 		spec.Container = &ct
 		spec.Command = strings.TrimSpace(ct.Image + " " + strings.Join(ct.Command, " "))
+	case TypeK8s:
+		k := *a.K8s
+		k.Command, k.Args = slices.Clone(k.Command), slices.Clone(k.Args)
+		for i, arg := range k.Command {
+			if k.Command[i], err = c.Resolve(arg); err != nil {
+				return nil, fmt.Errorf("k8s.command[%d]: %w", i, err)
+			}
+		}
+		for i, arg := range k.Args {
+			if k.Args[i], err = c.Resolve(arg); err != nil {
+				return nil, fmt.Errorf("k8s.args[%d]: %w", i, err)
+			}
+		}
+		spec.K8s = &k
+		spec.Command = K8sSummary(&k)
 	case TypeLLM:
 		l := *a.LLM
 		if l.Prompt, err = c.Resolve(l.Prompt); err != nil {
@@ -327,6 +343,11 @@ func (d *Definition) resolve(s *Step, a Action, ownOutputs map[string]string, c 
 		spec.Command = "agent: " + LLMSummary(&LLMSpec{Model: ag.Model, Prompt: ag.Prompt})[len("llm "):]
 	}
 	return spec, nil
+}
+
+// K8sSummary is a one-line description of a k8s task, for lists.
+func K8sSummary(k *K8sSpec) string {
+	return strings.Join(slices.Concat([]string{k.Image}, k.Command, k.Args), " ")
 }
 
 // LLMSummary is a one-line description of an llm task, for lists.

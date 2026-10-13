@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -42,6 +43,7 @@ const (
 	LabelShell     = "type.shell"
 	LabelHTTP      = "type.http"
 	LabelContainer = "type.container"
+	LabelK8s       = "type.k8s"
 )
 
 type Server struct {
@@ -51,9 +53,11 @@ type Server struct {
 	address     string
 	slots       int
 	labels      map[string]string
+	exclusive   []string
 	maxOutput   int
 	env         []string     // base environment for tasks
 	docker      *docker      // nil if containers aren't available
+	kube        *kube        // nil if Kubernetes tasks aren't enabled
 	llm         llm.Provider // nil if no language model is configured
 	llmPrices   llm.Prices
 	coordinator grpcapi.CoordinatorServiceClient
@@ -67,20 +71,32 @@ type Server struct {
 	mu       sync.Mutex
 	running  map[string]*runningTask
 	draining bool
-	wg       sync.WaitGroup
+	// lastHeartbeat is when a coordinator last acknowledged a heartbeat.
+	lastHeartbeat time.Time
+	wg            sync.WaitGroup
 }
 
 type Options struct {
-	ID        uint32
-	Address   string            // host:port the coordinator dials
-	Slots     int               // tasks run concurrently
-	Labels    map[string]string // user labels, e.g. region=eu
-	MaxOutput int               // bytes of output kept per task
+	ID      uint32
+	Address string            // host:port the coordinator dials
+	Slots   int               // tasks run concurrently
+	Labels  map[string]string // user labels, e.g. region=eu
+	// Exclusive names labels a task must require to run here, making this a
+	// dedicated worker (e.g. pool=gpu takes only tasks that ask for it).
+	Exclusive []string
+	MaxOutput int // bytes of output kept per task
 	// PassEnv names worker environment variables that tasks may see. Nothing
 	// else from the worker's environment is passed on.
 	PassEnv []string
 	// DockerSocket enables the container executor if the daemon answers.
 	DockerSocket string
+	// Kube enables Kubernetes tasks, if the worker runs in a cluster.
+	Kube *KubeOptions
+	// Types limits the task types the worker runs (shell, http, container,
+	// k8s, llm); empty means every type it can. A worker holding Kubernetes
+	// credentials should run only k8s tasks: shell tasks run as the
+	// worker's user and could read them.
+	Types []string
 	// LLM enables llm tasks; nil disables them. Prices turn token usage
 	// into cost.
 	LLM         llm.Provider
@@ -94,6 +110,7 @@ func NewServer(opts Options) *Server {
 		id:          opts.ID,
 		address:     opts.Address,
 		slots:       max(opts.Slots, 1),
+		exclusive:   opts.Exclusive,
 		maxOutput:   opts.MaxOutput,
 		env:         baseEnv(opts.PassEnv),
 		coordinator: opts.Coordinator,
@@ -109,12 +126,20 @@ func NewServer(opts Options) *Server {
 	if s.labels == nil {
 		s.labels = make(map[string]string)
 	}
-	s.labels[LabelShell] = "true"
-	s.labels[LabelHTTP] = "true"
+	runs := func(typ string) bool { return len(opts.Types) == 0 || slices.Contains(opts.Types, typ) }
+	if runs("shell") {
+		s.labels[LabelShell] = "true"
+	}
+	if runs("http") {
+		s.labels[LabelHTTP] = "true"
+	}
+	if !runs("llm") {
+		s.llm = nil
+	}
 	if s.llm != nil {
 		s.labels[LabelLLM] = "true"
 	}
-	if opts.DockerSocket != "" {
+	if opts.DockerSocket != "" && runs("container") {
 		d := newDocker(opts.DockerSocket)
 		if err := d.Ping(context.Background()); err != nil {
 			s.log.Info("Container tasks disabled: Docker is not reachable", "socket", opts.DockerSocket, "error", err)
@@ -123,17 +148,28 @@ func NewServer(opts Options) *Server {
 			s.labels[LabelContainer] = "true"
 		}
 	}
+	if opts.Kube != nil && runs("k8s") {
+		if k, err := inClusterKube(*opts.Kube); err != nil {
+			s.log.Warn("Kubernetes tasks disabled", "error", err)
+		} else {
+			s.kube = k
+			s.labels[LabelK8s] = "true"
+			s.log.Info("Kubernetes tasks enabled", "namespace", k.namespace, "service_account", k.opts.ServiceAccount)
+		}
+	}
 	return s
 }
 
 // Labels returns the labels the worker advertises.
 func (s *Server) Labels() map[string]string { return maps.Clone(s.labels) }
 
-// ID derives a stable worker ID from the advertised address, so replicas of
-// the same service get distinct IDs without configuration.
-func ID(address string) uint32 {
+// ID derives a worker ID from the host name and advertised address, so
+// replicas of the same service get distinct IDs without configuration. The
+// host name matters on Kubernetes, which reuses pod IPs: a new pod must not
+// inherit a dead pod's identity (and with it, the tasks it was running).
+func ID(hostname, address string) uint32 {
 	h := fnv.New32a()
-	h.Write([]byte(address))
+	h.Write([]byte(hostname + "/" + address))
 	return max(h.Sum32(), 1)
 }
 
@@ -164,10 +200,9 @@ func (s *Server) SubmitTask(rpcCtx context.Context, req *grpcapi.TaskRequest) (*
 		return reject("no free slot")
 	case s.running[req.TaskId] != nil:
 		return reject("task is already running here")
-	case req.Type == "container" && s.docker == nil:
-		return reject("container tasks are not available on this worker")
-	case req.Type == "llm" && s.llm == nil:
-		return reject("llm tasks are not available on this worker: no language model is configured")
+	case s.labels["type."+taskType(req.Type)] != "true":
+		// It runs exactly the types it advertises.
+		return reject(taskType(req.Type) + " tasks are not available on this worker")
 	}
 
 	ctx, cancel := context.WithCancelCause(s.tasksCtx)
@@ -261,6 +296,8 @@ func (s *Server) run(ctx context.Context, task *grpcapi.TaskRequest) {
 		res.output, res.outputs, err = runHTTP(ctx, task.SpecJson, timeout, s.maxOutput)
 	case "container":
 		res.output, err = s.docker.run(ctx, task.TaskId, task.SpecJson, taskEnv(nil, env), timeout, s.maxOutput)
+	case "k8s":
+		res.output, res.outputs, err = s.kube.run(ctx, task.TaskId, task.Attempt, task.SpecJson, env, timeout, s.outputOf(task.TaskId))
 	case "llm":
 		res, err = s.runLLM(ctx, task.SpecJson, timeout)
 	default:
@@ -311,8 +348,15 @@ func (s *Server) report(ctx context.Context, req *grpcapi.UpdateTaskStatusReques
 	}
 }
 
-// RunHeartbeats sends heartbeats until ctx is cancelled.
+// RunHeartbeats sends heartbeats, and does other periodic housekeeping,
+// until ctx is cancelled.
 func (s *Server) RunHeartbeats(ctx context.Context) {
+	if s.kube != nil {
+		// Before the first heartbeat, nothing can have been dispatched
+		// here: any pod this worker's pod started is from before a restart.
+		s.kube.deleteOwnLeftovers(ctx)
+		go s.kube.sweepOrphans(ctx, k8sOrphanAge)
+	}
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -376,16 +420,37 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 	s.mu.Unlock()
 
 	_, err := s.coordinator.SendHeartbeat(ctx, &grpcapi.HeartbeatRequest{
-		WorkerId: s.id,
-		Address:  s.address,
-		Draining: draining,
-		Slots:    int32(s.slots),
-		Running:  int32(running),
-		Labels:   s.labels,
+		WorkerId:        s.id,
+		Address:         s.address,
+		Draining:        draining,
+		Slots:           int32(s.slots),
+		Running:         int32(running),
+		Labels:          s.labels,
+		ExclusiveLabels: s.exclusive,
 	})
 	if err != nil {
 		s.log.Warn("Heartbeat failed", "error", err)
+		return
 	}
+	s.mu.Lock()
+	s.lastHeartbeat = time.Now()
+	s.mu.Unlock()
+}
+
+// Ready reports whether the worker can take tasks: it is not draining, and a
+// coordinator acknowledged one of its last two heartbeats.
+func (s *Server) Ready(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.draining:
+		return errors.New("draining")
+	case s.lastHeartbeat.IsZero():
+		return errors.New("not registered with a coordinator yet")
+	case time.Since(s.lastHeartbeat) > 2*heartbeatInterval+5*time.Second:
+		return fmt.Errorf("no heartbeat acknowledged for %v", time.Since(s.lastHeartbeat).Round(time.Second))
+	}
+	return nil
 }
 
 // Drain stops accepting tasks and waits for running ones to finish. If ctx

@@ -245,34 +245,39 @@ These rules apply to every phase. When a decision conflicts with one of them, th
 
 ---
 
-## Phase 6: Kubernetes and cloud-native ⬜
+## Phase 6: Kubernetes and cloud-native ✅ (done, PR #7)
 
 **Goal:** first-class deployment on Kubernetes, with autoscaling and strong isolation.
 **When it is needed:** when running across multiple machines, autoscaling workers, or isolating each task in its own pod. Docker Compose remains the supported single-host option.
 
+Design decisions: [ADR 0004](docs/adr/0004-kubernetes.md).
+
 ### 6.1 Deployment
-- ⬜ Helm chart:
-  - Coordinator Deployment (2 replicas, Phase 3 leader election)
-  - Scheduler Deployment with a HorizontalPodAutoscaler
-  - Worker Deployment
-  - Postgres external, or via CloudNativePG
-- ⬜ CI job that installs the chart on `kind` and runs the e2e suite against it
-- ⬜ Production settings: PodDisruptionBudgets, NetworkPolicies, resource requests and limits, readiness and liveness probes
+- ✅ Helm chart ([deploy/helm/conductor](deploy/helm/conductor)):
+  - Coordinator Deployment (2 replicas, Phase 3 leader election; standbys are ready and redirect)
+  - API ("scheduler") Deployment with a HorizontalPodAutoscaler and a preStop drain
+  - Worker pools, each a Deployment (`workerPools`), optionally dedicated
+  - Postgres external, via CloudNativePG, or a single dev pod for trying it out
+  - Mutual TLS on by default with a generated CA; generated secrets kept across upgrades
+- ✅ CI job that installs the chart on `kind` and runs the e2e suite against it, with dev Postgres and with CloudNativePG. The e2e helpers go through a platform interface (Compose or Kubernetes), so it is the same suite
+- ✅ Production settings: PodDisruptionBudgets, NetworkPolicies (verified enforced on kind), resource requests and limits, startup, readiness and liveness probes (`/healthz` and `/readyz` on every component), non-root pods with read-only root filesystems
+- ✅ A rolling restart of every component loses no task or workflow and fails no API request (`TestRollingRestartLosesNothing`)
 
 ### 6.2 Autoscaling
-- ⬜ KEDA `ScaledObject` using the Postgres scaler on queue depth: scale workers to zero when idle and burst when the queue grows
+- ✅ KEDA `ScaledObject` using the Postgres scaler on queue depth: scale workers to zero when idle and burst when the queue grows. The scaler reads `conductor_slot_demand()`, a SQL function in the schema (due tasks a pool can run plus tasks running on it), so its settings don't depend on table layout
+- ✅ Dedicated pools (exclusive worker labels, like taints), so a pool that scales from zero is never woken by unrelated tasks. Not in the original plan; without it scale-to-zero didn't work
 
 ### 6.3 Kubernetes executor
-- ⬜ `k8s` task type: each task runs as a Kubernetes Job or Pod with its own image, resources and service account (least-privilege RBAC)
+- ✅ `k8s` task type: each attempt runs as its own Pod (not a Job: Conductor already owns retries) with its own image, resources and service account (least-privilege RBAC: a Role for pods in the task namespace, held only by a pool that runs k8s tasks and no task code; task pods non-root, no capabilities, no token unless an allowed account is named). Outputs come from the termination message; logs stream live; pods are cleaned up on finish, cancel, timeout and worker crash
 
 ### 6.4 Operator
-- ⬜ Operator built with kubebuilder, with CRDs for `Workflow`, `WorkflowRun` and `Schedule`, so workflows can be managed with GitOps (`kubectl apply`, Argo CD)
+- ✅ Operator ([operator/](operator)) with CRDs for `Workflow`, `WorkflowRun` and `Schedule`, so workflows can be managed with GitOps (`kubectl apply`, Argo CD). Built on controller-runtime with controller-gen (the kubebuilder toolchain) as its own Go module; it drives Conductor through the HTTP API. Runs start exactly once (the resource UID is the idempotency key)
 
 ### 6.5 Reference infrastructure
-- ⬜ Terraform example for one managed cloud (cluster, managed Postgres, monitoring)
-- ⬜ GitOps example with Argo CD
+- ✅ Terraform example for one managed cloud ([deploy/terraform/gke](deploy/terraform/gke)): GKE Autopilot, Cloud SQL Postgres (regional, private IP, backups), KEDA, Google Managed Prometheus. Validated with `terraform validate`; not applied (it costs money)
+- ✅ GitOps example with Argo CD ([deploy/argocd](deploy/argocd)): app-of-apps, cert-manager for TLS, health checks for the operator's resources. Run end to end on kind against this branch
 
-**Exit criteria:** `helm install` gives a working HA cluster; workers autoscale on queue depth; the e2e suite passes on Kubernetes in CI.
+**Exit criteria:** `helm install` gives a working HA cluster; workers autoscale on queue depth; the e2e suite passes on Kubernetes in CI. ✅ All three: `TestWorkersScaleOnQueueDepth` scales a pool 0 → 3 → 0, and the suite passes on kind in CI.
 
 ---
 
@@ -351,7 +356,7 @@ Phases describe *areas*. The order below gets the most value soonest and front-l
 | 2 | A real scheduler (YAML DAGs, cron, task types, CLI, SDK) | ✅ Done |
 | 3 | Distributed-systems depth (HA, fencing, benchmarks, chaos) | ✅ Done |
 | 4 | Observability and UI (metrics, tracing, dashboard) | ✅ Done |
-| 5 | AI-native durable execution (LLM steps, agents, explainer) | ⬜ |
-| 6 | Kubernetes and cloud-native (Helm, KEDA, operator) | ⬜ |
+| 5 | AI-native durable execution (LLM steps, agents, explainer) | ✅ Done |
+| 6 | Kubernetes and cloud-native (Helm, KEDA, operator) | ✅ Done |
 | 🚦 | Open-source launch gate | ⬜ |
 | 7 | Open-source launch (rename, docs, releases, community) | ⬜ |

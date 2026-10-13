@@ -146,6 +146,8 @@ func stepType(def *workflow.Definition, name string) string {
 				return workflow.TypeHTTP
 			case s.Container != nil:
 				return workflow.TypeContainer
+			case s.K8s != nil:
+				return workflow.TypeK8s
 			case s.LLM != nil:
 				return workflow.TypeLLM
 			case s.Approval != nil:

@@ -1,0 +1,105 @@
+{{- $fullname := include "conductor.fullname" . }}
+{{- $pg := .Values.postgres }}
+{{- if eq $pg.mode "dev" }}
+# A single Postgres pod for trying Conductor out: no replicas, no backups.
+# Use postgres.mode cloudnativepg or external for anything that matters.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-postgres
+  labels:
+    {{- include "conductor.componentLabels" (list . "postgres") | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "conductor.componentSelector" (list . "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "conductor.componentLabels" (list . "postgres") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        # The postgres user of the alpine image.
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: {{ $pg.dev.image }}
+          env:
+            - {name: POSTGRES_DB, value: {{ $pg.database | quote }}}
+            - {name: POSTGRES_USER, value: conductor}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $fullname }}-postgres, key: password}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, conductor, -d, {{ $pg.database | quote }}]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, conductor, -d, {{ $pg.database | quote }}]
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml $pg.dev.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+      volumes:
+        - {name: run, emptyDir: {}}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with $pg.dev.storage.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pg.dev.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-postgres
+  labels:
+    {{- include "conductor.componentLabels" (list . "postgres") | nindent 4 }}
+spec:
+  selector:
+    {{- include "conductor.componentSelector" (list . "postgres") | nindent 4 }}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+{{- else if eq $pg.mode "cloudnativepg" }}
+# A highly available Postgres cluster run by the CloudNativePG operator. It
+# creates the {{ $fullname }}-pg-app secret Conductor connects with, and
+# the {{ $fullname }}-pg-rw service pointing at the primary.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $fullname }}-pg
+  labels:
+    {{- include "conductor.componentLabels" (list . "postgres") | nindent 4 }}
+spec:
+  {{- $spec := dict
+    "instances" $pg.cloudnativepg.instances
+    "storage" (dict "size" $pg.cloudnativepg.storage.size)
+    "bootstrap" (dict "initdb" (dict "database" $pg.database "owner" "conductor"))
+  }}
+  {{- with $pg.cloudnativepg.storage.storageClass }}
+  {{- $_ := set $spec.storage "storageClass" . }}
+  {{- end }}
+  {{- toYaml (mergeOverwrite $spec $pg.cloudnativepg.spec) | nindent 2 }}
+{{- end }}

@@ -372,6 +372,8 @@ func (s *Server) createStepTask(ctx context.Context, tx *db.DB, wf *db.Workflow,
 		detail = spec.HTTP
 	case spec.Container != nil:
 		detail = spec.Container
+	case spec.K8s != nil:
+		detail = spec.K8s
 	case spec.LLM != nil:
 		detail = spec.LLM
 	}

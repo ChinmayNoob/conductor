@@ -123,8 +123,9 @@ var (
 
 var once sync.Once
 
-// Serve exposes /metrics on addr until ctx ends. In dev mode every component
-// calls it; only the first call listens. An empty addr disables it.
+// Serve exposes /metrics, and the /healthz and /readyz probes (see
+// AddReadyCheck), on addr until ctx ends. In dev mode every component calls
+// it; only the first call listens. An empty addr disables it.
 func Serve(ctx context.Context, addr string) {
 	if addr == "" {
 		return
@@ -132,6 +133,8 @@ func Serve(ctx context.Context, addr string) {
 	once.Do(func() {
 		mux := http.NewServeMux()
 		mux.Handle("GET /metrics", promhttp.Handler())
+		mux.HandleFunc("GET /healthz", handleHealthz)
+		mux.HandleFunc("GET /readyz", handleReadyz)
 		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		lis, err := net.Listen("tcp", addr)
 		if err != nil {

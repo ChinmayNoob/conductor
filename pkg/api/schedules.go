@@ -48,6 +48,41 @@ func toScheduleJSON(s *db.Schedule) scheduleJSON {
 }
 
 func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
+	sch, ok := s.decodeSchedule(w, r, "")
+	if !ok {
+		return
+	}
+	created, err := s.db.CreateSchedule(r.Context(), sch)
+	if errors.Is(err, db.ErrExists) {
+		writeError(w, http.StatusConflict, "a schedule named "+sch.Name+" already exists")
+		return
+	}
+	if err != nil {
+		s.internalError(w, "Failed to create schedule", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toScheduleJSON(created))
+}
+
+// handlePutSchedule creates the named schedule or replaces its settings, for
+// declarative tools such as the Kubernetes operator. The run history is
+// kept, and so is the next run unless the timing changed.
+func (s *Server) handlePutSchedule(w http.ResponseWriter, r *http.Request) {
+	sch, ok := s.decodeSchedule(w, r, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	stored, created, err := s.db.PutSchedule(r.Context(), sch)
+	if err != nil {
+		s.internalError(w, "Failed to save schedule", err)
+		return
+	}
+	writeJSON(w, createdOr(created), toScheduleJSON(stored))
+}
+
+// decodeSchedule reads and validates a schedule from the request body. A
+// name from the URL (pathName) is used if given; the body may repeat it.
+func (s *Server) decodeSchedule(w http.ResponseWriter, r *http.Request, pathName string) (db.Schedule, bool) {
 	var req struct {
 		Name          string `json:"name"`
 		Cron          string `json:"cron"`
@@ -57,7 +92,14 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		schedule.Target
 	}
 	if !s.decode(w, r, &req) {
-		return
+		return db.Schedule{}, false
+	}
+	if pathName != "" {
+		if req.Name != "" && req.Name != pathName {
+			writeError(w, http.StatusBadRequest, "the name in the body must match the URL")
+			return db.Schedule{}, false
+		}
+		req.Name = pathName
 	}
 	if req.Timezone == "" {
 		req.Timezone = "UTC"
@@ -67,52 +109,42 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	if !nameRe.MatchString(req.Name) {
 		writeError(w, http.StatusBadRequest, "name must be lowercase letters, digits, '-' or '_'")
-		return
+		return db.Schedule{}, false
 	}
 	if !schedule.ValidPolicy(req.MisfirePolicy) {
 		writeError(w, http.StatusBadRequest, "misfire_policy must be skip, run_once or catch_up")
-		return
+		return db.Schedule{}, false
 	}
 	spec, err := schedule.Parse(req.Cron, req.Timezone)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return db.Schedule{}, false
 	}
 	if err := req.Target.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return db.Schedule{}, false
 	}
 	if wf := req.Target.Workflow; wf != nil {
 		d, err := s.db.GetDefinition(r.Context(), namespace(r), wf.Name, wf.Version)
 		if err != nil {
 			s.internalError(w, "Failed to look up workflow definition", err)
-			return
+			return db.Schedule{}, false
 		}
 		if d == nil {
 			writeError(w, http.StatusBadRequest, "no workflow definition named "+wf.Name)
-			return
+			return db.Schedule{}, false
 		}
 	}
 	target, err := json.Marshal(req.Target)
 	if err != nil {
 		s.internalError(w, "Failed to encode schedule target", err)
-		return
+		return db.Schedule{}, false
 	}
-
-	enabled := req.Enabled == nil || *req.Enabled
-	sch, err := s.db.CreateSchedule(r.Context(), db.Schedule{
+	return db.Schedule{
 		Namespace: namespace(r), Name: req.Name, Cron: req.Cron, Timezone: req.Timezone,
-		MisfirePolicy: req.MisfirePolicy, Target: target, Enabled: enabled, NextRunAt: spec.Next(time.Now()),
-	})
-	if errors.Is(err, db.ErrExists) {
-		writeError(w, http.StatusConflict, "a schedule named "+req.Name+" already exists")
-		return
-	}
-	if err != nil {
-		s.internalError(w, "Failed to create schedule", err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, toScheduleJSON(sch))
+		MisfirePolicy: req.MisfirePolicy, Target: target, Enabled: req.Enabled == nil || *req.Enabled,
+		NextRunAt: spec.Next(time.Now()),
+	}, true
 }
 
 func (s *Server) handleListSchedules(w http.ResponseWriter, r *http.Request) {

@@ -308,9 +308,32 @@ func (db *DB) CountPendingTasks(ctx context.Context, namespace string) (int, err
 
 // PickOptions constrain which tasks PickTasks may claim.
 type PickOptions struct {
-	// WorkerLabels holds the label set of every worker with a free slot. A
-	// task's requirements must be a subset of at least one of them.
-	WorkerLabels []map[string]string
+	// Workers describes every kind of worker with a free slot. A task must
+	// be able to run on at least one of them.
+	Workers []WorkerMatch
+}
+
+// WorkerMatch is what a worker accepts: tasks whose requirements are a
+// subset of Labels and include all of Exclusive (some of its labels, which
+// make it a dedicated worker).
+type WorkerMatch struct {
+	Labels    map[string]string `json:"labels"`
+	Exclusive map[string]string `json:"exclusive,omitempty"`
+}
+
+// Accepts reports whether a task with these requirements may run there.
+func (w WorkerMatch) Accepts(req map[string]string) bool {
+	for k, v := range req {
+		if w.Labels[k] != v {
+			return false
+		}
+	}
+	for k, v := range w.Exclusive {
+		if req[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // PickNextTask claims the most urgent runnable task, or returns nil.
@@ -332,10 +355,10 @@ func (db *DB) PickNextTask(ctx context.Context, opts PickOptions) (*Task, error)
 // Limits hold within a batch too: candidates are ranked per queue and per
 // namespace, and only as many as each limit still allows are claimed.
 func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Task, error) {
-	if len(opts.WorkerLabels) == 0 || limit < 1 {
+	if len(opts.Workers) == 0 || limit < 1 {
 		return nil, nil
 	}
-	labels, err := json.Marshal(opts.WorkerLabels)
+	workers, err := json.Marshal(opts.Workers)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +373,9 @@ func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Ta
 			   AND t.picked_at IS NULL
 			   AND t.scheduled_at <= NOW()
 			   AND NOT COALESCE(q.paused, false)
-			   AND EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb) w WHERE w @> t.requirements)
+			   AND EXISTS (SELECT 1 FROM jsonb_array_elements($1::jsonb) w
+			               WHERE (w->'labels') @> t.requirements
+			                 AND t.requirements @> COALESCE(w->'exclusive', '{}'))
 			   AND (q.concurrency_limit IS NULL OR q.concurrency_limit > (`+queueRunning+`))
 			   AND (q.rate_limit IS NULL OR q.rate_limit > (`+queueRecent+`))
 			   AND (q.tokens_per_minute IS NULL OR q.tokens_per_minute > (`+queueRecentTokens+`))
@@ -380,7 +405,7 @@ func (db *DB) PickTasks(ctx context.Context, opts PickOptions, limit int) ([]*Ta
 		 SET picked_at = NOW(), last_dispatched_at = NOW(), attempt = attempt + 1
 		 WHERE id IN (SELECT id FROM allowed) `+fenceMarker+`
 		 RETURNING `+taskColumns,
-		labels, limit,
+		workers, limit,
 	)
 	rows, err := db.q.QueryContext(ctx, query, args...)
 	if err != nil {

@@ -14,10 +14,14 @@ import (
 	"github.com/ChinmayNoob/conductor/pkg/client"
 )
 
-// scrape fetches a container's Prometheus metrics from inside it.
-func scrape(t *testing.T, container string) string {
+// scrape fetches an instance's Prometheus metrics from inside it.
+func scrape(t *testing.T, id string) string {
 	t.Helper()
-	return docker(t, "exec", container, "wget", "-qO-", "http://localhost:9090/metrics")
+	out, err := plat.exec(t, id, "wget", "-qO-", "http://localhost:9090/metrics")
+	if err != nil {
+		t.Fatalf("scraping %s: %v\n%s", id, err, out)
+	}
+	return out
 }
 
 func wantMetric(t *testing.T, who, metrics, prefix string) {
@@ -53,7 +57,7 @@ func TestMetrics(t *testing.T) {
 	}
 
 	// The standby says so, and leaves cluster state to the leader.
-	for _, id := range strings.Fields(compose(t, "ps", "-q", "coordinator")) {
+	for _, id := range plat.instances(t, "coordinator") {
 		if id == leaderContainer {
 			continue
 		}
@@ -64,9 +68,13 @@ func TestMetrics(t *testing.T) {
 		}
 	}
 
-	wantMetric(t, "a worker", scrape(t, strings.Fields(compose(t, "ps", "-q", "worker"))[0]), "conductor_worker_slots")
-	wantMetric(t, "the API", scrape(t, strings.TrimSpace(compose(t, "ps", "-q", "api"))),
-		`conductor_http_requests_total{code="201",route="POST /v1/tasks"}`)
+	wantMetric(t, "a worker", scrape(t, plat.instances(t, "worker")[0]), "conductor_worker_slots")
+	// With several API replicas, the task submission was counted by one.
+	var apis []string
+	for _, id := range plat.instances(t, "api") {
+		apis = append(apis, scrape(t, id))
+	}
+	wantMetric(t, "the API", strings.Join(apis, "\n"), `conductor_http_requests_total{code="201",route="POST /v1/tasks"}`)
 }
 
 // TestTracing needs tracing on (OTEL_EXPORTER_OTLP_ENDPOINT); it checks the

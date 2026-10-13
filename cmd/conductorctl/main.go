@@ -24,6 +24,8 @@ Tasks:
   task submit -cmd "echo hi" [task flags] [-wait]
   task submit -type http -url URL [-method POST] [-body JSON] [-header K=V]
   task submit -type container -image alpine:3.20 [-- command args...]
+  task submit -type k8s -image alpine:3.20 [-cpu 500m] [-memory 256Mi]
+              [-service-account SA] [-- command args...]
   task submit -prompt "Summarize: ..." [-model M] [-system S] [-schema JSON]
   task get|cancel|requeue <id>
   task logs <id> [-f]          Output; -f follows a running task live
@@ -254,15 +256,18 @@ func (m kv) Set(s string) error {
 func taskFlags(fs *flag.FlagSet) func() (client.TaskRequest, error) {
 	var req client.TaskRequest
 	env, labels, headers := kv{}, kv{}, kv{}
-	var url, method, body, image, prompt, model, system, schema string
+	var url, method, body, image, cpu, memory, account, prompt, model, system, schema string
 	retries := -1
-	fs.StringVar(&req.Type, "type", "", "shell (default), http, container or llm")
+	fs.StringVar(&req.Type, "type", "", "shell (default), http, container, k8s or llm")
 	fs.StringVar(&req.Command, "cmd", "", "shell command")
 	fs.StringVar(&url, "url", "", "http: URL")
 	fs.StringVar(&method, "method", "", "http: method (default GET)")
 	fs.StringVar(&body, "body", "", "http: request body")
 	fs.Var(headers, "header", "http: header K=V (repeatable)")
-	fs.StringVar(&image, "image", "", "container: image")
+	fs.StringVar(&image, "image", "", "container, k8s: image")
+	fs.StringVar(&cpu, "cpu", "", "k8s: CPU request and limit, e.g. 500m")
+	fs.StringVar(&memory, "memory", "", "k8s: memory request and limit, e.g. 256Mi")
+	fs.StringVar(&account, "service-account", "", "k8s: service account (one the workers allow)")
 	fs.StringVar(&prompt, "prompt", "", "llm: the prompt")
 	fs.StringVar(&model, "model", "", "llm: model (default: the workers' CONDUCTOR_LLM_MODEL)")
 	fs.StringVar(&system, "system", "", "llm: system message")
@@ -294,6 +299,8 @@ func taskFlags(fs *flag.FlagSet) func() (client.TaskRequest, error) {
 			if len(headers) > 0 {
 				req.HTTP.Headers = headers
 			}
+		case image != "" && req.Type == "k8s":
+			req.K8s = &client.K8sSpec{Image: image, Command: fs.Args(), CPU: cpu, Memory: memory, ServiceAccount: account}
 		case image != "":
 			if req.Type == "" {
 				req.Type = "container"

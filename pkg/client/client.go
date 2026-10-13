@@ -146,6 +146,18 @@ type ContainerSpec struct {
 	Network string   `json:"network,omitempty"`
 }
 
+// K8sSpec runs a task as its own Kubernetes pod (type k8s).
+type K8sSpec struct {
+	Image          string            `json:"image"`
+	Command        []string          `json:"command,omitempty"` // replaces the image's entrypoint
+	Args           []string          `json:"args,omitempty"`
+	CPU            string            `json:"cpu,omitempty"`    // request and limit, e.g. "500m"
+	Memory         string            `json:"memory,omitempty"` // request and limit, e.g. "256Mi"
+	ServiceAccount string            `json:"service_account,omitempty"`
+	NodeSelector   map[string]string `json:"node_selector,omitempty"`
+	RunAsUser      *int64            `json:"run_as_user,omitempty"`
+}
+
 // LLMSpec asks a language model for a completion (type llm).
 type LLMSpec struct {
 	Model       string         `json:"model,omitempty"`
@@ -165,10 +177,11 @@ type LLMUsage struct {
 }
 
 type TaskRequest struct {
-	Type              string            `json:"type,omitempty"` // shell (default), http, container, llm
+	Type              string            `json:"type,omitempty"` // shell (default), http, container, k8s, llm
 	Command           string            `json:"command,omitempty"`
 	HTTP              *HTTPSpec         `json:"http,omitempty"`
 	Container         *ContainerSpec    `json:"container,omitempty"`
+	K8s               *K8sSpec          `json:"k8s,omitempty"`
 	LLM               *LLMSpec          `json:"llm,omitempty"`
 	Env               map[string]string `json:"env,omitempty"`
 	Labels            map[string]string `json:"labels,omitempty"`
@@ -610,6 +623,14 @@ func (c *Client) CreateSchedule(ctx context.Context, req ScheduleRequest) (*Sche
 	var s Schedule
 	_, err := c.do(ctx, http.MethodPost, "/v1/schedules", req, &s)
 	return &s, err
+}
+
+// PutSchedule creates the schedule named in req or replaces its settings,
+// keeping its run history. created reports which happened.
+func (c *Client) PutSchedule(ctx context.Context, req ScheduleRequest) (s *Schedule, created bool, err error) {
+	s = &Schedule{}
+	code, err := c.do(ctx, http.MethodPut, "/v1/schedules/"+url.PathEscape(req.Name), req, s)
+	return s, code == http.StatusCreated, err
 }
 
 func (c *Client) ListSchedules(ctx context.Context) ([]Schedule, error) {

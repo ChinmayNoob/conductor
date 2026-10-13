@@ -118,3 +118,25 @@ func TestReleaseTaskFreesWorkerSlot(t *testing.T) {
 		t.Fatal("worker should be available after its task is released")
 	}
 }
+
+func TestChooseWorkerHonorsExclusiveLabels(t *testing.T) {
+	s := newTestServer(1, 2)
+	// Worker 2 is dedicated to the gpu pool.
+	s.workers[2].Labels = map[string]string{"type.shell": "true", "pool": "gpu"}
+	s.workers[2].Exclusive = map[string]string{"pool": "gpu"}
+
+	for range 3 {
+		if w := s.chooseWorker(shell); w == nil || w.ID != 1 {
+			t.Fatalf("a plain task went to %v, want worker 1", w)
+		}
+	}
+	if w := s.chooseWorker(map[string]string{"type.shell": "true", "pool": "gpu"}); w == nil || w.ID != 2 {
+		t.Fatalf("a gpu pool task went to %v, want worker 2", w)
+	}
+
+	// Pick queries see both kinds of worker.
+	kinds, free := s.freeCapacity()
+	if len(kinds) != 2 || free != 2 {
+		t.Fatalf("freeCapacity = %v, %d", kinds, free)
+	}
+}

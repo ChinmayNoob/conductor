@@ -68,7 +68,12 @@ func readOutputs(path string) (map[string]string, error) {
 	if len(data) > maxOutputsBytes {
 		return nil, fmt.Errorf("$CONDUCTOR_OUTPUT exceeds %d bytes", maxOutputsBytes)
 	}
+	return parseOutputs(data), nil
+}
 
+// parseOutputs parses key=value lines, ignoring others. It returns nil if
+// there are none.
+func parseOutputs(data []byte) map[string]string {
 	outputs := make(map[string]string)
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	sc.Buffer(make([]byte, maxOutputsBytes), maxOutputsBytes)
@@ -80,9 +85,9 @@ func readOutputs(path string) (map[string]string, error) {
 		outputs[string(key)] = string(bytes.TrimRight(value, "\r"))
 	}
 	if len(outputs) == 0 {
-		return nil, nil
+		return nil
 	}
-	return outputs, nil
+	return outputs
 }
 
 // taskEnv builds a task's environment. It starts from a minimal base rather
